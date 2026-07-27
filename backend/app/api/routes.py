@@ -530,7 +530,7 @@ def upload(conciliacao_id: str, tipo_documento: str, file: UploadFile = File(...
         extracted = []
         for number, page_text in enumerate(pages, 1):
             parsed_rfb = parse_rfb_page(page_text, number) if tipo_documento == "rfb" else None
-            extracted.extend([parsed_rfb] if parsed_rfb else [] if tipo_documento == "rfb" else extract_receipts(page_text, number) if tipo_documento == "comprovante" else extract_statement(page_text, number))
+            extracted.extend([parsed_rfb] if parsed_rfb else [] if tipo_documento == "rfb" else extract_receipts(page_text, number) if tipo_documento == "comprovante" else extract_statement(page_text, number, reconciliation.banco))
         for item in extracted:
             if tipo_documento == "rfb":
                 receipt = ComprovanteRfb(conciliacao_id=conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, tipo=item.tipo, cnpj=item.cnpj, razao_social=item.razao_social, competencia=item.competencia, periodo_apuracao=item.periodo_apuracao, data_vencimento=item.data_vencimento, data_arrecadacao=item.data_arrecadacao, numero_documento=item.numero_documento, codigo_banco=item.codigo_banco, nome_banco=item.nome_banco, agencia=item.agencia, valor_principal=item.valor_principal, valor_multa=item.valor_multa, valor_juros=item.valor_juros, valor_total=item.valor_total, texto_original=item.texto_original, status="composição divergente" if item.composicao_divergente else "pronto")
@@ -547,17 +547,25 @@ def upload(conciliacao_id: str, tipo_documento: str, file: UploadFile = File(...
     return {"id": record.id, "status": record.status_processamento}
 
 
+def clear_reconciliation_results(conciliacao_id: str, db: Session) -> None:
+    matches = db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id).all()
+    for match in matches:
+        db.query(LancamentoContabil).filter_by(correspondencia_id=match.id).delete()
+    db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id).delete()
+
+
 @router.post("/arquivos/{arquivo_id}/reprocessar")
 def reprocess_document(arquivo_id: str, db: Session = Depends(get_db)):
     record = db.get(Arquivo, arquivo_id)
     if not record or record.tipo_documento not in {"extrato", "comprovante", "rfb"}:
         raise HTTPException(404, "Documento reprocessável não encontrado")
+    clear_reconciliation_results(record.conciliacao_id, db)
     model = MovimentoExtrato if record.tipo_documento == "extrato" else Comprovante if record.tipo_documento == "comprovante" else ComprovanteRfb
     db.query(model).filter_by(arquivo_id=record.id).delete()
     extracted = []
     for number, page_text in enumerate((record.texto_bruto or "").split("\n\f\n"), 1):
         parsed_rfb = parse_rfb_page(page_text, number) if record.tipo_documento == "rfb" else None
-        extracted.extend([parsed_rfb] if parsed_rfb else [] if record.tipo_documento == "rfb" else extract_statement(page_text, number) if record.tipo_documento == "extrato" else extract_receipts(page_text, number))
+        extracted.extend([parsed_rfb] if parsed_rfb else [] if record.tipo_documento == "rfb" else extract_statement(page_text, number, record.banco_selecionado) if record.tipo_documento == "extrato" else extract_receipts(page_text, number))
     for item in extracted:
         if record.tipo_documento == "rfb":
             receipt = ComprovanteRfb(conciliacao_id=record.conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, tipo=item.tipo, cnpj=item.cnpj, razao_social=item.razao_social, competencia=item.competencia, periodo_apuracao=item.periodo_apuracao, data_vencimento=item.data_vencimento, data_arrecadacao=item.data_arrecadacao, numero_documento=item.numero_documento, codigo_banco=item.codigo_banco, nome_banco=item.nome_banco, agencia=item.agencia, valor_principal=item.valor_principal, valor_multa=item.valor_multa, valor_juros=item.valor_juros, valor_total=item.valor_total, texto_original=item.texto_original, status="composição divergente" if item.composicao_divergente else "pronto")
@@ -578,10 +586,7 @@ def reconcile(conciliacao_id: str, db: Session = Depends(get_db)):
     reconciliation = db.get(Conciliacao, conciliacao_id)
     if not reconciliation:
         raise HTTPException(404, "Conciliação não encontrada")
-    existing = db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id).all()
-    for match in existing:
-        db.query(LancamentoContabil).filter_by(correspondencia_id=match.id).delete()
-    db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id).delete()
+    clear_reconciliation_results(conciliacao_id, db)
     receipts = db.query(Comprovante).filter_by(conciliacao_id=conciliacao_id, ativo=True).all()
     rfb_receipts = [item for item in db.query(ComprovanteRfb).filter_by(conciliacao_id=conciliacao_id) if belongs_to_selected_bank(item, reconciliation.banco)]
     used_receipts, used_rfb = set(), set()

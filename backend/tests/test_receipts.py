@@ -38,20 +38,42 @@ def test_invoice_is_not_matched_by_value_only():
     )
 
 
-def test_banco_do_brasil_vertical_statement_extracts_pix_entry():
+def test_banco_do_brasil_credit_in_statement_becomes_debit_in_system():
     text = """02/01/2024
 0000
 13105 144 Pix - Enviado
 10.202
-520,52 D
+520,52 C
 02/01 09:40 Lia Da Silva Alexandre
 """
-    record = extract_statement(text, 1)[0]
+    record = extract_statement(text, 1, "Banco do Brasil")[0]
     assert record.data == date(2024, 1, 2)
     assert record.hora == "09:40"
     assert record.nome == "Lia Da Silva Alexandre"
     assert record.valor == Decimal("520.52")
     assert record.natureza == "saída"
+
+
+def test_banco_do_brasil_debit_in_statement_becomes_credit_in_system():
+    text = """02/01/2024
+0000
+13105 144 Pix - Recebido
+10.202
+520,52 D
+02/01 09:40 Lia Da Silva Alexandre
+"""
+    assert extract_statement(text, 1, "Banco do Brasil")[0].natureza == "entrada"
+
+
+def test_banco_do_brasil_parser_is_not_used_for_other_banks():
+    text = """02/01/2024
+0000
+13105 144 Pix - Enviado
+10.202
+520,52 C
+02/01 09:40 Lia Da Silva Alexandre
+"""
+    assert extract_statement(text, 1, "Santander") == []
 
 
 def test_payment_receipt_uses_beneficiario_final_and_valor_documento():

@@ -188,10 +188,11 @@ def _extract_banco_do_brasil_receipt(text: str, page_number: int) -> list[Parsed
     return []
 
 
-def extract_statement(text: str, page_number: int) -> list[ParsedStatement]:
-    bb_records = _extract_banco_do_brasil_statement(text, page_number)
-    if bb_records:
-        return bb_records
+def extract_statement(text: str, page_number: int, bank: str = "") -> list[ParsedStatement]:
+    if bank == "Banco do Brasil":
+        bb_records = _extract_banco_do_brasil_statement(text, page_number)
+        if bb_records:
+            return bb_records
 
     results = []
     for line in text.splitlines():
@@ -235,7 +236,7 @@ def _extract_banco_do_brasil_statement(text: str, page_number: int) -> list[Pars
             historico=history,
             nome=name,
             valor=amount,
-            natureza="entrada" if match.group("natureza") == "C" else "saída",
+            natureza="saída" if match.group("natureza") == "C" else "entrada",
             texto_original=match.group(0).strip(),
             pagina_numero=page_number,
         ))

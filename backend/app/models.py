@@ -2,7 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from uuid import uuid4
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -24,11 +24,23 @@ class Conciliacao(Base):
     __tablename__ = "conciliacoes"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     cliente_id: Mapped[str] = mapped_column(ForeignKey("clientes.id"), index=True)
+    processo_id: Mapped[str | None] = mapped_column(ForeignKey("processos_conciliacao.id"), index=True)
     banco: Mapped[str] = mapped_column(String(100))
     data_inicio: Mapped[date] = mapped_column(Date)
     data_fim: Mapped[date] = mapped_column(Date)
     status: Mapped[str] = mapped_column(String(30), default="rascunho")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ProcessoConciliacao(Base):
+    __tablename__ = "processos_conciliacao"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    cliente_id: Mapped[str] = mapped_column(ForeignKey("clientes.id"), index=True)
+    data_inicio: Mapped[date] = mapped_column(Date)
+    data_fim: Mapped[date] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(30), default="em_andamento")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class Arquivo(Base):
@@ -45,6 +57,17 @@ class Arquivo(Base):
     mensagem_erro: Mapped[str | None] = mapped_column(Text)
     paginas: Mapped[int | None] = mapped_column(Integer)
     ativo: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class DocumentoImportante(Base):
+    __tablename__ = "documentos_importantes"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    tipo: Mapped[str] = mapped_column(String(30))
+    nome_original: Mapped[str] = mapped_column(String(255))
+    caminho: Mapped[str] = mapped_column(String(500))
+    extensao: Mapped[str] = mapped_column(String(10))
+    catalogo: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class RegistroBase:
@@ -155,6 +178,8 @@ class Correspondencia(Base):
 class RegraContabil(Base):
     __tablename__ = "regras_contabeis"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    cliente_id: Mapped[str | None] = mapped_column(ForeignKey("clientes.id"), index=True)
+    banco: Mapped[str] = mapped_column(String(100), default="")
     tipo_fonte: Mapped[str] = mapped_column(String(30))
     tipo_operacao: Mapped[str] = mapped_column(String(80), default="")
     favorecido_normalizado: Mapped[str] = mapped_column(Text, default="")
@@ -162,8 +187,19 @@ class RegraContabil(Base):
     conta_debito: Mapped[str] = mapped_column(String(100), default="")
     conta_credito: Mapped[str] = mapped_column(String(100), default="")
     historico: Mapped[str] = mapped_column(Text, default="")
+    complemento: Mapped[str] = mapped_column(Text, default="")
     ativo: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ContaBancaria(Base):
+    __tablename__ = "contas_bancarias"
+    __table_args__ = (UniqueConstraint("cliente_id", "banco", name="uq_contas_bancarias_cliente_banco"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    cliente_id: Mapped[str] = mapped_column(ForeignKey("clientes.id"), index=True)
+    banco: Mapped[str] = mapped_column(String(100))
+    conta_contabil: Mapped[str] = mapped_column(String(100), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class LancamentoContabil(Base):

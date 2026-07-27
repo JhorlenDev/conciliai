@@ -10,3 +10,4 @@ backend/storage/
 frontend/.next/
 frontend/node_modules/
 frontend/.turbo/
+frontend/.env.local

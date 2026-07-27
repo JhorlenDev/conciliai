@@ -5,3 +5,164 @@
 * { box-sizing: border-box; }
 body { background: #f6f7f8; color: #17212b; }
 button, input, select { font: inherit; }
+
+section.overflow-hidden.rounded-xl > div.overflow-x-auto {
+  max-height: calc(100dvh - 360px);
+  overflow: auto;
+}
+
+section.overflow-hidden.rounded-xl > div.overflow-x-auto > table > thead {
+  position: sticky;
+  top: 0;
+}
+
+main.min-h-screen {
+  height: 100dvh;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+main.min-h-screen > header,
+main.min-h-screen > nav {
+  flex-shrink: 0;
+}
+
+main.min-h-screen > section.relative {
+  height: auto !important;
+  min-height: 0;
+  flex: 1;
+}
+
+/* The advanced rule editor uses direct trigger entry. */
+button.text-teal-700.underline,
+.flex.max-w-40.flex-wrap.gap-1 {
+  display: none;
+}
+
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(1),
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(3),
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(4),
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(5),
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(6),
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(7),
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(8),
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(9) {
+  font-size: 0;
+}
+
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(1)::after { content: "Data"; }
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(3)::after { content: "Tipo"; }
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(4)::after { content: "Valor"; }
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(5)::after { content: "Palavra-chave"; }
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(6)::after { content: "Débito"; }
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(7)::after { content: "Crédito"; }
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(8)::after { content: "Histórico"; }
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th:nth-child(9)::after { content: "Complemento"; }
+
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th::after {
+  font-size: 10px;
+}
+
+section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead tr::after {
+  content: "Ação";
+  display: table-cell;
+  padding: 0.5rem;
+  font-size: 10px;
+  color: rgb(100 116 139);
+}
+
+section.space-y-3.rounded-xl.border.border-slate-200 td .absolute.left-0.top-8 {
+  left: 12rem;
+}
+
+main.min-h-screen > nav > button {
+  gap: 0.375rem;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.75rem;
+}
+
+main.min-h-screen > nav img.h-6.w-6,
+main.min-h-screen > nav span.h-6.w-6 {
+  width: 1.1rem !important;
+  height: 1.1rem !important;
+}
+
+main.min-h-screen > nav > button:last-child {
+  font-size: 0;
+}
+
+main.min-h-screen > nav > button:last-child::after {
+  content: "Documentos";
+  font-size: 0.75rem;
+}
+
+main.min-h-screen > div.grid {
+  height: calc(100dvh - 78px);
+  overflow: hidden;
+}
+
+main.min-h-screen > div.grid > :nth-child(2) {
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 0.35rem;
+}
+
+main.min-h-screen > div.grid > :nth-child(2) .flex.flex-wrap {
+  flex-wrap: nowrap;
+  align-items: center;
+}
+
+main.min-h-screen > div.grid > :nth-child(2) .flex.flex-wrap > button,
+main.min-h-screen > div.grid > :nth-child(2) .flex.flex-wrap > select {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+main.mx-auto.max-w-7xl {
+  padding-top: 0.75rem;
+  padding-bottom: 0.75rem;
+}
+
+main.mx-auto.max-w-7xl > header {
+  margin-bottom: 0.75rem;
+}
+
+main.mx-auto.max-w-7xl > header img.h-10.w-10 {
+  width: 2rem;
+  height: 2rem;
+}
+
+main.mx-auto.max-w-7xl > header h1 {
+  font-size: 1rem;
+}
+
+main.mx-auto.max-w-7xl > header p,
+main.mx-auto.max-w-7xl label {
+  font-size: 0.7rem;
+}
+
+main.mx-auto.max-w-7xl > .mb-5 {
+  margin-bottom: 0.75rem;
+}
+
+main.mx-auto.max-w-7xl > .mb-5 button {
+  padding: 0.35rem 0.65rem;
+  font-size: 0.75rem;
+}
+
+main.mx-auto.max-w-7xl .p-5 {
+  padding: 0.75rem;
+}
+
+main.mx-auto.max-w-7xl input,
+main.mx-auto.max-w-7xl select {
+  padding: 0.35rem 0.5rem;
+  font-size: 0.75rem;
+}
+
+main.mx-auto.max-w-7xl .px-4.py-2 {
+  padding: 0.35rem 0.65rem;
+  font-size: 0.75rem;
+}

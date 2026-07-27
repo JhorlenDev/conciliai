@@ -3,6 +3,7 @@ import io
 import shutil
 import re
 import zipfile
+import logging
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,12 +21,14 @@ from app.core.config import UPLOAD_DIR
 from app.core.database import get_db
 from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, ComprovanteRfbItem, Conciliacao, ContaBancaria, Correspondencia, DocumentoImportante, LancamentoContabil, MovimentoExtrato, NotaFiscal, ProcessoConciliacao, RegraContabil
 from app.services.normalization import normalize_name
-from app.services.parsers import extract_receipts, extract_statement
+from app.services.matching import names_similar
+from app.services.parsers import deduplicate_statement_records, extract_receipts, extract_statement
 from app.services.rfb import belongs_to_selected_bank, parse_rfb_page
 from app.services.rule_source import choose_rule_source
 
 router = APIRouter()
 BANKS = ["Banco do Brasil", "Santander", "BASA", "Bradesco", "Conta Caixa", "Vendas com Cartão", "Comissões Getnet", "Apropriações", "Empréstimos/Financeiro"]
+logger = logging.getLogger(__name__)
 
 
 @router.get("/arquivos/{arquivo_id}/visualizar")
@@ -41,11 +44,7 @@ def delete_file(arquivo_id: str, db: Session = Depends(get_db)):
     record = db.get(Arquivo, arquivo_id)
     if not record:
         raise HTTPException(404, "Arquivo não encontrado")
-    reconciliation_id = record.conciliacao_id
-    matches = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation_id).all()
-    for match in matches:
-        db.query(LancamentoContabil).filter_by(correspondencia_id=match.id).delete()
-    db.query(Correspondencia).filter_by(conciliacao_id=reconciliation_id).delete()
+    reset_reconciliation(record.conciliacao_id, db)
     if record.tipo_documento == "extrato":
         db.query(MovimentoExtrato).filter_by(arquivo_id=record.id).delete()
     elif record.tipo_documento == "comprovante":
@@ -346,6 +345,7 @@ def resume_process_bank(processo_id: str, payload: ProcessoBancoInput, db: Sessi
     reconciliation = db.query(Conciliacao).filter_by(processo_id=process.id, banco=payload.banco).first()
     if not reconciliation:
         reconciliation = Conciliacao(cliente_id=process.cliente_id, processo_id=process.id, banco=payload.banco, data_inicio=process.data_inicio, data_fim=process.data_fim)
+        process.status = "em_andamento"
         db.add(reconciliation); db.commit(); db.refresh(reconciliation)
     return reconciliation_payload(reconciliation)
 
@@ -363,8 +363,12 @@ def create_reconciliation(payload: ConciliacaoInput, db: Session = Depends(get_d
 
 def rule_matches_movement(rule: RegraContabil, movement: MovimentoExtrato) -> bool:
     trigger = normalize_name(rule.favorecido_normalizado)
-    history = normalize_name(movement.historico)
+    history = normalize_name(" ".join(item for item in [movement.historico, movement.nome_encontrado] if item))
     return bool(trigger and trigger in history and (not rule.tipo_operacao or rule.tipo_operacao == movement.natureza))
+
+
+def in_reconciliation_period(reconciliation: Conciliacao, movement: MovimentoExtrato) -> bool:
+    return bool(movement.data and reconciliation.data_inicio <= movement.data <= reconciliation.data_fim)
 
 
 def rule_payload(rule: RegraContabil, movements: list[MovimentoExtrato]) -> dict:
@@ -383,18 +387,21 @@ def apply_accounting_rules(reconciliation: Conciliacao, db: Session) -> int:
     """Create or update accounting entries without changing document matching links."""
     rules = scoped_rules(reconciliation, db)
     applied = 0
-    movements = db.query(MovimentoExtrato).filter_by(conciliacao_id=reconciliation.id, ativo=True).all()
+    movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=reconciliation.id, ativo=True) if in_reconciliation_period(reconciliation, item)]
     for movement in movements:
         rule = next((item for item in rules if rule_matches_movement(item, movement)), None)
-        if not rule:
-            continue
         match = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id).first()
+        if match:
+            db.query(LancamentoContabil).filter_by(correspondencia_id=match.id, status="aplicado_por_regra").delete()
+        if not rule:
+            if match:
+                match.regra_contabil_id = None
+            continue
         if not match:
             match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id)
             db.add(match)
             db.flush()
         match.regra_contabil_id = rule.id
-        db.query(LancamentoContabil).filter_by(correspondencia_id=match.id, regra_contabil_id=rule.id).delete()
         db.add(LancamentoContabil(correspondencia_id=match.id, regra_contabil_id=rule.id, valor=movement.valor or 0, conta_debito=rule.conta_debito, conta_credito=rule.conta_credito, historico=rule.historico, status="aplicado_por_regra"))
         applied += 1
     return applied
@@ -429,11 +436,14 @@ def save_bank_account(conciliacao_id: str, payload: ContaBancariaInput, db: Sess
 @router.get("/conciliacoes/{conciliacao_id}/regras-contabeis")
 def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db)):
     reconciliation = reconciliation_or_404(conciliacao_id, db)
-    movements = db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True).order_by(MovimentoExtrato.data, MovimentoExtrato.hora).all()
+    movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True).order_by(MovimentoExtrato.data, MovimentoExtrato.hora) if in_reconciliation_period(reconciliation, item)]
+    if reconciliation.banco == "Banco do Brasil":
+        for movement in movements:
+            logger.info("Total do extrato BB: data=%s historico=%s valor=%s natureza=%s", movement.data, movement.historico, movement.valor, movement.natureza)
     rules = scoped_rules(reconciliation, db)
     same_bank_rules = [rule for rule in rules if rule.banco == reconciliation.banco]
+    applied_movements = [item for item in movements if any(rule_matches_movement(rule, item) for rule in rules)]
     pending = [item for item in movements if not any(rule_matches_movement(rule, item) for rule in same_bank_rules)]
-    accounting_entries = db.query(LancamentoContabil).join(Correspondencia).filter(Correspondencia.conciliacao_id == conciliacao_id, LancamentoContabil.status == "aplicado_por_regra").all()
     matches = {item.movimento_extrato_id: item for item in db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id).all()}
     def pending_payload(item: MovimentoExtrato):
         match = matches.get(item.id)
@@ -441,7 +451,8 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db)):
         history = " ".join(part for part in [item.historico, item.nome_encontrado] if part)
         shared_rule = next((rule for rule in rules if rule.banco != reconciliation.banco and rule_matches_movement(rule, item)), None)
         return {"id": item.id, "data": item.data.strftime("%d/%m/%y") if item.data else "—", "historico": history, "valor": str(item.valor or 0), "natureza": item.natureza, "pagina": item.pagina_numero, "arquivo_id": item.arquivo_id, "comprovante_arquivo_id": receipt.arquivo_id if receipt else None, "comprovante_pagina": receipt.pagina_numero if receipt else None, "comprovante_confere": bool(receipt and match and match.status.startswith("Conciliado")), "regra_compartilhada": {"id": shared_rule.id, "banco_origem": shared_rule.banco, "gatilho": shared_rule.favorecido_normalizado} if shared_rule else None}
-    return {"pendentes": [pending_payload(item) for item in pending], "salvas": [rule_payload(rule, movements) for rule in same_bank_rules], "resumo": {"extrato": {"debito": str(sum((item.valor or 0 for item in movements if item.natureza == "saída"), 0)), "credito": str(sum((item.valor or 0 for item in movements if item.natureza == "entrada"), 0))}, "razao": {"debito": str(sum((item.valor for item in accounting_entries), 0)), "credito": str(sum((item.valor for item in accounting_entries), 0))}}}
+    applied_total = sum((item.valor or 0 for item in applied_movements), 0)
+    return {"pendentes": [pending_payload(item) for item in pending], "salvas": [rule_payload(rule, movements) for rule in same_bank_rules], "resumo": {"extrato": {"debito": str(sum((item.valor or 0 for item in movements if item.natureza == "saída"), 0)), "credito": str(sum((item.valor or 0 for item in movements if item.natureza == "entrada"), 0))}, "razao": {"debito": str(applied_total), "credito": str(applied_total)}}}
 
 
 @router.post("/conciliacoes/{conciliacao_id}/regras-contabeis")
@@ -491,6 +502,8 @@ def delete_accounting_rule(regra_id: str, db: Session = Depends(get_db)):
     db.query(LancamentoContabil).filter_by(regra_contabil_id=rule.id).delete()
     for match in db.query(Correspondencia).filter_by(regra_contabil_id=rule.id):
         match.regra_contabil_id = None
+    for reconciliation in db.query(Conciliacao).filter_by(cliente_id=rule.cliente_id):
+        apply_accounting_rules(reconciliation, db)
     db.commit()
 
 
@@ -498,7 +511,7 @@ def delete_accounting_rule(regra_id: str, db: Session = Depends(get_db)):
 def accounting_csv(conciliacao_id: str, db: Session = Depends(get_db)):
     reconciliation = reconciliation_or_404(conciliacao_id, db)
     rules = scoped_rules(reconciliation, db)
-    movements = db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True).order_by(MovimentoExtrato.data, MovimentoExtrato.hora).all()
+    movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True).order_by(MovimentoExtrato.data, MovimentoExtrato.hora) if in_reconciliation_period(reconciliation, item)]
     output = io.StringIO(newline="")
     writer = csv.writer(output, delimiter=";", lineterminator="\n")
     writer.writerow(["data", "debito", "credito", "historico", "complemento", "valor"])
@@ -516,6 +529,7 @@ def upload(conciliacao_id: str, tipo_documento: str, file: UploadFile = File(...
     reconciliation = db.get(Conciliacao, conciliacao_id)
     if not reconciliation:
         raise HTTPException(404, "Conciliação não encontrada")
+    reset_reconciliation(conciliacao_id, db)
     destination = UPLOAD_DIR / conciliacao_id
     destination.mkdir(parents=True, exist_ok=True)
     path = destination / f"{uuid4()}.pdf"
@@ -531,6 +545,8 @@ def upload(conciliacao_id: str, tipo_documento: str, file: UploadFile = File(...
         for number, page_text in enumerate(pages, 1):
             parsed_rfb = parse_rfb_page(page_text, number) if tipo_documento == "rfb" else None
             extracted.extend([parsed_rfb] if parsed_rfb else [] if tipo_documento == "rfb" else extract_receipts(page_text, number) if tipo_documento == "comprovante" else extract_statement(page_text, number, reconciliation.banco))
+        if tipo_documento == "extrato" and reconciliation.banco == "Banco do Brasil":
+            extracted = deduplicate_statement_records(extracted)
         for item in extracted:
             if tipo_documento == "rfb":
                 receipt = ComprovanteRfb(conciliacao_id=conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, tipo=item.tipo, cnpj=item.cnpj, razao_social=item.razao_social, competencia=item.competencia, periodo_apuracao=item.periodo_apuracao, data_vencimento=item.data_vencimento, data_arrecadacao=item.data_arrecadacao, numero_documento=item.numero_documento, codigo_banco=item.codigo_banco, nome_banco=item.nome_banco, agencia=item.agencia, valor_principal=item.valor_principal, valor_multa=item.valor_multa, valor_juros=item.valor_juros, valor_total=item.valor_total, texto_original=item.texto_original, status="composição divergente" if item.composicao_divergente else "pronto")
@@ -554,18 +570,32 @@ def clear_reconciliation_results(conciliacao_id: str, db: Session) -> None:
     db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id).delete()
 
 
+def reset_reconciliation(conciliacao_id: str, db: Session) -> None:
+    clear_reconciliation_results(conciliacao_id, db)
+    reconciliation = db.get(Conciliacao, conciliacao_id)
+    if not reconciliation:
+        return
+    reconciliation.status = "rascunho"
+    if reconciliation.processo_id:
+        process = db.get(ProcessoConciliacao, reconciliation.processo_id)
+        if process:
+            process.status = "em_andamento"
+
+
 @router.post("/arquivos/{arquivo_id}/reprocessar")
 def reprocess_document(arquivo_id: str, db: Session = Depends(get_db)):
     record = db.get(Arquivo, arquivo_id)
     if not record or record.tipo_documento not in {"extrato", "comprovante", "rfb"}:
         raise HTTPException(404, "Documento reprocessável não encontrado")
-    clear_reconciliation_results(record.conciliacao_id, db)
+    reset_reconciliation(record.conciliacao_id, db)
     model = MovimentoExtrato if record.tipo_documento == "extrato" else Comprovante if record.tipo_documento == "comprovante" else ComprovanteRfb
     db.query(model).filter_by(arquivo_id=record.id).delete()
     extracted = []
     for number, page_text in enumerate((record.texto_bruto or "").split("\n\f\n"), 1):
         parsed_rfb = parse_rfb_page(page_text, number) if record.tipo_documento == "rfb" else None
         extracted.extend([parsed_rfb] if parsed_rfb else [] if record.tipo_documento == "rfb" else extract_statement(page_text, number, record.banco_selecionado) if record.tipo_documento == "extrato" else extract_receipts(page_text, number))
+    if record.tipo_documento == "extrato" and record.banco_selecionado == "Banco do Brasil":
+        extracted = deduplicate_statement_records(extracted)
     for item in extracted:
         if record.tipo_documento == "rfb":
             receipt = ComprovanteRfb(conciliacao_id=record.conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, tipo=item.tipo, cnpj=item.cnpj, razao_social=item.razao_social, competencia=item.competencia, periodo_apuracao=item.periodo_apuracao, data_vencimento=item.data_vencimento, data_arrecadacao=item.data_arrecadacao, numero_documento=item.numero_documento, codigo_banco=item.codigo_banco, nome_banco=item.nome_banco, agencia=item.agencia, valor_principal=item.valor_principal, valor_multa=item.valor_multa, valor_juros=item.valor_juros, valor_total=item.valor_total, texto_original=item.texto_original, status="composição divergente" if item.composicao_divergente else "pronto")
@@ -590,9 +620,11 @@ def reconcile(conciliacao_id: str, db: Session = Depends(get_db)):
     receipts = db.query(Comprovante).filter_by(conciliacao_id=conciliacao_id, ativo=True).all()
     rfb_receipts = [item for item in db.query(ComprovanteRfb).filter_by(conciliacao_id=conciliacao_id) if belongs_to_selected_bank(item, reconciliation.banco)]
     used_receipts, used_rfb = set(), set()
-    movements = db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True, natureza="saída").order_by(MovimentoExtrato.data, MovimentoExtrato.hora).all()
+    movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True, natureza="saída").order_by(MovimentoExtrato.data, MovimentoExtrato.hora) if in_reconciliation_period(reconciliation, item)]
     for movement in movements:
-        receipt = next((item for item in receipts if item.id not in used_receipts and item.valor_pago == movement.valor and item.data == movement.data), None)
+        movement_text = " ".join(item for item in [movement.historico, movement.nome_encontrado] if item)
+        receipt_candidates = [item for item in receipts if item.id not in used_receipts and item.valor_pago == movement.valor and item.data == movement.data and names_similar(movement_text, item.favorecido)]
+        receipt = receipt_candidates[0] if len(receipt_candidates) == 1 else None
         rfb = next((item for item in rfb_receipts if item.id not in used_rfb and item.valor_total == movement.valor and item.data_arrecadacao == movement.data), None)
         source_rfb = None
         if rfb:

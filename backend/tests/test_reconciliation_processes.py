@@ -24,7 +24,7 @@ def test_process_resumes_the_same_bank_and_exposes_shared_rule_source():
 
     statement = Arquivo(conciliacao_id=bradesco["id"], tipo_documento="extrato", banco_selecionado="Bradesco", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
     session.add(statement); session.flush()
-    session.add(MovimentoExtrato(conciliacao_id=bradesco["id"], arquivo_id=statement.id, pagina_numero=1, historico="PIX FORNECEDOR", natureza="saída"))
+    session.add(MovimentoExtrato(conciliacao_id=bradesco["id"], arquivo_id=statement.id, pagina_numero=1, data=date(2024, 1, 2), historico="PIX FORNECEDOR", natureza="saída"))
     session.add(RegraContabil(cliente_id=client.id, banco="Santander", tipo_fonte="extrato", tipo_operacao="saída", favorecido_normalizado=normalize_name("PIX"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento"))
     session.commit()
 

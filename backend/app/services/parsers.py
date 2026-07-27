@@ -1,9 +1,12 @@
 import re
+import logging
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from app.services.normalization import normalize_name
+
+logger = logging.getLogger(__name__)
 
 DATE_RE = r"(\d{2}/\d{2}/\d{4})"
 TIME_RE = r"(\d{2}:\d{2}(?::\d{2})?)"
@@ -217,7 +220,7 @@ def _extract_banco_do_brasil_statement(text: str, page_number: int) -> list[Pars
         r"(?m)^(?P<data>\d{2}/\d{2}/\d{4})\n"
         r"\d{4}\n"
         r"(?P<historico>[^\n]+)\n"
-        r"(?P<documento>[^\n]+)\n"
+        r"(?P<documento>[^\n]+?)(?:\n|[ \t]+)"
         r"(?P<valor>[\d.]+,\d{2})[ \t]+(?P<natureza>[CD])(?:[ \t]+[^\n]+)?"
         r"(?P<detalhe>(?:\n(?!\d{2}/\d{2}/\d{4}\n)[^\n]+)*)"
     )
@@ -226,6 +229,8 @@ def _extract_banco_do_brasil_statement(text: str, page_number: int) -> list[Pars
         parsed_date, _ = parse_date_time(match.group("data"))
         amount = parse_brl(match.group("valor"))
         history = re.sub(r"^\d+\s+\d+\s+", "", match.group("historico")).strip()
+        if re.search(r"\b(?:saldo anterior|saldo do dia|saldo final|limite|valor total devido|cheque especial)\b", history, re.I):
+            continue
         detail = match.group("detalhe").strip()
         _, hour = parse_date_time(detail)
         name = re.sub(r"^\d{2}/\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?\s+", "", detail)
@@ -241,3 +246,18 @@ def _extract_banco_do_brasil_statement(text: str, page_number: int) -> list[Pars
             pagina_numero=page_number,
         ))
     return results
+
+
+def deduplicate_statement_records(records: list[ParsedStatement]) -> list[ParsedStatement]:
+    """Keeps a repeated transaction at a PDF page boundary only once."""
+    seen_pages: dict[tuple[object, ...], int] = {}
+    unique = []
+    for record in records:
+        key = (normalize_name(record.texto_original), record.data, record.valor, record.natureza)
+        previous_page = seen_pages.get(key)
+        if previous_page is not None and previous_page != record.pagina_numero:
+            logger.info("Extrato BB duplicado entre páginas ignorado: data=%s historico=%s valor=%s natureza=%s", record.data, record.historico, record.valor, record.natureza)
+            continue
+        seen_pages[key] = record.pagina_numero
+        unique.append(record)
+    return unique

@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from app.services.normalization import names_similar
 from app.services.matching import invoice_is_candidate
-from app.services.parsers import extract_receipts, extract_statement, parse_brl, parse_date_time
+from app.services.parsers import deduplicate_statement_records, extract_receipts, extract_statement, parse_brl, parse_date_time
 
 
 def test_receipt_is_one_line_even_with_institutional_text():
@@ -74,6 +74,76 @@ def test_banco_do_brasil_parser_is_not_used_for_other_banks():
 02/01 09:40 Lia Da Silva Alexandre
 """
     assert extract_statement(text, 1, "Santander") == []
+
+
+def test_banco_do_brasil_uses_first_cd_value_and_ignores_balance_rows():
+    text = """02/01/2024
+0000
+BB Rende Fácil
+10.202
+100,00 C 1.000,00 C
+02/01 09:40 Aplicação
+02/01/2024
+0000
+Saldo do dia
+10.203
+1.000,00 C
+02/01/2024
+0000
+PIX - Enviado
+10.204
+100,00 D 900,00 D
+02/01 10:00 Fornecedor
+"""
+
+    records = extract_statement(text, 1, "Banco do Brasil")
+
+    assert [(item.historico, item.valor, item.natureza) for item in records] == [
+        ("BB Rende Fácil", Decimal("100.00"), "saída"),
+        ("PIX - Enviado", Decimal("100.00"), "entrada"),
+    ]
+
+
+def test_banco_do_brasil_page_boundary_duplicate_is_kept_once():
+    text = """02/01/2024
+0000
+PIX - Enviado
+10.202
+520,52 C
+02/01 09:40 Lia Da Silva Alexandre
+"""
+    records = extract_statement(text, 1, "Banco do Brasil") + extract_statement(text, 2, "Banco do Brasil")
+
+    assert len(deduplicate_statement_records(records)) == 1
+
+
+def test_banco_do_brasil_reads_inline_document_value_and_keeps_same_day_duplicates():
+    text = """30/01/2024
+0000
+TED-Crédito em Conta
+319.950.632 12.000,00 C
+Cliente A
+31/01/2024
+0000
+Pagamento de Boleto
+13.101
+493,14 D
+Conselho Federal
+31/01/2024
+0000
+Pagamento de Boleto
+13.102
+493,14 D
+Conselho Federal
+"""
+    records = extract_statement(text, 1, "Banco do Brasil")
+
+    assert [(item.valor, item.natureza) for item in records] == [
+        (Decimal("12000.00"), "saída"),
+        (Decimal("493.14"), "entrada"),
+        (Decimal("493.14"), "entrada"),
+    ]
+    assert len(deduplicate_statement_records(records)) == 3
 
 
 def test_payment_receipt_uses_beneficiario_final_and_valor_documento():

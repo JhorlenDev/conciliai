@@ -21,19 +21,6 @@ def affected_reconciliations() -> str:
 
 
 def upgrade() -> None:
-    # Undo the previous broad update for non-BB records.
-    op.execute(f"""
-        UPDATE movimentos_extrato m
-        SET natureza = CASE
-            WHEN m.texto_original ~ '[0-9][[:space:]]+C([[:space:]]|$)' THEN 'entrada'
-            WHEN m.texto_original ~ '[0-9][[:space:]]+D([[:space:]]|$)' THEN 'saída'
-            ELSE m.natureza
-        END
-        FROM arquivos a
-        WHERE a.id = m.arquivo_id
-          AND a.banco_selecionado <> 'Banco do Brasil'
-          AND {MATCH}
-    """)
     op.execute(f"""
         UPDATE movimentos_extrato m
         SET natureza = CASE

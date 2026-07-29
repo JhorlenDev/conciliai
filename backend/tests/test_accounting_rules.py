@@ -38,7 +38,7 @@ def test_rule_application_and_csv_include_only_covered_movements():
     assert len(data["pendentes"]) == 1
     entry = session.query(LancamentoContabil).filter_by(status="aplicado_por_regra").one()
     assert (entry.valor, entry.conta_debito, entry.conta_credito) == (Decimal("12.50"), "Despesa", "Banco")
-    assert data["resumo"]["razao"] == {"debito": "12.50", "credito": "0"}
+    assert data["resumo"]["razao"] == {"debito": "0", "credito": "12.50"}
 
 
 def test_credit_rule_moves_entry_to_saved_and_reason_only_sums_covered_value():
@@ -59,10 +59,10 @@ def test_credit_rule_moves_entry_to_saved_and_reason_only_sums_covered_value():
     data = accounting_rules(reconciliation.id, session)
 
     assert data["pendentes"] == []
-    assert data["salvas"][0]["natureza"] == "entrada"
+    assert data["salvas"][0]["natureza"] == "Débito"
     entry = session.query(LancamentoContabil).filter_by(status="aplicado_por_regra").one()
     assert (entry.valor, entry.conta_debito, entry.conta_credito) == (Decimal("20.00"), "Banco", "Receita")
-    assert data["resumo"]["razao"] == {"debito": "0", "credito": "20.00"}
+    assert data["resumo"]["razao"] == {"debito": "20.00", "credito": "0"}
 
 
 def test_reason_separates_debit_and_credit_movements_without_double_counting():

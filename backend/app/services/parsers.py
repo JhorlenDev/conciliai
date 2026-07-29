@@ -233,7 +233,7 @@ def extract_statement(text: str, page_number: int, bank: str = "") -> list[Parse
         history = " ".join(columns[1:-1])
         _, hour = parse_date_time(history)
         name = re.sub(r".*?\d{2}/\d{2}\s+(?:\d{2}:\d{2}(?::\d{2})?\s+)?", "", history).strip()
-        nature = "saída" if re.search(r"enviado|debito|débito|pagamento", history, re.I) else "entrada"
+        nature = "Débito" if re.search(r"enviado|debito|débito|pagamento", history, re.I) else "Crédito"
         results.append(ParsedStatement(parsed_date, hour, history, name, amount, nature, line, page_number))
     return results
 
@@ -269,7 +269,7 @@ def _extract_banco_do_brasil_statement(text: str, page_number: int) -> list[Pars
             historico=history,
             nome=name,
             valor=amount,
-            natureza="entrada" if match.group("natureza") == "C" else "saída",
+            natureza="Crédito" if match.group("natureza") == "C" else "Débito",
             texto_original=match.group(0).strip(),
             pagina_numero=page_number,
             data_origem=data_origem,

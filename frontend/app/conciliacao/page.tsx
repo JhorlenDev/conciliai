@@ -156,7 +156,7 @@ function Table({
                 <tr className="border-t align-top" key={row.id ?? index}>
                   {columns.map((column) => (
                     <td
-                      className={`max-w-72 px-2 py-2${column === "Favorecido" ? " whitespace-pre-line" : ""}`}
+                      className={`max-w-72 px-2 py-2${column === "Favorecido" ? " whitespace-pre-line" : ""}${column === "Natureza" ? row.natureza === "Débito" ? " font-semibold text-blue-700" : " font-semibold text-red-700" : ""}`}
                       key={column}
                     >
                       {row[column.toLowerCase().replaceAll(" ", "_")] || "—"}
@@ -332,6 +332,7 @@ type PendingRule = {
   historico: string;
   valor: string;
   natureza: string;
+  natureza_contabil?: string;
   tipo_componente?: string;
   valor_documento?: string;
   composicao_simples?: string;
@@ -353,12 +354,14 @@ type SavedRule = {
   id: string;
   gatilho: string;
   natureza: string;
+  natureza_contabil?: string;
   tipo_componente?: string;
   conta_debito: string;
   conta_credito: string;
   historico: string;
   complemento: string;
   cobertos: number;
+  movimentos?: { data: string; historico: string; valor: string; natureza: string; natureza_contabil: string }[];
 };
 
 function LegacyAdvancedRulesPanel({
@@ -684,8 +687,8 @@ function AdvancedRulesPanel({
         }
       : {
           gatilho: "",
-          debito: item.natureza === "saída" ? account : "",
-          credito: item.natureza === "entrada" ? account : "",
+          debito: item.natureza === "Débito" ? account : "",
+          credito: item.natureza === "Crédito" ? account : "",
           historico: "",
           complemento: "Conforme extrato bancário",
         };
@@ -708,7 +711,7 @@ function AdvancedRulesPanel({
     const fields = defaults(item);
     const body = {
       gatilho: value(item.id, "gatilho", fields.gatilho),
-      natureza: item.natureza,
+      natureza: item.natureza_contabil || item.natureza,
       tipo_componente: item.tipo_componente || "",
       conta_debito: value(item.id, "debito", fields.debito),
       conta_credito: value(item.id, "credito", fields.credito),
@@ -747,7 +750,7 @@ function AdvancedRulesPanel({
   function legacyEditor(item: PendingRule | SavedRule, existing = false) {
     const fields = defaults(item);
     const pendingItem = "data" in item ? item : null;
-    const isDebit = item.natureza === "saída";
+    const isDebit = (item.natureza_contabil || item.natureza) === "Débito";
     const words = pendingItem?.historico.match(/[\p{L}\p{N}]+/gu) ?? [];
     const keyword = value(item.id, "gatilho", fields.gatilho);
     const coveredCount =
@@ -759,7 +762,7 @@ function AdvancedRulesPanel({
                 candidate.historico
                   .toUpperCase()
                   .includes(keyword.toUpperCase()) &&
-                candidate.natureza === item.natureza,
+                (candidate.natureza_contabil || candidate.natureza) === (item.natureza_contabil || item.natureza),
             ).length
           : 0;
     return (
@@ -896,7 +899,7 @@ function AdvancedRulesPanel({
   ) {
     const fields = defaults(item);
     const pendingItem = "data" in item ? item : null;
-    const isDebit = item.natureza === "saída";
+    const isDebit = (item.natureza_contabil || item.natureza) === "Débito";
     const words = pendingItem?.historico.match(/[\p{L}\p{N}]+/gu) ?? [];
     const keyword = value(item.id, "gatilho", fields.gatilho);
     const coveredCount =
@@ -908,7 +911,7 @@ function AdvancedRulesPanel({
                 candidate.historico
                   .toUpperCase()
                   .includes(keyword.toUpperCase()) &&
-                candidate.natureza === item.natureza,
+                (candidate.natureza_contabil || candidate.natureza) === (item.natureza_contabil || item.natureza),
             ).length
           : 0;
     return (
@@ -1258,9 +1261,7 @@ function AdvancedRulesPanel({
                               {movement.historico}
                             </span>
                             <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-800">
-                              {movement.natureza === "saída"
-                                ? "Débito"
-                                : "Crédito"}
+                              Extrato: {movement.natureza} | Contábil: {movement.natureza_contabil}
                             </span>
                             {movement.comprovante_confere && (
                               <span className="text-[10px] text-emerald-700">
@@ -1307,7 +1308,28 @@ function AdvancedRulesPanel({
                     </Fragment>
                   );
                 })
-              : saved.map((item) => editor(item, true, false, false, showActions))}
+              : saved.map((item) => (
+                  <Fragment key={item.id}>
+                    {editor(item, true, false, false, showActions)}
+                    {item.movimentos?.length ? (
+                      <tr className="bg-slate-50">
+                        <td colSpan={showActions ? 10 : 9} className="px-3 pb-3 pt-1">
+                          <p className="mb-1 text-[10px] font-semibold uppercase text-slate-500">Lançamentos cobertos</p>
+                          <div className="divide-y divide-slate-200 border-y border-slate-200 text-xs text-slate-600">
+                            {item.movimentos.map((movement, index) => (
+                              <div className="grid grid-cols-[90px_minmax(240px,1fr)_120px_90px] gap-3 py-1.5" key={`${movement.data}-${index}`} title={movement.historico}>
+                                <strong>{movement.data}</strong>
+                                <span className="truncate">{movement.historico}</span>
+                                <span>R$ {Number(movement.valor).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}</span>
+                                <span>{movement.natureza_contabil}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </td>
+                      </tr>
+                    ) : null}
+                  </Fragment>
+                ))}
           </tbody>
         </table>
       </div>
@@ -1429,6 +1451,7 @@ function LegacyResultTable({
                 "Comprovante bancário",
                 "Comprovante RFB",
                 "Valor",
+                "Natureza contábil",
                 "Fonte",
                 "Situação",
                 "",
@@ -1477,6 +1500,7 @@ function LegacyResultTable({
                       )}
                     </td>
                     <td className="whitespace-nowrap px-3 py-3">{row.valor}</td>
+                    <td className={`px-3 py-3 font-semibold ${row.natureza_contabil === "Débito" ? "text-blue-700" : "text-red-700"}`}>{row.natureza_contabil}</td>
                     <td className="px-3 py-3">{row.fonte_regra}</td>
                     <td className="px-3 py-3">
                       <span
@@ -1503,7 +1527,7 @@ function LegacyResultTable({
                       className={`border-t ${tag?.[3] ?? "bg-white"}`}
                       key={`${row.id}-details`}
                     >
-                      <td className="px-3 py-3 text-slate-600" colSpan={9}>
+                      <td className="px-3 py-3 text-slate-600" colSpan={10}>
                         <p>
                           Confiança: {row.confianca} | Total dos lançamentos:{" "}
                           {row.total_lancamentos} | Diferença: {row.diferenca}
@@ -2351,10 +2375,10 @@ function ConciliacaoFlow({
         .trim(),
     ) || 0;
   const extratoDebito = review.extratos
-    .filter((item) => item.natureza === "saída")
+    .filter((item) => item.natureza === "Débito")
     .reduce((total, item) => total + numberValue(item.valor), 0);
   const extratoCredito = review.extratos
-    .filter((item) => item.natureza === "entrada")
+    .filter((item) => item.natureza === "Crédito")
     .reduce((total, item) => total + numberValue(item.valor), 0);
   const rulesToCreate =
     results?.filter((item) => item.fonte_regra === "extrato").length ?? 0;

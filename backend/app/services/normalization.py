@@ -11,6 +11,35 @@ def normalize_name(value: str) -> str:
     return " ".join(token for token in tokens if token not in {"DE", "DA", "DO", "DAS", "DOS"})
 
 
+def normalize_statement_nature(value: str | None) -> str:
+    """Presents bank statement direction consistently, including legacy values."""
+    normalized = normalize_name(value or "")
+    if normalized in {"C", "CREDITO", "ENTRADA"}:
+        return "Crédito"
+    if normalized in {"D", "DEBITO", "SAIDA"}:
+        return "Débito"
+    return ""
+
+
+def accounting_nature(value: str | None) -> str:
+    nature = normalize_statement_nature(value)
+    return "Débito" if nature == "Crédito" else "Crédito" if nature == "Débito" else ""
+
+
+def is_statement_debit(value: str | None) -> bool:
+    return normalize_statement_nature(value) == "Débito"
+
+
+def normalize_rule_accounting_nature(value: str | None) -> str:
+    # Rules saved before the visual change stored the statement direction.
+    normalized = normalize_name(value or "")
+    if normalized == "SAIDA":
+        return "Crédito"
+    if normalized == "ENTRADA":
+        return "Débito"
+    return normalize_statement_nature(value)
+
+
 def names_similar(left: str, right: str, allow_truncated_terminal: bool = False) -> bool:
     a, b = normalize_name(left).split(), normalize_name(right).split()
     if not a or not b:

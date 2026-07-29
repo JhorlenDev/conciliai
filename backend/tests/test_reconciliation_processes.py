@@ -82,7 +82,7 @@ def test_reprocessing_statement_clears_previous_reconciliation_results(tmp_path)
 
     assert session.query(Correspondencia).filter_by(conciliacao_id=reconciliation_id).count() == 0
     assert session.query(LancamentoContabil).count() == 0
-    assert session.query(MovimentoExtrato).filter_by(arquivo_id=file.id, natureza="entrada").count() == 1
+    assert session.query(MovimentoExtrato).filter_by(arquivo_id=file.id, natureza="Crédito").count() == 1
 
 
 def test_boleto_matches_paid_value_once_and_creates_component_items():

@@ -90,7 +90,7 @@ class MovimentoExtrato(RegistroBase, Base):
     historico: Mapped[str] = mapped_column(Text, default="")
     nome_encontrado: Mapped[str] = mapped_column(Text, default="")
     valor: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
-    natureza: Mapped[str] = mapped_column(String(10), default="saída")
+    natureza: Mapped[str] = mapped_column(String(10), default="Débito")
     data_origem: Mapped[str] = mapped_column(String(10), default="")
 
 

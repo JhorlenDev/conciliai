@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from app.core.config import UPLOAD_DIR
 from app.core.database import get_db
 from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, ComprovanteRfbItem, Conciliacao, ContaBancaria, Correspondencia, DocumentoImportante, LancamentoContabil, MovimentoExtrato, NotaFiscal, ProcessoConciliacao, RegraContabil
-from app.services.normalization import normalize_name
+from app.services.normalization import accounting_nature, is_statement_debit, normalize_name, normalize_rule_accounting_nature, normalize_statement_nature
 from app.services.matching import names_similar
 from app.services.parsers import deduplicate_statement_records, extract_receipts, extract_statement
 from app.services.rfb import belongs_to_selected_bank, parse_rfb_page
@@ -384,7 +384,7 @@ def rule_matches_movement(rule: RegraContabil, movement: MovimentoExtrato, count
     trigger = normalize_name(rule.favorecido_normalizado)
     history = normalize_name(" ".join(item for item in [movement.historico, movement.nome_encontrado, counterparty] if item))
     component_matches = not component or (rule.tipo_componente == component if rule.tipo_componente else component in {"PRINCIPAL", "VALOR_COBRADO"})
-    return bool(trigger and trigger in history and (not rule.tipo_operacao or rule.tipo_operacao == movement.natureza) and component_matches)
+    return bool(trigger and trigger in history and (not rule.tipo_operacao or normalize_rule_accounting_nature(rule.tipo_operacao) == accounting_nature(movement.natureza)) and component_matches)
 
 
 def in_reconciliation_period(reconciliation: Conciliacao, movement: MovimentoExtrato) -> bool:
@@ -436,7 +436,8 @@ def is_transfer_without_counterparty(movement: MovimentoExtrato) -> bool:
 
 
 def rule_payload(rule: RegraContabil, movements: list[MovimentoExtrato]) -> dict:
-    return {"id": rule.id, "gatilho": rule.favorecido_normalizado, "natureza": rule.tipo_operacao, "tipo_componente": rule.tipo_componente, "conta_debito": rule.conta_debito, "conta_credito": rule.conta_credito, "historico": rule.historico, "complemento": rule.complemento, "banco_origem": rule.banco, "cobertos": sum(rule_matches_movement(rule, item) for item in movements)}
+    covered = [item for item in movements if rule_matches_movement(rule, item)]
+    return {"id": rule.id, "gatilho": rule.favorecido_normalizado, "natureza": normalize_rule_accounting_nature(rule.tipo_operacao), "tipo_componente": rule.tipo_componente, "conta_debito": rule.conta_debito, "conta_credito": rule.conta_credito, "historico": rule.historico, "complemento": rule.complemento, "banco_origem": rule.banco, "cobertos": len(covered), "movimentos": [{"data": item.data.strftime("%d/%m/%Y") if item.data else "—", "historico": " ".join(part for part in [item.historico, item.nome_encontrado] if part), "valor": str(item.valor or 0), "natureza": normalize_statement_nature(item.natureza), "natureza_contabil": accounting_nature(item.natureza)} for item in covered]}
 
 
 def scoped_rules(reconciliation: Conciliacao, db: Session) -> list[RegraContabil]:
@@ -541,16 +542,16 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db)):
             if rfb.valor_multa: lines.append(f"Multa: {money(rfb.valor_multa)}")
             if rfb.valor_juros: lines.append(f"Juros: {money(rfb.valor_juros)}")
             composition = "Composição:\n- " + "\n- ".join(lines) + f"\nTotal do documento: {money(rfb.valor_total or 0)}"
-        return {"id": f"{item.id}:{component}", "data": item.data.strftime("%d/%m/%y") if item.data else "—", "historico": history, "valor": str(value if value is not None else item.valor or 0), "natureza": item.natureza, "tipo_componente": component, "valor_documento": str(receipt.valor_original) if receipt and receipt.valor_original else "", "composicao_simples": composition, "tarifa_no_extrato": tariff_in_statement, "tarifa_referente_ao_comprovante": tariff_reference, "tarifa_referencia_nome": (receipt.beneficiario or receipt.favorecido) if tariff_reference else "", "tarifa_referencia_valor": str(receipt.valor_pago or 0) if tariff_reference else "", "tarifa_referencia_data": receipt.data.strftime("%d/%m/%Y") if tariff_reference and receipt.data else "", "pagina": item.pagina_numero, "arquivo_id": item.arquivo_id, "comprovante_arquivo_id": receipt.arquivo_id if receipt else None, "comprovante_pagina": receipt.pagina_numero if receipt else None, "comprovante_confere": bool(receipt and match and match.status.startswith("Conciliado")), "regra_compartilhada": {"id": shared_rule.id, "banco_origem": shared_rule.banco, "gatilho": shared_rule.favorecido_normalizado} if shared_rule else None}
+        return {"id": f"{item.id}:{component}", "data": item.data.strftime("%d/%m/%y") if item.data else "—", "historico": history, "valor": str(value if value is not None else item.valor or 0), "natureza": normalize_statement_nature(item.natureza), "natureza_contabil": accounting_nature(item.natureza), "tipo_componente": component, "valor_documento": str(receipt.valor_original) if receipt and receipt.valor_original else "", "composicao_simples": composition, "tarifa_no_extrato": tariff_in_statement, "tarifa_referente_ao_comprovante": tariff_reference, "tarifa_referencia_nome": (receipt.beneficiario or receipt.favorecido) if tariff_reference else "", "tarifa_referencia_valor": str(receipt.valor_pago or 0) if tariff_reference else "", "tarifa_referencia_data": receipt.data.strftime("%d/%m/%Y") if tariff_reference and receipt.data else "", "pagina": item.pagina_numero, "arquivo_id": item.arquivo_id, "comprovante_arquivo_id": receipt.arquivo_id if receipt else None, "comprovante_pagina": receipt.pagina_numero if receipt else None, "comprovante_confere": bool(receipt and match and match.status.startswith("Conciliado")), "regra_compartilhada": {"id": shared_rule.id, "banco_origem": shared_rule.banco, "gatilho": shared_rule.favorecido_normalizado} if shared_rule else None}
     pending = []
     for movement in movements:
         match = matches.get(movement.id)
         items = db.query(LancamentoContabil).filter_by(correspondencia_id=match.id).all() if match else []
         candidates = [(entry.componente, entry.valor) for entry in items] or [("PRINCIPAL", movement.valor)]
         pending.extend(pending_payload(movement, component, value) for component, value in candidates if not any(rule_matches_movement(rule, movement, component=component) for rule in same_bank_rules))
-    reason_debit = sum((item.valor or 0 for item in applied_movements if item.natureza == "saída"), 0)
-    reason_credit = sum((item.valor or 0 for item in applied_movements if item.natureza == "entrada"), 0)
-    return {"pendentes": pending, "salvas": [rule_payload(rule, movements) for rule in same_bank_rules], "resumo": {"extrato": {"debito": str(sum((item.valor or 0 for item in movements if item.natureza == "saída"), 0)), "credito": str(sum((item.valor or 0 for item in movements if item.natureza == "entrada"), 0))}, "razao": {"debito": str(reason_debit), "credito": str(reason_credit)}}}
+    reason_debit = sum((item.valor or 0 for item in applied_movements if accounting_nature(item.natureza) == "Débito"), 0)
+    reason_credit = sum((item.valor or 0 for item in applied_movements if accounting_nature(item.natureza) == "Crédito"), 0)
+    return {"pendentes": pending, "salvas": [rule_payload(rule, movements) for rule in same_bank_rules], "resumo": {"extrato": {"debito": str(sum((item.valor or 0 for item in movements if is_statement_debit(item.natureza)), 0)), "credito": str(sum((item.valor or 0 for item in movements if not is_statement_debit(item.natureza)), 0))}, "razao": {"debito": str(reason_debit), "credito": str(reason_credit)}}}
 
 
 @router.post("/conciliacoes/{conciliacao_id}/regras-contabeis")
@@ -757,7 +758,7 @@ def reconcile(conciliacao_id: str, db: Session = Depends(get_db)):
     rfb_receipts = [item for item in db.query(ComprovanteRfb).filter_by(conciliacao_id=conciliacao_id) if belongs_to_selected_bank(item, reconciliation.banco)]
     existing_matches = {item.movimento_extrato_id: item for item in db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id).all()}
     used_receipts, used_rfb = set(), set()
-    movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True, natureza="saída").order_by(MovimentoExtrato.data, MovimentoExtrato.hora) if in_reconciliation_period(reconciliation, item)]
+    movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True).order_by(MovimentoExtrato.data, MovimentoExtrato.hora) if is_statement_debit(item.natureza) and in_reconciliation_period(reconciliation, item)]
     for movement in movements:
         # The extracted counterparty is more precise than the operation history.
         movement_text = movement.nome_encontrado or movement.historico
@@ -832,7 +833,7 @@ def result(conciliacao_id: str, db: Session = Depends(get_db)):
             additions = (receipt.valor_juros or 0) + (receipt.valor_multa or 0) + (receipt.valor_encargos or 0)
             expected = (receipt.valor_original or receipt.valor_pago or 0) - discount + additions
             receipt_composition = {"valor_documento": money(receipt.valor_original), "valor_cobrado": money(receipt.valor_pago), "desconto": money(discount), "juros": money(receipt.valor_juros), "multa": money(receipt.valor_multa), "encargos": money(receipt.valor_encargos), "valor_calculado": money(expected), "diferenca": money((receipt.valor_pago or 0) - expected), "confere": abs((receipt.valor_pago or 0) - expected) <= Decimal("0.01")}
-        rows.append({"id": match.id, "data": movement_date, "tipo_pagamento": payment_type(movement.historico), "natureza": movement.natureza, "extrato": f"Data: {movement_date}\nTexto: {' '.join(item for item in [movement.historico, movement.nome_encontrado] if item)}\nValor: {money(movement.valor)}", "comprovante_bancario": receipt_detail, "comprovante_rfb": rfb_detail, "comprovante_composicao": receipt_composition, "extrato_arquivo_id": movement.arquivo_id, "extrato_pagina": movement.pagina_numero, "comprovante_arquivo_id": receipt.arquivo_id if receipt else None, "comprovante_pagina": receipt.pagina_numero if receipt else None, "rfb_arquivo_id": rfb.arquivo_id if rfb else None, "rfb_pagina": rfb.pagina_numero if rfb else None, "valor": money(movement.valor), "fonte_regra": match.fonte_regra or "—", "total_lancamentos": money(total_lines), "diferenca": money(movement.valor - total_lines), "confianca": match.confianca, "situacao": match.status})
+        rows.append({"id": match.id, "data": movement_date, "tipo_pagamento": payment_type(movement.historico), "natureza": normalize_statement_nature(movement.natureza), "natureza_contabil": accounting_nature(movement.natureza), "extrato": f"Data: {movement_date}\nTexto: {' '.join(item for item in [movement.historico, movement.nome_encontrado] if item)}\nValor: {money(movement.valor)}", "comprovante_bancario": receipt_detail, "comprovante_rfb": rfb_detail, "comprovante_composicao": receipt_composition, "extrato_arquivo_id": movement.arquivo_id, "extrato_pagina": movement.pagina_numero, "comprovante_arquivo_id": receipt.arquivo_id if receipt else None, "comprovante_pagina": receipt.pagina_numero if receipt else None, "rfb_arquivo_id": rfb.arquivo_id if rfb else None, "rfb_pagina": rfb.pagina_numero if rfb else None, "valor": money(movement.valor), "fonte_regra": match.fonte_regra or "—", "total_lancamentos": money(total_lines), "diferenca": money(movement.valor - total_lines), "confianca": match.confianca, "situacao": match.status})
     for row in rows:
         items = db.query(LancamentoContabil).filter_by(correspondencia_id=row["id"]).order_by(LancamentoContabil.ordem, LancamentoContabil.id).all()
         row["lancamentos"] = [{"id": item.id, "componente": item.componente, "categoria": item.categoria, "tributo": item.tributo, "codigo_receita": item.codigo_receita, "descricao": item.descricao, "efeito_no_total": item.efeito_no_total, "valor": money(item.valor), "conta_debito": item.conta_debito, "conta_credito": item.conta_credito, "historico": item.historico, "origem": item.origem, "status": item.status, "regra_contabil_id": item.regra_contabil_id} for item in items]
@@ -920,7 +921,7 @@ def review(conciliacao_id: str, db: Session = Depends(get_db)):
     rfb_records = [item for item in db.query(ComprovanteRfb).filter_by(conciliacao_id=conciliacao_id).order_by(ComprovanteRfb.data_arrecadacao.asc(), ComprovanteRfb.id.asc()) if reconciliation and belongs_to_selected_bank(item, reconciliation.banco)]
 
     return {
-        "extratos": [base(x, {"data": display_date(x.data), "hora": x.hora, "historico": " ".join(item for item in [x.historico, x.nome_encontrado] if item), "valor": str(x.valor), "natureza": x.natureza}) for x in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True).order_by(MovimentoExtrato.data.asc(), MovimentoExtrato.hora.asc().nulls_last(), MovimentoExtrato.id.asc())],
+        "extratos": [base(x, {"data": display_date(x.data), "hora": x.hora, "historico": " ".join(item for item in [x.historico, x.nome_encontrado] if item), "valor": str(x.valor), "natureza": normalize_statement_nature(x.natureza), "natureza_contabil": accounting_nature(x.natureza)}) for x in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True).order_by(MovimentoExtrato.data.asc(), MovimentoExtrato.hora.asc().nulls_last(), MovimentoExtrato.id.asc())],
         "comprovantes": [base(x, {"data": display_date(x.data), "hora": x.hora, "favorecido": receipt_counterparty(x), "valor_original": money(x.valor_original), "ajustes": adjustments(x), "valor_pago": money(x.valor_pago), "tipo": x.tipo_operacao}) for x in db.query(Comprovante).filter_by(conciliacao_id=conciliacao_id, ativo=True).order_by(Comprovante.data.asc(), Comprovante.hora.asc().nulls_last(), Comprovante.id.asc())],
         "rfb": [base(x, {"tipo": x.tipo, "competencia_apuracao": x.competencia or x.periodo_apuracao or "—", "data_arrecadacao": display_date(x.data_arrecadacao), "documento": x.numero_documento, "banco": x.nome_banco, "principal": money(x.valor_principal), "multa_juros": "Sem acréscimos" if not ((x.valor_multa or 0) + (x.valor_juros or 0)) else f"Multa: {money(x.valor_multa)} + Juros: {money(x.valor_juros)}", "total": money(x.valor_total), "situacao": x.status}) for x in rfb_records],
         "arquivos": [{"id": x.id, "nome": x.nome_original, "tipo": x.tipo_documento, "status": x.status_processamento, "erro": x.mensagem_erro} for x in db.query(Arquivo).filter_by(conciliacao_id=conciliacao_id, ativo=True)],

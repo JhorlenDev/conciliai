@@ -1,7 +1,7 @@
 from datetime import date
 from decimal import Decimal
 
-from app.services.normalization import names_similar
+from app.services.normalization import accounting_nature, names_similar, normalize_statement_nature
 from app.services.matching import invoice_is_candidate
 from app.services.parsers import deduplicate_statement_records, extract_financial_values, extract_receipts, extract_statement, parse_brl, parse_date_time
 
@@ -17,6 +17,13 @@ def test_pix_receipt_extracts_its_separate_tariff():
 
     assert values.valor_pago == Decimal("2100.00")
     assert values.valor_tarifa == Decimal("10.00")
+
+
+def test_statement_and_accounting_natures_support_codes_and_legacy_values():
+    assert normalize_statement_nature("C") == normalize_statement_nature("entrada") == "Crédito"
+    assert normalize_statement_nature("D") == normalize_statement_nature("saída") == "Débito"
+    assert accounting_nature("Crédito") == "Débito"
+    assert accounting_nature("Débito") == "Crédito"
 
 
 def test_documento_pix_and_ted_are_never_names():
@@ -66,7 +73,7 @@ def test_banco_do_brasil_credit_in_statement_becomes_credit_in_system():
     assert record.hora == "09:40"
     assert record.nome == "Lia Da Silva Alexandre"
     assert record.valor == Decimal("520.52")
-    assert record.natureza == "entrada"
+    assert record.natureza == "Crédito"
 
 
 def test_banco_do_brasil_debit_in_statement_becomes_debit_in_system():
@@ -77,7 +84,7 @@ def test_banco_do_brasil_debit_in_statement_becomes_debit_in_system():
 520,52 D
 02/01 09:40 Lia Da Silva Alexandre
 """
-    assert extract_statement(text, 1, "Banco do Brasil")[0].natureza == "saída"
+    assert extract_statement(text, 1, "Banco do Brasil")[0].natureza == "Débito"
 
 
 def test_banco_do_brasil_parser_is_not_used_for_other_banks():
@@ -114,8 +121,8 @@ PIX - Enviado
     records = extract_statement(text, 1, "Banco do Brasil")
 
     assert [(item.historico, item.valor, item.natureza) for item in records] == [
-        ("BB Rende Fácil", Decimal("100.00"), "entrada"),
-        ("PIX - Enviado", Decimal("100.00"), "saída"),
+        ("BB Rende Fácil", Decimal("100.00"), "Crédito"),
+        ("PIX - Enviado", Decimal("100.00"), "Débito"),
     ]
 
 
@@ -207,9 +214,9 @@ Conselho Federal
     records = extract_statement(text, 1, "Banco do Brasil")
 
     assert [(item.valor, item.natureza) for item in records] == [
-        (Decimal("12000.00"), "entrada"),
-        (Decimal("493.14"), "saída"),
-        (Decimal("493.14"), "saída"),
+        (Decimal("12000.00"), "Crédito"),
+        (Decimal("493.14"), "Débito"),
+        (Decimal("493.14"), "Débito"),
     ]
     assert len(deduplicate_statement_records(records)) == 3
 

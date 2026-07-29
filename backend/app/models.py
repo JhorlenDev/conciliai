@@ -91,6 +91,7 @@ class MovimentoExtrato(RegistroBase, Base):
     nome_encontrado: Mapped[str] = mapped_column(Text, default="")
     valor: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     natureza: Mapped[str] = mapped_column(String(10), default="saída")
+    data_origem: Mapped[str] = mapped_column(String(10), default="")
 
 
 class Comprovante(RegistroBase, Base):
@@ -106,10 +107,17 @@ class Comprovante(RegistroBase, Base):
     valor_juros: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     valor_multa: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     valor_encargos: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    valor_tarifa: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     valor_pago: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     detalhes_financeiros: Mapped[dict] = mapped_column(JSON, default=dict)
     tipo_operacao: Mapped[str] = mapped_column(String(20), default="")
     banco_detectado: Mapped[str | None] = mapped_column(String(100))
+    beneficiario: Mapped[str] = mapped_column(Text, default="")
+    nome_fantasia: Mapped[str] = mapped_column(Text, default="")
+    beneficiario_final: Mapped[str] = mapped_column(Text, default="")
+    pagador: Mapped[str] = mapped_column(Text, default="")
+    cnpj_beneficiario: Mapped[str] = mapped_column(String(32), default="")
+    cnpj_beneficiario_final: Mapped[str] = mapped_column(String(32), default="")
 
 
 class NotaFiscal(RegistroBase, Base):
@@ -163,6 +171,7 @@ class ComprovanteRfbItem(Base):
 
 class Correspondencia(Base):
     __tablename__ = "correspondencias"
+    __table_args__ = (UniqueConstraint("conciliacao_id", "movimento_extrato_id", name="uq_correspondencias_conciliacao_movimento"),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     conciliacao_id: Mapped[str] = mapped_column(ForeignKey("conciliacoes.id"), index=True)
     movimento_extrato_id: Mapped[str] = mapped_column(ForeignKey("movimentos_extrato.id"))
@@ -172,6 +181,7 @@ class Correspondencia(Base):
     fonte_regra: Mapped[str | None] = mapped_column(String(30))
     regra_contabil_id: Mapped[str | None] = mapped_column(ForeignKey("regras_contabeis.id"))
     confianca: Mapped[str] = mapped_column(String(20), default="")
+    criterio_correspondencia: Mapped[str] = mapped_column(String(80), default="")
     status: Mapped[str] = mapped_column(String(40), default="possível correspondência")
 
 
@@ -182,6 +192,7 @@ class RegraContabil(Base):
     banco: Mapped[str] = mapped_column(String(100), default="")
     tipo_fonte: Mapped[str] = mapped_column(String(30))
     tipo_operacao: Mapped[str] = mapped_column(String(80), default="")
+    tipo_componente: Mapped[str] = mapped_column(String(30), default="")
     favorecido_normalizado: Mapped[str] = mapped_column(Text, default="")
     codigo_receita: Mapped[str] = mapped_column(String(20), default="")
     conta_debito: Mapped[str] = mapped_column(String(100), default="")
@@ -208,6 +219,13 @@ class LancamentoContabil(Base):
     correspondencia_id: Mapped[str] = mapped_column(ForeignKey("correspondencias.id"), index=True)
     regra_contabil_id: Mapped[str | None] = mapped_column(ForeignKey("regras_contabeis.id"))
     componente: Mapped[str] = mapped_column(String(30), default="total")
+    categoria: Mapped[str] = mapped_column(String(30), default="")
+    tributo: Mapped[str] = mapped_column(Text, default="")
+    codigo_receita: Mapped[str] = mapped_column(String(20), default="")
+    descricao: Mapped[str] = mapped_column(Text, default="")
+    efeito_no_total: Mapped[str] = mapped_column(String(10), default="SOMA")
+    origem: Mapped[str] = mapped_column(String(20), default="")
+    ordem: Mapped[int] = mapped_column(Integer, default=0)
     valor: Mapped[Decimal] = mapped_column(Numeric(18, 2))
     conta_debito: Mapped[str] = mapped_column(String(100), default="")
     conta_credito: Mapped[str] = mapped_column(String(100), default="")

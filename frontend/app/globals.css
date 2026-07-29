@@ -65,14 +65,6 @@ section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead th::aft
   font-size: 10px;
 }
 
-section.space-y-3.rounded-xl.border.border-slate-200 > div > table thead tr::after {
-  content: "Ação";
-  display: table-cell;
-  padding: 0.5rem;
-  font-size: 10px;
-  color: rgb(100 116 139);
-}
-
 section.space-y-3.rounded-xl.border.border-slate-200 td .absolute.left-0.top-8 {
   left: 12rem;
 }

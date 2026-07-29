@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from app.services.normalization import names_similar
 from app.services.matching import invoice_is_candidate
-from app.services.parsers import deduplicate_statement_records, extract_receipts, extract_statement, parse_brl, parse_date_time
+from app.services.parsers import deduplicate_statement_records, extract_financial_values, extract_receipts, extract_statement, parse_brl, parse_date_time
 
 
 def test_receipt_is_one_line_even_with_institutional_text():
@@ -12,10 +12,25 @@ def test_receipt_is_one_line_even_with_institutional_text():
     assert records[0].favorecido == "Lia Silva"
 
 
+def test_pix_receipt_extracts_its_separate_tariff():
+    values = extract_financial_values("VALOR: 2.100,00\nTARIFA: 10,00")
+
+    assert values.valor_pago == Decimal("2100.00")
+    assert values.valor_tarifa == Decimal("10.00")
+
+
 def test_documento_pix_and_ted_are_never_names():
     records = extract_receipts("VALOR: R$2.300,00\nTED\nDOCUMENTO: 12\nFAVORECIDO: C ODONTO\nDEBITO EM: 02/01/2024", 1)
     assert records[0].favorecido not in {"DOCUMENTO", "PIX", "TED"}
     assert records[0].tipo_operacao == "TED"
+
+
+def test_abbreviated_names_match_only_when_initials_follow_full_name_order():
+    assert names_similar("Adrielle Colares Frazao De Queiroz", "Adrielle C F Queiroz")
+    assert names_similar("Adrielle Colares Frazao De Queiroz", "Adrielle C Queiroz")
+    assert not names_similar("Adrielle Colares Frazao De Queiroz", "Adrielle Costa Ferreira")
+    assert names_similar("Adrielle Colares Frazao De", "Adrielle C F Queiroz", allow_truncated_terminal=True)
+    assert not names_similar("Adrielle Colares Frazao De", "Adrielle C F Queiroz")
 
 
 def test_brazilian_value_date_and_optional_time():
@@ -38,7 +53,7 @@ def test_invoice_is_not_matched_by_value_only():
     )
 
 
-def test_banco_do_brasil_credit_in_statement_becomes_debit_in_system():
+def test_banco_do_brasil_credit_in_statement_becomes_credit_in_system():
     text = """02/01/2024
 0000
 13105 144 Pix - Enviado
@@ -51,10 +66,10 @@ def test_banco_do_brasil_credit_in_statement_becomes_debit_in_system():
     assert record.hora == "09:40"
     assert record.nome == "Lia Da Silva Alexandre"
     assert record.valor == Decimal("520.52")
-    assert record.natureza == "saída"
+    assert record.natureza == "entrada"
 
 
-def test_banco_do_brasil_debit_in_statement_becomes_credit_in_system():
+def test_banco_do_brasil_debit_in_statement_becomes_debit_in_system():
     text = """02/01/2024
 0000
 13105 144 Pix - Recebido
@@ -62,7 +77,7 @@ def test_banco_do_brasil_debit_in_statement_becomes_credit_in_system():
 520,52 D
 02/01 09:40 Lia Da Silva Alexandre
 """
-    assert extract_statement(text, 1, "Banco do Brasil")[0].natureza == "entrada"
+    assert extract_statement(text, 1, "Banco do Brasil")[0].natureza == "saída"
 
 
 def test_banco_do_brasil_parser_is_not_used_for_other_banks():
@@ -99,8 +114,8 @@ PIX - Enviado
     records = extract_statement(text, 1, "Banco do Brasil")
 
     assert [(item.historico, item.valor, item.natureza) for item in records] == [
-        ("BB Rende Fácil", Decimal("100.00"), "saída"),
-        ("PIX - Enviado", Decimal("100.00"), "entrada"),
+        ("BB Rende Fácil", Decimal("100.00"), "entrada"),
+        ("PIX - Enviado", Decimal("100.00"), "saída"),
     ]
 
 
@@ -115,6 +130,59 @@ PIX - Enviado
     records = extract_statement(text, 1, "Banco do Brasil") + extract_statement(text, 2, "Banco do Brasil")
 
     assert len(deduplicate_statement_records(records)) == 1
+
+
+def test_receipt_uses_payment_date_before_document_date():
+    text = """VALOR: 493,14
+FAVORECIDO: Conselho Federal
+DATA: 31/12/2023
+DATA DO PAGAMENTO: 02/01/2024
+"""
+
+    assert extract_receipts(text, 1)[0].data == date(2024, 1, 2)
+
+
+def test_boleto_uses_paid_value_for_matching_and_keeps_accounting_components():
+    text = """VALOR DO DOCUMENTO: 547,93
+DESCONTO/ABATIMENTO: 54,79
+VALOR COBRADO: 493,14
+BENEFICIÁRIO: CONSELHO FEDERAL DE ODONTOLOGI
+DATA DO PAGAMENTO: 31/01/2024
+"""
+    receipt = extract_receipts(text, 32)[0]
+
+    assert receipt.data == date(2024, 1, 31)
+    assert receipt.valor == Decimal("493.14")
+    assert receipt.financeiros.valor_original == Decimal("547.93")
+    assert receipt.financeiros.valor_desconto_abatimento == Decimal("54.79")
+
+
+def test_receipt_keeps_beneficiary_when_final_beneficiary_differs():
+    text = """VALOR: 1.000,00
+BENEFICIÁRIO: BAMBUNO TECNOLOGIA LTDA
+BENEFICIÁRIO FINAL: SUCESSODONTO CURSOS E TREINAMENTOS
+PAGADOR: RENATA KAMILE DE SOUSA FIGUEIRO
+DATA DO PAGAMENTO: 30/01/2024
+"""
+    receipt = extract_receipts(text, 1)[0]
+
+    assert receipt.favorecido == "BAMBUNO TECNOLOGIA LTDA"
+    assert receipt.beneficiario_final == "SUCESSODONTO CURSOS E TREINAMENTOS"
+    assert receipt.pagador == "RENATA KAMILE DE SOUSA FIGUEIRO"
+
+
+def test_receipt_reads_multiline_beneficiary_before_final_beneficiary():
+    text = """VALOR COBRADO 1.000,00
+BENEFICIARIO:
+BAMBUNO TECNOLOGIA LTDA
+BENEFICIARIO FINAL:
+SUCESSODONTO CURSOS E TREINAMENTOS
+DATA DO PAGAMENTO 30/01/2024
+"""
+    receipt = extract_receipts(text, 1)[0]
+
+    assert receipt.beneficiario == "BAMBUNO TECNOLOGIA LTDA"
+    assert receipt.beneficiario_final == "SUCESSODONTO CURSOS E TREINAMENTOS"
 
 
 def test_banco_do_brasil_reads_inline_document_value_and_keeps_same_day_duplicates():
@@ -139,9 +207,9 @@ Conselho Federal
     records = extract_statement(text, 1, "Banco do Brasil")
 
     assert [(item.valor, item.natureza) for item in records] == [
-        (Decimal("12000.00"), "saída"),
-        (Decimal("493.14"), "entrada"),
-        (Decimal("493.14"), "entrada"),
+        (Decimal("12000.00"), "entrada"),
+        (Decimal("493.14"), "saída"),
+        (Decimal("493.14"), "saída"),
     ]
     assert len(deduplicate_statement_records(records)) == 3
 
@@ -205,13 +273,13 @@ VALOR: R$ 450,00
     assert records[0].valor == Decimal("450.00")
 
 
-def test_beneficiario_final_has_priority_over_beneficiario():
+def test_beneficiario_is_kept_when_final_beneficiary_also_exists():
     text = """BENEFICIARIO: Nome Intermediario
 BENEFICIARIO FINAL: Nome Final
 DATA DO PAGAMENTO: 08/01/2024
 VALOR: 450,00
 """
-    assert extract_receipts(text, 1)[0].favorecido == "Nome Final"
+    assert extract_receipts(text, 1)[0].favorecido == "Nome Intermediario"
 
 
 def test_convenio_is_used_when_no_higher_priority_name_exists():

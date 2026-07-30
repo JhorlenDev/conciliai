@@ -156,7 +156,7 @@ function Table({
                 <tr className="border-t align-top" key={row.id ?? index}>
                   {columns.map((column) => (
                     <td
-                      className={`max-w-72 px-2 py-2${column === "Favorecido" ? " whitespace-pre-line" : ""}${column === "Natureza" ? row.natureza === "Débito" ? " font-semibold text-blue-700" : " font-semibold text-red-700" : ""}`}
+                      className={`max-w-72 px-2 py-2${column === "Favorecido" ? " whitespace-pre-line" : ""}${column === "Natureza" ? row.natureza === "Crédito" ? " font-semibold text-blue-700" : " font-semibold text-red-700" : ""}`}
                       key={column}
                     >
                       {row[column.toLowerCase().replaceAll(" ", "_")] || "—"}
@@ -687,8 +687,8 @@ function AdvancedRulesPanel({
         }
       : {
           gatilho: "",
-          debito: item.natureza === "Débito" ? account : "",
-          credito: item.natureza === "Crédito" ? account : "",
+          debito: item.natureza_contabil === "Débito" ? account : "",
+          credito: item.natureza_contabil === "Crédito" ? account : "",
           historico: "",
           complemento: "Conforme extrato bancário",
         };

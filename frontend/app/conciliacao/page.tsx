@@ -333,6 +333,7 @@ type PendingRule = {
   valor: string;
   natureza: string;
   natureza_contabil?: string;
+  palavras_comprovante?: string[];
   tipo_componente?: string;
   valor_documento?: string;
   composicao_simples?: string;
@@ -353,6 +354,7 @@ type PendingRule = {
 type SavedRule = {
   id: string;
   gatilho: string;
+  gatilho_comprovante?: string;
   natureza: string;
   natureza_contabil?: string;
   tipo_componente?: string;
@@ -361,7 +363,7 @@ type SavedRule = {
   historico: string;
   complemento: string;
   cobertos: number;
-  movimentos?: { data: string; historico: string; valor: string; natureza: string; natureza_contabil: string }[];
+  movimentos?: { data: string; historico: string; texto_extrato?: string; texto_comprovante?: string; tem_comprovante?: boolean; valor: string; natureza: string; natureza_contabil: string }[];
 };
 
 function LegacyAdvancedRulesPanel({
@@ -628,6 +630,7 @@ function AdvancedRulesPanel({
   const [view, setView] = useState<"pending" | "saved">("pending");
   const [filter, setFilter] = useState(""),
     [wordPicker, setWordPicker] = useState<string | null>(null),
+    [receiptWordPicker, setReceiptWordPicker] = useState<string | null>(null),
     [keywordMode, setKeywordMode] = useState<Record<string, "full" | "words">>(
       {},
     );
@@ -637,6 +640,7 @@ function AdvancedRulesPanel({
       .replace(/\s+/g, " ")
       .trim();
   const [message, setMessage] = useState("");
+  const [busyRuleId, setBusyRuleId] = useState<string | null>(null);
   const [catalog, setCatalog] = useState<{
     contas: string[];
     historicos: string[];
@@ -679,14 +683,16 @@ function AdvancedRulesPanel({
   const defaults = (item: PendingRule | SavedRule) =>
     "gatilho" in item
       ? {
-          gatilho: item.gatilho,
+           gatilho: item.gatilho,
+           gatilhoComprovante: item.gatilho_comprovante || "",
           debito: item.conta_debito,
           credito: item.conta_credito,
           historico: item.historico,
           complemento: item.complemento,
         }
       : {
-          gatilho: "",
+           gatilho: "",
+           gatilhoComprovante: "",
           debito: item.natureza_contabil === "Débito" ? account : "",
           credito: item.natureza_contabil === "Crédito" ? account : "",
           historico: "",
@@ -708,9 +714,12 @@ function AdvancedRulesPanel({
     );
   }
   async function saveRule(item: PendingRule | SavedRule, existing = false) {
+    if (busyRuleId) return;
+    setBusyRuleId(item.id);
     const fields = defaults(item);
     const body = {
       gatilho: value(item.id, "gatilho", fields.gatilho),
+      gatilho_comprovante: value(item.id, "gatilhoComprovante", fields.gatilhoComprovante),
       natureza: item.natureza_contabil || item.natureza,
       tipo_componente: item.tipo_componente || "",
       conta_debito: value(item.id, "debito", fields.debito),
@@ -721,31 +730,41 @@ function AdvancedRulesPanel({
     const url = existing
       ? `${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/${item.id}`
       : `${API}/api/conciliacoes/${reconciliationId}/regras-contabeis`;
-    const response = await fetch(url, {
-      method: existing ? "PATCH" : "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) {
-      const error = await response.json();
-      return setMessage(error.detail ?? "Não foi possível salvar a regra.");
+    try {
+      const response = await fetch(url, {
+        method: existing ? "PATCH" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) {
+        const error = await response.json();
+        return setMessage(error.detail ?? "Não foi possível salvar a regra.");
+      }
+      setMessage(
+        existing
+          ? "Regra atualizada e reaplicada."
+          : "Regra salva e aplicada aos lançamentos compatíveis.",
+      );
+      setDrafts((items) => ({ ...items, [item.id]: {} }));
+      await load();
+      onRulesChanged();
+    } finally {
+      setBusyRuleId(null);
     }
-    setMessage(
-      existing
-        ? "Regra atualizada e reaplicada."
-        : "Regra salva e aplicada aos lançamentos compatíveis.",
-    );
-    setDrafts((items) => ({ ...items, [item.id]: {} }));
-    load();
-    onRulesChanged();
   }
   async function remove(id: string) {
-    const response = await fetch(`${API}/api/regras-contabeis/${id}`, {
-      method: "DELETE",
-    });
-    if (!response.ok) return setMessage("Não foi possível excluir a regra.");
-    load();
-    onRulesChanged();
+    if (busyRuleId) return;
+    setBusyRuleId(id);
+    try {
+      const response = await fetch(`${API}/api/regras-contabeis/${id}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) return setMessage("Não foi possível excluir a regra.");
+      await load();
+      onRulesChanged();
+    } finally {
+      setBusyRuleId(null);
+    }
   }
   function legacyEditor(item: PendingRule | SavedRule, existing = false) {
     const fields = defaults(item);
@@ -902,6 +921,7 @@ function AdvancedRulesPanel({
     const isDebit = (item.natureza_contabil || item.natureza) === "Débito";
     const words = pendingItem?.historico.match(/[\p{L}\p{N}]+/gu) ?? [];
     const keyword = value(item.id, "gatilho", fields.gatilho);
+    const receiptKeyword = value(item.id, "gatilhoComprovante", fields.gatilhoComprovante);
     const coveredCount =
       "cobertos" in item && keyword === fields.gatilho
         ? item.cobertos
@@ -933,11 +953,12 @@ function AdvancedRulesPanel({
           </td>
         ) : (
           <>
-            <td className="px-2 py-2">
+            <td className={`${existing ? "w-[8%]" : ""} px-2 py-2`}>
               {"data" in item ? item.data : `${item.cobertos} cobertos`}
             </td>
-            <td className="w-64 max-w-64 px-2 py-2">
-              <p className="max-w-64 truncate" title={"gatilho" in item ? item.gatilho : item.historico}>{"gatilho" in item ? item.gatilho : item.historico}</p>
+            <td className={`${existing ? "w-[14%]" : "w-64 max-w-64"} px-2 py-2`}>
+              <p className={`${existing ? "break-words" : "max-w-64 truncate"}`} title={"gatilho" in item ? item.gatilho : item.historico}>{"gatilho" in item ? item.gatilho : item.historico}</p>
+              {"gatilho" in item && item.gatilho_comprovante && <p className={`mt-1 text-[10px] text-violet-700 ${existing ? "break-words" : "max-w-64 truncate"}`} title={item.gatilho_comprovante}>Comprovante: {item.gatilho_comprovante}</p>}
               {pendingItem?.tarifa_no_extrato && <p className="mt-1 text-[10px] text-sky-700">Tarifa do comprovante está presente no extrato.</p>}
               {pendingItem?.tarifa_referente_ao_comprovante && <p className="mt-1 text-[10px] text-slate-500">Esta tarifa é referente ao comprovante de {pendingItem.tarifa_referencia_nome}, R$ {Number(pendingItem.tarifa_referencia_valor || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2 })} em {pendingItem.tarifa_referencia_data}.</p>}
               {pendingItem?.composicao_simples && <p className="mt-1 whitespace-pre-line text-[10px] text-slate-500">{pendingItem.composicao_simples}</p>}
@@ -966,7 +987,7 @@ function AdvancedRulesPanel({
                 </div>
               )}
             </td>
-            <td className="px-2 py-2">
+            <td className={`${existing ? "w-[8%]" : ""} px-2 py-2`}>
               <span
                 className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${isDebit ? "bg-blue-100 text-blue-800" : "bg-red-100 text-red-800"}`}
               >
@@ -979,17 +1000,17 @@ function AdvancedRulesPanel({
               )}
             </td>
             <td
-              className={`px-2 py-2 font-semibold whitespace-nowrap ${isDebit ? "text-blue-700" : "text-red-700"}`}
+              className={`${existing ? "w-[8%]" : ""} px-2 py-2 font-semibold whitespace-nowrap ${isDebit ? "text-blue-700" : "text-red-700"}`}
             >
               {pendingItem ? `R$ ${pendingItem.valor}` : "—"}
             </td>
           </>
         )}
-        <td className="px-2 py-1">
+        <td className={`${existing ? "w-[11%]" : ""} px-2 py-1`}>
           <div className="relative">
             <div className="flex items-center gap-1">
               <input
-                className="w-20 rounded border px-1.5 py-1"
+                className={`${existing ? "w-full min-w-0" : "w-20"} rounded border px-1.5 py-1`}
                 placeholder="gatilho..."
                 value={keyword}
                 onChange={(event) =>
@@ -1072,6 +1093,23 @@ function AdvancedRulesPanel({
                 </>
               )}
             </div>
+            {pendingItem?.comprovante_arquivo_id && (
+              <div className="relative mt-1 flex items-center gap-1">
+                <input className="w-20 rounded border border-violet-200 px-1.5 py-1" placeholder="comprovante..." value={receiptKeyword} onChange={(event) => change(item.id, "gatilhoComprovante", event.target.value)} />
+                <button title="Usar comprovante completo" onClick={() => change(item.id, "gatilhoComprovante", (pendingItem.palavras_comprovante ?? []).join(" "))} className="rounded border border-violet-200 bg-violet-50 p-1 text-violet-700 hover:border-violet-500">
+                  <Copy size={13} />
+                </button>
+                <button title="Selecionar palavras do comprovante" onClick={() => setReceiptWordPicker(receiptWordPicker === item.id ? null : item.id)} className="rounded border border-violet-200 bg-violet-50 p-1 text-violet-700 hover:border-violet-500">
+                  <Tags size={13} />
+                </button>
+                {receiptWordPicker === item.id && (
+                  <div className="absolute left-0 top-8 z-30 w-56 rounded-lg border border-violet-200 bg-white p-2 shadow-xl">
+                    <div className="mb-2 flex items-center justify-between border-b pb-1 text-[10px] font-semibold text-violet-800">Palavras do comprovante<button onClick={() => setReceiptWordPicker(null)} className="text-sm leading-none text-slate-500">✕</button></div>
+                    <div className="flex flex-wrap gap-1">{(pendingItem.palavras_comprovante ?? []).map((word, index) => { const selected = receiptKeyword.toUpperCase().split(/\s+/).includes(word); return <button onClick={() => change(item.id, "gatilhoComprovante", selected ? receiptKeyword.split(/\s+/).filter(part => part !== word).join(" ") : [receiptKeyword, word].filter(Boolean).join(" "))} className={`rounded px-1.5 py-0.5 text-[10px] ${selected ? "bg-violet-700 text-white" : "bg-violet-50 text-violet-800"}`} key={`${word}-${index}`}>{word}</button>; })}</div>
+                  </div>
+                )}
+              </div>
+            )}
             {keyword && (
               <div className="mt-1 w-48 text-[10px] leading-4 text-emerald-700">
                 <span className="font-semibold">
@@ -1086,31 +1124,31 @@ function AdvancedRulesPanel({
             )}
           </div>
         </td>
-        <td className="px-2 py-1">
+        <td className={`${existing ? "w-[10%]" : ""} px-2 py-1`}>
           <input
             list="catalogo-contas"
             title={value(item.id, "debito", fields.debito)}
-            className="w-20 rounded border px-1.5 py-1 pr-5 text-[10px]"
+            className={`${existing ? "w-full min-w-0" : "w-20"} rounded border px-1.5 py-1 pr-5 text-[10px]`}
             placeholder="Selecionar"
             value={value(item.id, "debito", fields.debito)}
             onChange={(event) => change(item.id, "debito", event.target.value)}
           />
         </td>
-        <td className="px-2 py-1">
+        <td className={`${existing ? "w-[10%]" : ""} px-2 py-1`}>
           <input
             list="catalogo-contas"
             title={value(item.id, "credito", fields.credito)}
-            className="w-20 rounded border px-1.5 py-1 pr-5 text-[10px]"
+            className={`${existing ? "w-full min-w-0" : "w-20"} rounded border px-1.5 py-1 pr-5 text-[10px]`}
             placeholder="Selecionar"
             value={value(item.id, "credito", fields.credito)}
             onChange={(event) => change(item.id, "credito", event.target.value)}
           />
         </td>
-        <td className="px-2 py-1">
+        <td className={`${existing ? "w-[14%]" : ""} px-2 py-1`}>
           <input
             list="catalogo-historicos"
             title={value(item.id, "historico", fields.historico)}
-            className="w-28 rounded border px-1.5 py-1 pr-5 text-[10px]"
+            className={`${existing ? "w-full min-w-0" : "w-28"} rounded border px-1.5 py-1 pr-5 text-[10px]`}
             placeholder="Selecionar"
             value={value(item.id, "historico", fields.historico)}
             onChange={(event) =>
@@ -1118,22 +1156,22 @@ function AdvancedRulesPanel({
             }
           />
         </td>
-        <td className="px-2 py-1">
+        <td className={`${existing ? "w-[13%]" : ""} px-2 py-1`}>
           <input
-            className="w-28 rounded border px-1.5 py-1"
+            className={`${existing ? "w-full min-w-0" : "w-28"} rounded border px-1.5 py-1`}
             value={value(item.id, "complemento", fields.complemento)}
             onChange={(event) =>
               change(item.id, "complemento", event.target.value)
             }
           />
         </td>
-        {showAction && <td className="w-px whitespace-nowrap px-2 py-1">
+        {showAction && <td className={`${existing ? "w-[6%]" : "w-px"} whitespace-nowrap px-2 py-1`}>
           {!pendingItem?.regra_compartilhada && (
             <>
-              <button onClick={() => saveRule(item, existing)} className="rounded bg-teal-700 px-2 py-1 text-white">
-                {existing ? "Atualizar" : "Salvar"}
+              <button title={existing ? "Atualizar regra" : "Salvar regra"} aria-label={existing ? "Atualizar regra" : "Salvar regra"} disabled={busyRuleId === item.id} onClick={() => saveRule(item, existing)} className="rounded bg-teal-700 px-2 py-1 text-white disabled:cursor-wait disabled:opacity-60">
+                {busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : existing ? <RefreshCw size={14} /> : "Salvar"}
               </button>
-              {existing && <button onClick={() => remove(item.id)} className="ml-1 rounded border border-red-200 px-2 py-1 text-red-700">Excluir</button>}
+              {existing && <button title="Excluir regra" aria-label="Excluir regra" disabled={busyRuleId === item.id} onClick={() => remove(item.id)} className="ml-1 rounded border border-red-200 px-2 py-1 text-red-700 disabled:cursor-wait disabled:opacity-60"><Trash2 size={14} /></button>}
             </>
           )}
         </td>}
@@ -1213,8 +1251,8 @@ function AdvancedRulesPanel({
         )}
       </div>
       {message && <p className="text-xs text-teal-800">{message}</p>}
-      <div className="max-h-[calc(100dvh-350px)] overflow-auto rounded border">
-        <table className="w-full text-left text-xs">
+      <div className="overflow-x-auto rounded border">
+        <table className={`w-full text-left text-xs ${view === "saved" ? "table-fixed" : ""}`}>
           <thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase text-slate-500 shadow-sm">
             <tr>
               {[
@@ -1315,13 +1353,16 @@ function AdvancedRulesPanel({
                       <tr className="bg-slate-50">
                         <td colSpan={showActions ? 10 : 9} className="px-3 pb-3 pt-1">
                           <p className="mb-1 text-[10px] font-semibold uppercase text-slate-500">Lançamentos cobertos</p>
-                          <div className="divide-y divide-slate-200 border-y border-slate-200 text-xs text-slate-600">
+                          <div className="divide-y divide-slate-200 border-y border-slate-200 text-[11px] leading-[1.25] text-slate-600">
                             {item.movimentos.map((movement, index) => (
-                              <div className="grid grid-cols-[90px_minmax(240px,1fr)_120px_90px] gap-3 py-1.5" key={`${movement.data}-${index}`} title={movement.historico}>
-                                <strong>{movement.data}</strong>
-                                <span className="truncate">{movement.historico}</span>
-                                <span>R$ {Number(movement.valor).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}</span>
-                                <span>{movement.natureza_contabil}</span>
+                              <div className="grid grid-cols-[72px_minmax(220px,1fr)_max-content_64px] gap-x-3 gap-y-1 py-1.5 max-sm:grid-cols-1 max-sm:gap-y-1" key={`${movement.data}-${index}`}>
+                                <strong className="whitespace-nowrap text-slate-700">{movement.data}</strong>
+                                <div className="min-w-0 space-y-0.5 whitespace-normal break-words [overflow-wrap:anywhere]">
+                                  <p><span className="text-[10px] font-semibold text-slate-500">Texto Extrato: </span>{movement.texto_extrato || movement.historico}</p>
+                                  {movement.tem_comprovante && <p><span className="text-[10px] font-semibold text-slate-500">Texto Comprovante: </span>{movement.texto_comprovante || "Não identificado"}</p>}
+                                </div>
+                                <span className="whitespace-nowrap text-slate-700">R$ {Number(movement.valor).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}</span>
+                                <span className="whitespace-nowrap text-slate-700">{movement.natureza_contabil}</span>
                               </div>
                             ))}
                           </div>

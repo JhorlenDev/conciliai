@@ -194,6 +194,7 @@ class RegraContabil(Base):
     tipo_operacao: Mapped[str] = mapped_column(String(80), default="")
     tipo_componente: Mapped[str] = mapped_column(String(30), default="")
     favorecido_normalizado: Mapped[str] = mapped_column(Text, default="")
+    gatilho_comprovante_normalizado: Mapped[str] = mapped_column(Text, default="")
     codigo_receita: Mapped[str] = mapped_column(String(20), default="")
     conta_debito: Mapped[str] = mapped_column(String(100), default="")
     conta_credito: Mapped[str] = mapped_column(String(100), default="")

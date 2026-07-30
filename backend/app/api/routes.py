@@ -90,6 +90,7 @@ class ProcessoBancoInput(BaseModel):
 
 class RegraContabilInput(BaseModel):
     gatilho: str
+    gatilho_comprovante: str = ""
     natureza: str
     conta_debito: str
     conta_credito: str
@@ -380,11 +381,79 @@ def create_reconciliation(payload: ConciliacaoInput, db: Session = Depends(get_d
     return reconciliation_payload(item)
 
 
-def rule_matches_movement(rule: RegraContabil, movement: MovimentoExtrato, counterparty: str = "", component: str = "") -> bool:
-    trigger = normalize_name(rule.favorecido_normalizado)
-    history = normalize_name(" ".join(item for item in [movement.historico, movement.nome_encontrado, counterparty] if item))
+def trigger_matches(source: str, trigger: str) -> bool:
+    normalized_trigger, normalized_source = normalize_name(trigger), normalize_name(source)
+    if not normalized_trigger:
+        return True
+    if normalized_trigger in normalized_source:
+        return True
+    trigger_digits = re.sub(r"\D", "", trigger)
+    source_digits = re.sub(r"\D", "", source)
+    return bool(trigger_digits and trigger_digits in source_digits)
+
+
+def receipt_trigger_text(receipt: Comprovante | None) -> str:
+    if not receipt:
+        return ""
+    return " ".join(item for item in [receipt.favorecido, receipt.beneficiario, receipt.beneficiario_final, receipt.nome_fantasia, receipt.pagador] if item)
+
+
+def receipt_description(receipt: Comprovante | None) -> str:
+    if not receipt:
+        return ""
+    party = next((value.strip() for value in [receipt.beneficiario_final, receipt.beneficiario, receipt.favorecido] if value and value.strip()), "")
+    operation = (receipt.tipo_operacao or "").strip()
+    if operation and party:
+        return f"{operation} {party}"
+    if party:
+        return party
+    fallback = next((value for value in [receipt.dados_normalizados.get("descricao", ""), receipt.dados_normalizados.get("historico", ""), receipt.texto_original] if isinstance(value, str) and value.strip()), "")
+    return " ".join(fallback.split())
+
+
+def normalized_trigger_key(value: str) -> str:
+    """Makes equivalent keyword sets stable regardless of order and punctuation."""
+    return " ".join(sorted(normalize_name(value).split()))
+
+
+def rule_identity(cliente_id: str | None, banco: str, natureza: str, componente: str, gatilho: str, gatilho_comprovante: str, conta_debito: str, conta_credito: str, historico: str, complemento: str) -> tuple[str, ...]:
+    return (
+        cliente_id or "",
+        normalize_name(banco),
+        normalize_rule_accounting_nature(natureza),
+        normalize_name(componente or "PRINCIPAL"),
+        normalized_trigger_key(gatilho),
+        normalized_trigger_key(gatilho_comprovante),
+        normalize_name(conta_debito),
+        normalize_name(conta_credito),
+        normalize_name(historico),
+        normalize_name(complemento),
+    )
+
+
+def saved_rule_identity(rule: RegraContabil) -> tuple[str, ...]:
+    return rule_identity(rule.cliente_id, rule.banco, rule.tipo_operacao, rule.tipo_componente, rule.favorecido_normalizado, rule.gatilho_comprovante_normalizado, rule.conta_debito, rule.conta_credito, rule.historico, rule.complemento)
+
+
+def legacy_trigger_matches_receipt(rule: RegraContabil, history: str, receipt: Comprovante | None) -> bool:
+    """Supports rules saved before receipt triggers had their own field."""
+    if rule.gatilho_comprovante_normalizado or not receipt:
+        return False
+    trigger_tokens = set(normalize_name(rule.favorecido_normalizado).split())
+    statement_tokens = set(normalize_name(history).split())
+    receipt_tokens = set(normalize_name(receipt_trigger_text(receipt)).split())
+    if not trigger_tokens or not trigger_tokens <= statement_tokens | receipt_tokens:
+        return False
+    # A legacy combined trigger must still identify a party from the receipt.
+    return bool(trigger_tokens & receipt_tokens)
+
+
+def rule_matches_movement(rule: RegraContabil, movement: MovimentoExtrato, receipt: Comprovante | None = None, component: str = "") -> bool:
+    trigger = rule.favorecido_normalizado
+    history = " ".join(item for item in [movement.historico, movement.nome_encontrado] if item)
     component_matches = not component or (rule.tipo_componente == component if rule.tipo_componente else component in {"PRINCIPAL", "VALOR_COBRADO"})
-    return bool(trigger and trigger in history and (not rule.tipo_operacao or normalize_rule_accounting_nature(rule.tipo_operacao) == accounting_nature(movement.natureza)) and component_matches)
+    statement_matches = trigger_matches(history, trigger) or legacy_trigger_matches_receipt(rule, history, receipt)
+    return bool(statement_matches and trigger_matches(receipt_trigger_text(receipt), rule.gatilho_comprovante_normalizado or "") and (not rule.tipo_operacao or normalize_rule_accounting_nature(rule.tipo_operacao) == accounting_nature(movement.natureza)) and component_matches)
 
 
 def in_reconciliation_period(reconciliation: Conciliacao, movement: MovimentoExtrato) -> bool:
@@ -435,9 +504,11 @@ def is_transfer_without_counterparty(movement: MovimentoExtrato) -> bool:
     return bool(any(term in history for term in ("TRANSFERENCIA", "TED", "DOC")) and (not name or re.fullmatch(r"\d{2} \d{2}", name)))
 
 
-def rule_payload(rule: RegraContabil, movements: list[MovimentoExtrato]) -> dict:
-    covered = [item for item in movements if rule_matches_movement(rule, item)]
-    return {"id": rule.id, "gatilho": rule.favorecido_normalizado, "natureza": normalize_rule_accounting_nature(rule.tipo_operacao), "tipo_componente": rule.tipo_componente, "conta_debito": rule.conta_debito, "conta_credito": rule.conta_credito, "historico": rule.historico, "complemento": rule.complemento, "banco_origem": rule.banco, "cobertos": len(covered), "movimentos": [{"data": item.data.strftime("%d/%m/%Y") if item.data else "—", "historico": " ".join(part for part in [item.historico, item.nome_encontrado] if part), "valor": str(item.valor or 0), "natureza": normalize_statement_nature(item.natureza), "natureza_contabil": accounting_nature(item.natureza)} for item in covered]}
+def rule_payload(rule: RegraContabil, movements: list[MovimentoExtrato], receipts: dict[str, Comprovante], covered_movement_ids: set[str]) -> dict:
+    # The persisted entry is authoritative for legacy rules whose source text has
+    # changed since they were first applied.
+    covered = [item for item in movements if item.id in covered_movement_ids or rule_matches_movement(rule, item, receipts.get(item.id))]
+    return {"id": rule.id, "gatilho": rule.favorecido_normalizado, "gatilho_comprovante": rule.gatilho_comprovante_normalizado, "natureza": normalize_rule_accounting_nature(rule.tipo_operacao), "tipo_componente": rule.tipo_componente, "conta_debito": rule.conta_debito, "conta_credito": rule.conta_credito, "historico": rule.historico, "complemento": rule.complemento, "banco_origem": rule.banco, "cobertos": len(covered), "movimentos": [{"data": item.data.strftime("%d/%m/%Y") if item.data else "—", "historico": " ".join(part for part in [item.historico, item.nome_encontrado] if part), "texto_extrato": " ".join(part for part in [item.historico, item.nome_encontrado] if part), "texto_comprovante": receipt_description(receipts.get(item.id)), "tem_comprovante": bool(receipts.get(item.id)), "valor": str(item.valor or 0), "natureza": normalize_statement_nature(item.natureza), "natureza_contabil": accounting_nature(item.natureza)} for item in covered]}
 
 
 def scoped_rules(reconciliation: Conciliacao, db: Session) -> list[RegraContabil]:
@@ -456,7 +527,6 @@ def apply_accounting_rules(reconciliation: Conciliacao, db: Session) -> int:
     for movement in movements:
         match = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id).first()
         receipt = db.get(Comprovante, match.comprovante_id) if match and match.comprovante_id else None
-        counterparty = receipt.beneficiario_final or receipt.beneficiario or receipt.favorecido if receipt else ""
         if not match:
             match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id)
             db.add(match)
@@ -470,7 +540,7 @@ def apply_accounting_rules(reconciliation: Conciliacao, db: Session) -> int:
             db.add(source_entries[0])
         applied_rule = None
         for entry in source_entries:
-            rule = next((item for item in rules if rule_matches_movement(item, movement, counterparty, entry.componente)), None)
+            rule = next((item for item in rules if rule_matches_movement(item, movement, receipt, entry.componente)), None)
             if not rule:
                 continue
             entry.regra_contabil_id = rule.id
@@ -519,8 +589,17 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db)):
             logger.info("Total do extrato BB: data=%s historico=%s valor=%s natureza=%s", movement.data, movement.historico, movement.valor, movement.natureza)
     rules = scoped_rules(reconciliation, db)
     same_bank_rules = [rule for rule in rules if rule.banco == reconciliation.banco]
-    applied_movements = [item for item in movements if any(rule_matches_movement(rule, item) for rule in rules)]
     matches = {item.movimento_extrato_id: item for item in db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id).all()}
+    receipts = {movement_id: db.get(Comprovante, match.comprovante_id) for movement_id, match in matches.items() if match.comprovante_id}
+    entries_by_movement = {movement_id: db.query(LancamentoContabil).filter_by(correspondencia_id=match.id).all() for movement_id, match in matches.items()}
+    covered_by_rule = {rule.id: set() for rule in same_bank_rules}
+    covered_components = set()
+    for movement_id, entries in entries_by_movement.items():
+        for entry in entries:
+            if entry.regra_contabil_id in covered_by_rule:
+                covered_by_rule[entry.regra_contabil_id].add(movement_id)
+                covered_components.add((movement_id, entry.componente))
+    applied_movements = [item for item in movements if any(item.id in covered for covered in covered_by_rule.values()) or any(rule_matches_movement(rule, item, receipts.get(item.id)) for rule in rules)]
     def pending_payload(item: MovimentoExtrato, component: str = "PRINCIPAL", value: Decimal | None = None):
         match = matches.get(item.id)
         receipt = db.get(Comprovante, match.comprovante_id) if match and match.comprovante_id else None
@@ -531,9 +610,10 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db)):
                 history = re.sub(re.escape(receipt.beneficiario), receipt.beneficiario_final, history, flags=re.I)
             else:
                 history = f"{item.historico} {receipt.beneficiario_final}".strip()
-        shared_rule = next((rule for rule in rules if rule.banco != reconciliation.banco and rule_matches_movement(rule, item, component=component)), None)
+        shared_rule = next((rule for rule in rules if rule.banco != reconciliation.banco and rule_matches_movement(rule, item, receipt, component)), None)
         tariff_in_statement = bool(receipt and receipt.valor_tarifa and "TARIFA PIX" not in normalize_name(item.historico) and any(other.comprovante_id == receipt.id and other.movimento_extrato_id != item.id and "TARIFA PIX" in normalize_name(db.get(MovimentoExtrato, other.movimento_extrato_id).historico) for other in matches.values()))
         tariff_reference = bool(receipt and "TARIFA PIX" in normalize_name(item.historico))
+        receipt_words = list(dict.fromkeys(normalize_name(receipt_trigger_text(receipt)).split()))
         composition = ""
         if rfb and (rfb.tipo.upper() == "DAS" or any("SIMPLES NACIONAL" in tax.descricao.upper() for tax in db.query(ComprovanteRfbItem).filter_by(comprovante_rfb_id=rfb.id))):
             taxes = db.query(ComprovanteRfbItem).filter_by(comprovante_rfb_id=rfb.id).all()
@@ -542,16 +622,31 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db)):
             if rfb.valor_multa: lines.append(f"Multa: {money(rfb.valor_multa)}")
             if rfb.valor_juros: lines.append(f"Juros: {money(rfb.valor_juros)}")
             composition = "Composição:\n- " + "\n- ".join(lines) + f"\nTotal do documento: {money(rfb.valor_total or 0)}"
-        return {"id": f"{item.id}:{component}", "data": item.data.strftime("%d/%m/%y") if item.data else "—", "historico": history, "valor": str(value if value is not None else item.valor or 0), "natureza": normalize_statement_nature(item.natureza), "natureza_contabil": accounting_nature(item.natureza), "tipo_componente": component, "valor_documento": str(receipt.valor_original) if receipt and receipt.valor_original else "", "composicao_simples": composition, "tarifa_no_extrato": tariff_in_statement, "tarifa_referente_ao_comprovante": tariff_reference, "tarifa_referencia_nome": (receipt.beneficiario or receipt.favorecido) if tariff_reference else "", "tarifa_referencia_valor": str(receipt.valor_pago or 0) if tariff_reference else "", "tarifa_referencia_data": receipt.data.strftime("%d/%m/%Y") if tariff_reference and receipt.data else "", "pagina": item.pagina_numero, "arquivo_id": item.arquivo_id, "comprovante_arquivo_id": receipt.arquivo_id if receipt else None, "comprovante_pagina": receipt.pagina_numero if receipt else None, "comprovante_confere": bool(receipt and match and match.status.startswith("Conciliado")), "regra_compartilhada": {"id": shared_rule.id, "banco_origem": shared_rule.banco, "gatilho": shared_rule.favorecido_normalizado} if shared_rule else None}
+        return {"id": f"{item.id}:{component}", "data": item.data.strftime("%d/%m/%y") if item.data else "—", "historico": history, "valor": str(value if value is not None else item.valor or 0), "natureza": normalize_statement_nature(item.natureza), "natureza_contabil": accounting_nature(item.natureza), "tipo_componente": component, "palavras_comprovante": receipt_words, "valor_documento": str(receipt.valor_original) if receipt and receipt.valor_original else "", "composicao_simples": composition, "tarifa_no_extrato": tariff_in_statement, "tarifa_referente_ao_comprovante": tariff_reference, "tarifa_referencia_nome": (receipt.beneficiario or receipt.favorecido) if tariff_reference else "", "tarifa_referencia_valor": str(receipt.valor_pago or 0) if tariff_reference else "", "tarifa_referencia_data": receipt.data.strftime("%d/%m/%Y") if tariff_reference and receipt.data else "", "pagina": item.pagina_numero, "arquivo_id": item.arquivo_id, "comprovante_arquivo_id": receipt.arquivo_id if receipt else None, "comprovante_pagina": receipt.pagina_numero if receipt else None, "comprovante_confere": bool(receipt and match and match.status.startswith("Conciliado")), "regra_compartilhada": {"id": shared_rule.id, "banco_origem": shared_rule.banco, "gatilho": shared_rule.favorecido_normalizado} if shared_rule else None}
     pending = []
     for movement in movements:
         match = matches.get(movement.id)
-        items = db.query(LancamentoContabil).filter_by(correspondencia_id=match.id).all() if match else []
+        items = entries_by_movement.get(movement.id, [])
         candidates = [(entry.componente, entry.valor) for entry in items] or [("PRINCIPAL", movement.valor)]
-        pending.extend(pending_payload(movement, component, value) for component, value in candidates if not any(rule_matches_movement(rule, movement, component=component) for rule in same_bank_rules))
+        pending.extend(
+            pending_payload(movement, component, value)
+            for component, value in candidates
+            if (movement.id, component) not in covered_components
+            and not any(rule_matches_movement(rule, movement, receipts.get(movement.id), component) for rule in same_bank_rules)
+        )
     reason_debit = sum((item.valor or 0 for item in applied_movements if accounting_nature(item.natureza) == "Débito"), 0)
     reason_credit = sum((item.valor or 0 for item in applied_movements if accounting_nature(item.natureza) == "Crédito"), 0)
-    return {"pendentes": pending, "salvas": [rule_payload(rule, movements) for rule in same_bank_rules], "resumo": {"extrato": {"debito": str(sum((item.valor or 0 for item in movements if is_statement_debit(item.natureza)), 0)), "credito": str(sum((item.valor or 0 for item in movements if not is_statement_debit(item.natureza)), 0))}, "razao": {"debito": str(reason_debit), "credito": str(reason_credit)}}}
+    return {
+        "pendentes": pending,
+        "salvas": [rule_payload(rule, movements, receipts, covered_by_rule[rule.id]) for rule in same_bank_rules],
+        "resumo": {
+            "extrato": {
+                "debito": str(sum((item.valor or 0 for item in movements if is_statement_debit(item.natureza)), 0)),
+                "credito": str(sum((item.valor or 0 for item in movements if not is_statement_debit(item.natureza)), 0)),
+            },
+            "razao": {"debito": str(reason_debit), "credito": str(reason_credit)},
+        },
+    }
 
 
 @router.post("/conciliacoes/{conciliacao_id}/regras-contabeis")
@@ -559,10 +654,14 @@ def create_accounting_rule(conciliacao_id: str, payload: RegraContabilInput, db:
     reconciliation = reconciliation_or_404(conciliacao_id, db)
     if not all([payload.gatilho.strip(), payload.conta_debito.strip(), payload.conta_credito.strip(), payload.historico.strip()]):
         raise HTTPException(422, "Preencha gatilho, débito, crédito e histórico")
-    shared_rule = next((item for item in scoped_rules(reconciliation, db) if item.banco != reconciliation.banco and item.tipo_operacao == payload.natureza and item.tipo_componente == payload.tipo_componente.strip().upper() and normalize_name(item.favorecido_normalizado) == normalize_name(payload.gatilho)), None)
+    candidate_identity = rule_identity(reconciliation.cliente_id, reconciliation.banco, payload.natureza, payload.tipo_componente, payload.gatilho, payload.gatilho_comprovante, payload.conta_debito, payload.conta_credito, payload.historico, payload.complemento)
+    existing_rule = next((item for item in scoped_rules(reconciliation, db) if saved_rule_identity(item) == candidate_identity), None)
+    if existing_rule:
+        raise HTTPException(409, "Já existe uma regra equivalente neste banco")
+    shared_rule = next((item for item in scoped_rules(reconciliation, db) if item.banco != reconciliation.banco and item.tipo_operacao == payload.natureza and item.tipo_componente == payload.tipo_componente.strip().upper() and normalize_name(item.favorecido_normalizado) == normalize_name(payload.gatilho) and normalize_name(item.gatilho_comprovante_normalizado) == normalize_name(payload.gatilho_comprovante)), None)
     if shared_rule:
         raise HTTPException(409, f"Já existe uma regra deste cliente criada no banco {shared_rule.banco}")
-    rule = RegraContabil(cliente_id=reconciliation.cliente_id, banco=reconciliation.banco, tipo_fonte="extrato", tipo_operacao=payload.natureza, tipo_componente=payload.tipo_componente.strip().upper(), favorecido_normalizado=normalize_name(payload.gatilho), conta_debito=payload.conta_debito.strip(), conta_credito=payload.conta_credito.strip(), historico=payload.historico.strip(), complemento=payload.complemento.strip())
+    rule = RegraContabil(cliente_id=reconciliation.cliente_id, banco=reconciliation.banco, tipo_fonte="extrato", tipo_operacao=payload.natureza, tipo_componente=payload.tipo_componente.strip().upper(), favorecido_normalizado=normalize_name(payload.gatilho), gatilho_comprovante_normalizado=normalize_name(payload.gatilho_comprovante), conta_debito=payload.conta_debito.strip(), conta_credito=payload.conta_credito.strip(), historico=payload.historico.strip(), complemento=payload.complemento.strip())
     db.add(rule); db.flush()
     applied = sum(apply_accounting_rules(item, db) for item in scoped_reconciliations(reconciliation, db))
     db.commit(); db.refresh(rule)
@@ -577,9 +676,13 @@ def update_accounting_rule(conciliacao_id: str, regra_id: str, payload: RegraCon
         raise HTTPException(404, "Regra não encontrada")
     if not all([payload.gatilho.strip(), payload.conta_debito.strip(), payload.conta_credito.strip(), payload.historico.strip()]):
         raise HTTPException(422, "Preencha gatilho, débito, crédito e histórico")
+    candidate_identity = rule_identity(reconciliation.cliente_id, reconciliation.banco, payload.natureza, payload.tipo_componente, payload.gatilho, payload.gatilho_comprovante, payload.conta_debito, payload.conta_credito, payload.historico, payload.complemento)
+    if any(item.id != rule.id and saved_rule_identity(item) == candidate_identity for item in scoped_rules(reconciliation, db)):
+        raise HTTPException(409, "Já existe uma regra equivalente neste banco")
     rule.tipo_operacao = payload.natureza
     rule.tipo_componente = payload.tipo_componente.strip().upper()
     rule.favorecido_normalizado = normalize_name(payload.gatilho)
+    rule.gatilho_comprovante_normalizado = normalize_name(payload.gatilho_comprovante)
     rule.conta_debito = payload.conta_debito.strip()
     rule.conta_credito = payload.conta_credito.strip()
     rule.historico = payload.historico.strip()
@@ -619,7 +722,9 @@ def accounting_csv(conciliacao_id: str, db: Session = Depends(get_db)):
     writer = csv.writer(output, delimiter=";", lineterminator="\n")
     writer.writerow(["data", "debito", "credito", "historico", "complemento", "valor"])
     for movement in movements:
-        rule = next((item for item in rules if rule_matches_movement(item, movement)), None)
+        match = db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id, movimento_extrato_id=movement.id).first()
+        receipt = db.get(Comprovante, match.comprovante_id) if match and match.comprovante_id else None
+        rule = next((item for item in rules if rule_matches_movement(item, movement, receipt)), None)
         if rule:
             writer.writerow([movement.data.strftime("%d/%m/%Y") if movement.data else "", rule.conta_debito, rule.conta_credito, rule.historico, rule.complemento, f"{movement.valor or 0:.2f}".replace(".", ",")])
     return Response(output.getvalue().encode("utf-8-sig"), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="lancamentos-contabeis.csv"'})

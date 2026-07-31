@@ -36,7 +36,7 @@ def choose_rule_source(extrato_valor: Decimal | None, receipt=None, rfb=None, ta
         return RuleDecision("Conciliado bancário", "comprovante bancário", False, lines)
     else:
         return RuleDecision("Somente extrato", "extrato", True)
-    total = sum((line.valor if line.efeito_no_total == "SOMA" else -line.valor for line in decision.linhas), Decimal("0.00"))
+    total = sum((line.valor if line.efeito_no_total == "SOMA" else -line.valor if line.efeito_no_total == "SUBTRAI" else Decimal("0.00") for line in decision.linhas), Decimal("0.00"))
     decision.diferenca = extrato_valor - total
     if abs(decision.diferenca) > Decimal("0.01"):
         decision.status = "Lançamentos não fecham com o extrato"
@@ -91,6 +91,7 @@ def _receipt_lines(receipt) -> list[RuleLine]:
     additions_total = sum((value or Decimal("0.00") for _, value in additions), Decimal("0.00"))
     principal = (values.valor_pago or Decimal("0.00")) - additions_total if has_reductions else values.valor_original or values.valor_pago
     lines = [RuleLine("VALOR_COBRADO", principal, origem="comprovante")] if principal and principal > 0 else []
-    lines.extend(RuleLine(component, value, origem="comprovante") for component, value in reductions if value and value > 0)
+    # Discounts and abatements are valid accounting entries, but never move the bank.
+    lines.extend(RuleLine(component, value, efeito_no_total="OUTROS", origem="comprovante") for component, value in reductions if value and value > 0)
     lines.extend(RuleLine(component, value, origem="comprovante") for component, value in additions if value and value > 0)
     return lines

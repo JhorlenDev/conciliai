@@ -213,11 +213,13 @@ function AdvancedSummary({
   label,
   debit,
   credit,
+  other,
   current,
 }: {
   label: string;
   debit: number;
   credit: number;
+  other: number;
   current: number;
 }) {
   const money = (value: number) =>
@@ -230,13 +232,14 @@ function AdvancedSummary({
     ["Débito", debit, "border-blue-200 bg-blue-50 text-blue-800"],
     ["Crédito", credit, "border-red-200 bg-red-50 text-red-800"],
     ["Atual", current, "border-slate-200 bg-slate-50"],
+    ["Outros", other, "border-violet-200 bg-violet-50 text-violet-800"],
   ] as const;
   return (
     <div className="flex items-center gap-3">
       <div className="w-12 shrink-0 text-xs font-semibold text-slate-600">
         {label}
       </div>
-      <div className="grid flex-1 grid-cols-2 gap-1 sm:grid-cols-4">
+      <div className="grid flex-1 grid-cols-2 gap-1 sm:grid-cols-5">
         {cells.map(([title, value, color]) => (
           <div
             className={`rounded-md border px-2 py-1 text-center ${color}`}
@@ -264,16 +267,25 @@ function AdvancedOverview({
     pendentes: unknown[];
     salvas: unknown[];
     resumo: {
-      extrato: { debito: string; credito: string };
-      razao: { debito: string; credito: string };
+      extrato: { debito: string; credito: string; outros: string };
+      razao: { debito: string; credito: string; outros: string };
     };
+    integridade: { csv_permitido: boolean; diferenca: string; movimentos_incompletos: { data: string; historico: string }[] };
   } | null>(null);
   useEffect(() => {
-    fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis`)
+    const controller = new AbortController();
+    fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis?atualizacao=${version}`, { cache: "no-store", signal: controller.signal })
       .then((response) => (response.ok ? response.json() : null))
-      .then(setData);
+      .then((result) => {
+        if (!controller.signal.aborted) setData(result);
+      })
+      .catch((error) => {
+        if (error.name !== "AbortError") setData(null);
+      });
+    return () => controller.abort();
   }, [reconciliationId, version]);
   const summary = data?.resumo;
+  const csvBlocked = data?.integridade && !data.integridade.csv_permitido;
   return (
     <section className="flex flex-wrap items-center gap-4 rounded-xl border border-slate-200 bg-white p-3">
       <div className="flex flex-col gap-1.5">
@@ -301,6 +313,7 @@ function AdvancedOverview({
             Number(summary?.extrato.credito ?? 0) -
             Number(summary?.extrato.debito ?? 0)
           }
+          other={Number(summary?.extrato.outros ?? 0)}
         />
         <AdvancedSummary
           label="Razão"
@@ -310,17 +323,12 @@ function AdvancedOverview({
             Number(summary?.razao.credito ?? 0) -
             Number(summary?.razao.debito ?? 0)
           }
+          other={Number(summary?.razao.outros ?? 0)}
         />
       </div>
       <div className="text-right text-[10px] text-slate-500">
         Gera o CSV pronto para importar no ERP.
-        <a
-          href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`}
-          className="mt-1 flex items-center rounded bg-teal-700 px-2 py-1 text-[10px] font-semibold text-white"
-        >
-          <Download className="mr-1" size={12} />
-          Gerar CSV
-        </a>
+        {csvBlocked ? <span title={`Revise os lançamentos incompletos: ${data.integridade.movimentos_incompletos.map((item) => item.data).join(", ")}`} className="mt-1 flex cursor-not-allowed items-center rounded bg-slate-300 px-2 py-1 text-[10px] font-semibold text-slate-600"><Download className="mr-1" size={12} />CSV bloqueado</span> : <><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`} className="mt-1 flex items-center rounded bg-teal-700 px-2 py-1 text-[10px] font-semibold text-white"><Download className="mr-1" size={12} />Gerar CSV</a><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis-outros.csv`} className="mt-1 flex items-center rounded border border-violet-300 bg-violet-50 px-2 py-1 text-[10px] font-semibold text-violet-800"><Download className="mr-1" size={12} />CSV Outros</a></>}
       </div>
     </section>
   );
@@ -334,6 +342,9 @@ type PendingRule = {
   natureza: string;
   natureza_contabil?: string;
   palavras_comprovante?: string[];
+  movimento_composto?: boolean;
+  componentes_documento?: string[];
+  componentes_cobertos?: { componente: string; valor: string }[];
   tipo_componente?: string;
   valor_documento?: string;
   composicao_simples?: string;
@@ -641,14 +652,16 @@ function AdvancedRulesPanel({
       .trim();
   const [message, setMessage] = useState("");
   const [busyRuleId, setBusyRuleId] = useState<string | null>(null);
+  const [confirmClearAll, setConfirmClearAll] = useState(false);
+  const [csvPermitted, setCsvPermitted] = useState(true);
   const [catalog, setCatalog] = useState<{
     contas: string[];
     historicos: string[];
   }>({ contas: [], historicos: [] });
   async function load() {
     const [rulesResponse, accountResponse] = await Promise.all([
-      fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis`),
-      fetch(`${API}/api/conciliacoes/${reconciliationId}/conta-bancaria`),
+      fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis`, { cache: "no-store" }),
+      fetch(`${API}/api/conciliacoes/${reconciliationId}/conta-bancaria`, { cache: "no-store" }),
     ]);
     if (!rulesResponse.ok || !accountResponse.ok)
       return setMessage("Não foi possível carregar as regras.");
@@ -666,6 +679,7 @@ function AdvancedRulesPanel({
         historico: cleanHistory(item.historico),
       })),
     );
+    setCsvPermitted(rules.integridade?.csv_permitido !== false);
     setAccount(bankAccount.conta_contabil || "");
   }
   useEffect(() => {
@@ -760,6 +774,20 @@ function AdvancedRulesPanel({
         method: "DELETE",
       });
       if (!response.ok) return setMessage("Não foi possível excluir a regra.");
+      await load();
+      onRulesChanged();
+    } finally {
+      setBusyRuleId(null);
+    }
+  }
+  async function clearAllRules() {
+    if (busyRuleId) return;
+    setBusyRuleId("all");
+    try {
+      const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis`, { method: "DELETE" });
+      if (!response.ok) return setMessage("Não foi possível limpar as regras.");
+      setConfirmClearAll(false);
+      setMessage("Todas as regras deste banco foram limpas e os lançamentos foram recalculados.");
       await load();
       onRulesChanged();
     } finally {
@@ -1169,7 +1197,7 @@ function AdvancedRulesPanel({
           {!pendingItem?.regra_compartilhada && (
             <>
               <button title={existing ? "Atualizar regra" : "Salvar regra"} aria-label={existing ? "Atualizar regra" : "Salvar regra"} disabled={busyRuleId === item.id} onClick={() => saveRule(item, existing)} className="rounded bg-teal-700 px-2 py-1 text-white disabled:cursor-wait disabled:opacity-60">
-                {busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : existing ? <RefreshCw size={14} /> : "Salvar"}
+                {busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : existing ? <RefreshCw size={14} /> : <CheckCircle2 size={14} />}
               </button>
               {existing && <button title="Excluir regra" aria-label="Excluir regra" disabled={busyRuleId === item.id} onClick={() => remove(item.id)} className="ml-1 rounded border border-red-200 px-2 py-1 text-red-700 disabled:cursor-wait disabled:opacity-60"><Trash2 size={14} /></button>}
             </>
@@ -1221,12 +1249,7 @@ function AdvancedRulesPanel({
         >
           Salvar conta
         </button>
-        <a
-          href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`}
-          className="rounded bg-teal-700 px-3 py-1.5 text-xs font-semibold text-white"
-        >
-          Gerar CSV
-        </a>
+        {csvPermitted ? <><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`} className="rounded bg-teal-700 px-3 py-1.5 text-xs font-semibold text-white">Gerar CSV</a><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis-outros.csv`} className="rounded border border-violet-300 bg-violet-50 px-3 py-1.5 text-xs font-semibold text-violet-800">CSV Outros</a></> : <span className="cursor-not-allowed rounded bg-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-500">CSV bloqueado</span>}
       </div>
       <div className="flex flex-wrap items-center gap-2">
         <button
@@ -1241,6 +1264,7 @@ function AdvancedRulesPanel({
         >
           Regras salvas ({saved.length})
         </button>
+        {saved.length > 0 && <button onClick={() => setConfirmClearAll(true)} className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-semibold text-red-700">Limpar todas</button>}
         {view === "pending" && (
           <input
             value={filter}
@@ -1277,7 +1301,7 @@ function AdvancedRulesPanel({
             {view === "pending"
               ? pendingGroups.map((items) => {
                   const movement = items[0];
-                  const compound = items.length > 1;
+                  const compound = items.length > 1 || items.some((item) => item.movimento_composto);
                   if (!compound)
                     return (
                       <Fragment key={movement.id}>
@@ -1298,9 +1322,12 @@ function AdvancedRulesPanel({
                             <span className="max-w-96 truncate font-medium text-slate-800" title={movement.historico}>
                               {movement.historico}
                             </span>
-                            <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-800">
-                              Extrato: {movement.natureza} | Contábil: {movement.natureza_contabil}
-                            </span>
+                             <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-800">
+                               Extrato: {movement.natureza} | Contábil: {movement.natureza_contabil}
+                             </span>
+                              <span className="text-[10px] font-semibold text-sky-800">
+                               Composição do comprovante: {items.map((item) => componentLabel(item.tipo_componente)).join(", ")} pendente{items.length > 1 ? "s" : ""}.
+                             </span>
                             {movement.comprovante_confere && (
                               <span className="text-[10px] text-emerald-700">
                                 ✓ Confere com o extrato
@@ -1328,8 +1355,8 @@ function AdvancedRulesPanel({
                         </td>
                       </tr>
                       {items.map((item) => editor(item, false, true, false, showActions))}
-                      {movement.valor_documento && (
-                        <tr
+                       {(movement.valor_documento || movement.componentes_cobertos?.length) && (
+                         <tr
                           className={
                             compound ? "bg-sky-50" : "bg-emerald-50/70"
                           }
@@ -1338,8 +1365,12 @@ function AdvancedRulesPanel({
                             colSpan={showActions ? 10 : 9}
                             className="border-x-2 border-b-2 border-sky-200 px-3 pb-3 text-[10px] text-slate-500"
                           >
-                            Valor total do documento: R${" "}
-                            {movement.valor_documento}
+                            {(() => {
+                              const principal = movement.componentes_cobertos?.find((item) => ["PRINCIPAL", "VALOR_COBRADO"].includes(item.componente));
+                              const missing = items.reduce((total, item) => total + Number(item.valor || 0), 0);
+                              const money = (value: string | number) => Number(value || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2 });
+                              return <span>Principal já lançado: R$ {money(principal?.valor || 0)} | Faltando: R$ {money(missing)} | Valor total do documento: R$ {money(movement.valor_documento || 0)}</span>;
+                            })()}
                           </td>
                         </tr>
                       )}
@@ -1374,6 +1405,16 @@ function AdvancedRulesPanel({
           </tbody>
         </table>
       </div>
+      {confirmClearAll && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
+        <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl">
+          <h3 className="text-sm font-semibold text-slate-900">Limpar todas as regras?</h3>
+          <p className="mt-2 text-xs leading-5 text-slate-600">As regras salvas deste banco serão desativadas e seus lançamentos aplicados serão removidos. Os movimentos e comprovantes não serão apagados; as sugestões voltarão para Regras a criar.</p>
+          <div className="mt-4 flex justify-end gap-2">
+            <button disabled={busyRuleId === "all"} onClick={() => setConfirmClearAll(false)} className="rounded border px-3 py-1.5 text-xs font-semibold text-slate-700">Cancelar</button>
+            <button disabled={busyRuleId === "all"} onClick={clearAllRules} className="rounded bg-red-700 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-60">{busyRuleId === "all" ? "Limpando..." : "Sim, limpar todas"}</button>
+          </div>
+        </div>
+      </div>}
     </section>
   );
 }

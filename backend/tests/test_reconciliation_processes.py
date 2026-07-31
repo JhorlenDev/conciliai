@@ -105,7 +105,7 @@ def test_boleto_matches_paid_value_once_and_creates_component_items():
     match = session.query(Correspondencia).filter_by(movimento_extrato_id=movement.id).one()
     items = session.query(LancamentoContabil).filter_by(correspondencia_id=match.id).order_by(LancamentoContabil.ordem).all()
     assert match.comprovante_id == receipt.id
-    assert [(item.componente, item.valor, item.efeito_no_total) for item in items] == [("VALOR_COBRADO", Decimal("493.14"), "SOMA"), ("DESCONTO_ABATIMENTO", Decimal("54.79"), "SOMA")]
+    assert [(item.componente, item.valor, item.efeito_no_total) for item in items] == [("VALOR_COBRADO", Decimal("493.14"), "SOMA"), ("DESCONTO_ABATIMENTO", Decimal("54.79"), "OUTROS")]
 
 
 def test_reconciliation_refresh_preserves_manual_component_edits():

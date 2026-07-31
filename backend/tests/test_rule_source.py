@@ -35,7 +35,7 @@ def test_receipt_discount_creates_principal_and_discount_items():
     receipt = SimpleNamespace(financeiros=FinancialValues(valor_original=Decimal("547.93"), valor_desconto=Decimal("54.79"), valor_pago=Decimal("493.14")))
     result = choose_rule_source(Decimal("493.14"), receipt)
 
-    assert [(line.componente, line.valor, line.efeito_no_total) for line in result.linhas] == [("VALOR_COBRADO", Decimal("493.14"), "SOMA"), ("DESCONTO", Decimal("54.79"), "SOMA")]
+    assert [(line.componente, line.valor, line.efeito_no_total) for line in result.linhas] == [("VALOR_COBRADO", Decimal("493.14"), "SOMA"), ("DESCONTO", Decimal("54.79"), "OUTROS")]
     assert not result.exige_revisao
 
 

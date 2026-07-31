@@ -6,7 +6,8 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.api.routes import RegraContabilInput, accounting_csv, accounting_rules, apply_accounting_rules, create_accounting_rule, delete_accounting_rule, rule_matches_movement
+from app.api.routes import RegraContabilInput, accounting_csv, accounting_integrity, accounting_other_csv, accounting_rules, apply_accounting_rules, create_accounting_rule, delete_accounting_rule, delete_all_accounting_rules, rule_matches_movement, update_accounting_rule
+import app.api.routes as routes
 from app.core.database import Base
 from app.models import Arquivo, Cliente, Comprovante, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, RegraContabil
 from app.services.normalization import normalize_name
@@ -40,7 +41,7 @@ def test_rule_application_and_csv_include_only_covered_movements():
     assert len(data["pendentes"]) == 1
     entry = session.query(LancamentoContabil).filter_by(status="aplicado_por_regra").one()
     assert (entry.valor, entry.conta_debito, entry.conta_credito) == (Decimal("12.50"), "Despesa", "Banco")
-    assert data["resumo"]["razao"] == {"debito": "0", "credito": "12.50"}
+    assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "12.50", "outros": "0.00"}
 
 
 def test_credit_rule_moves_entry_to_saved_and_reason_only_sums_covered_value():
@@ -67,7 +68,7 @@ def test_credit_rule_moves_entry_to_saved_and_reason_only_sums_covered_value():
     assert data["salvas"][0]["movimentos"][0]["texto_comprovante"] == ""
     entry = session.query(LancamentoContabil).filter_by(status="aplicado_por_regra").one()
     assert (entry.valor, entry.conta_debito, entry.conta_credito) == (Decimal("20.00"), "Banco", "Receita")
-    assert data["resumo"]["razao"] == {"debito": "20.00", "credito": "0"}
+    assert data["resumo"]["razao"] == {"debito": "20.00", "credito": "0.00", "outros": "0.00"}
 
 
 def test_reason_separates_debit_and_credit_movements_without_double_counting():
@@ -91,7 +92,7 @@ def test_reason_separates_debit_and_credit_movements_without_double_counting():
     data = accounting_rules(reconciliation.id, session)
 
     assert session.query(LancamentoContabil).filter_by(status="aplicado_por_regra").count() == 2
-    assert data["resumo"]["razao"] == {"debito": "100.00", "credito": "100.00"}
+    assert data["resumo"]["razao"] == {"debito": "100.00", "credito": "100.00", "outros": "0.00"}
 
 
 def test_rule_requires_its_statement_and_receipt_triggers():
@@ -134,7 +135,9 @@ def rule_input(trigger="FORNECEDOR", receipt_trigger=""):
 def test_new_eligible_rule_is_returned_as_pending_suggestion():
     session, reconciliation, _ = rules_session()
 
-    assert len(accounting_rules(reconciliation.id, session)["pendentes"]) == 1
+    data = accounting_rules(reconciliation.id, session)
+    assert len(data["pendentes"]) == 1
+    assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00"}
 
 
 def test_saved_rule_disappears_from_pending_and_is_returned_as_saved_after_refresh():
@@ -159,8 +162,9 @@ def test_persisted_covered_entry_does_not_return_zero_eligible_suggestion():
 
     data = accounting_rules(reconciliation.id, session)
 
-    assert data["pendentes"] == []
-    assert data["salvas"][0]["cobertos"] == 1
+    assert len(data["pendentes"]) == 1
+    assert data["salvas"][0]["cobertos"] == 0
+    assert data["integridade"]["movimentos_incompletos"][0]["movimento_id"] == movement.id
 
 
 def test_deleting_saved_rule_recalculates_its_pending_suggestion():
@@ -191,3 +195,140 @@ def test_equivalent_rule_with_reordered_keywords_is_not_saved_twice():
 
     with pytest.raises(HTTPException, match="regra equivalente"):
         create_accounting_rule(reconciliation.id, rule_input("FORNECEDOR, PIX"), session)
+
+
+def test_rule_save_rolls_back_when_accounting_entry_creation_fails(monkeypatch):
+    session, reconciliation, _ = rules_session()
+
+    monkeypatch.setattr(routes, "apply_accounting_rules", lambda *_: (_ for _ in ()).throw(RuntimeError("falha")))
+
+    with pytest.raises(RuntimeError, match="falha"):
+        create_accounting_rule(reconciliation.id, rule_input(), session)
+    assert session.query(RegraContabil).count() == 0
+    assert session.query(LancamentoContabil).count() == 0
+
+
+def test_equal_date_and_beneficiary_movements_keep_separate_accounting_entries():
+    session, reconciliation, first = rules_session("PAGAMENTO BOLETO SUCESSODONTO")
+    second = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=first.arquivo_id, pagina_numero=1, data=first.data, historico=first.historico, valor=Decimal("1000.00"), natureza="saída")
+    session.add(second); session.flush()
+
+    create_accounting_rule(reconciliation.id, rule_input("SUCESSODONTO"), session)
+
+    entries = session.query(LancamentoContabil).filter_by(status="aplicado_por_regra").all()
+    assert sorted(entry.valor for entry in entries) == [Decimal("12.50"), Decimal("1000.00")]
+    assert len({entry.correspondencia_id for entry in entries}) == 2
+
+
+def test_csv_is_blocked_when_integrity_reports_an_unbalanced_reason(monkeypatch):
+    session, reconciliation, _ = rules_session()
+    session.add(ContaBancaria(cliente_id=reconciliation.cliente_id, banco=reconciliation.banco, conta_contabil="Banco"))
+    monkeypatch.setattr(routes, "accounting_integrity", lambda *_: {"debito": Decimal("100.00"), "credito": Decimal("0.00"), "diferenca": Decimal("100.00"), "movimentos_incompletos": [], "csv_permitido": False, "lancamentos_validos": []})
+
+    with pytest.raises(HTTPException, match=r"diferença de R\$ 100.00"):
+        accounting_csv(reconciliation.id, session)
+
+
+def test_discount_is_accounted_as_other_and_exported_in_its_own_csv():
+    session, reconciliation, movement = rules_session()
+    match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id)
+    session.add(match); session.flush()
+    session.add_all([
+        LancamentoContabil(correspondencia_id=match.id, componente="VALOR_COBRADO", valor=Decimal("12.50"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento", status="editado_manual"),
+        LancamentoContabil(correspondencia_id=match.id, componente="DESCONTO", efeito_no_total="SOMA", valor=Decimal("2.50"), conta_debito="Descontos", conta_credito="Despesa", historico="Desconto obtido", status="editado_manual"),
+    ])
+    session.add(ContaBancaria(cliente_id=reconciliation.cliente_id, banco=reconciliation.banco, conta_contabil="Banco"))
+    session.commit()
+
+    integrity = accounting_integrity(reconciliation, session)
+    other_csv = accounting_other_csv(reconciliation.id, session).body.decode("utf-8-sig")
+
+    assert (integrity["debito"], integrity["credito"], integrity["outros"]) == (Decimal("0.00"), Decimal("12.50"), Decimal("2.50"))
+    assert other_csv.splitlines() == ["data;debito;credito;historico;complemento;valor", "02/01/2024;Descontos;Despesa;Desconto obtido;;2,50"]
+
+
+def test_remaining_discount_stays_identified_as_a_compound_pending_component():
+    session, reconciliation, movement = rules_session()
+    match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id)
+    session.add(match); session.flush()
+    session.add_all([
+        LancamentoContabil(correspondencia_id=match.id, componente="VALOR_COBRADO", valor=Decimal("12.50"), origem="comprovante", status="pendente_regra"),
+        LancamentoContabil(correspondencia_id=match.id, componente="DESCONTO", valor=Decimal("2.50"), origem="comprovante", efeito_no_total="OUTROS", status="pendente_regra"),
+    ])
+    session.commit()
+
+    create_accounting_rule(reconciliation.id, RegraContabilInput(gatilho="FORNECEDOR", natureza="Crédito", tipo_componente="VALOR_COBRADO", conta_debito="Despesa", conta_credito="Banco", historico="Pagamento"), session)
+
+    pending = accounting_rules(reconciliation.id, session)["pendentes"]
+    assert [(item["tipo_componente"], item["movimento_composto"], item["componentes_documento"], item["componentes_cobertos"]) for item in pending] == [("DESCONTO", True, ["VALOR_COBRADO", "DESCONTO"], [{"componente": "VALOR_COBRADO", "valor": "12.50"}])]
+
+
+def test_clearing_all_rules_recalculates_pending_movements_without_deleting_them():
+    session, reconciliation, movement = rules_session()
+    create_accounting_rule(reconciliation.id, rule_input(), session)
+
+    delete_all_accounting_rules(reconciliation.id, session)
+
+    data = accounting_rules(reconciliation.id, session)
+    assert data["salvas"] == []
+    assert len(data["pendentes"]) == 1
+    assert session.get(MovimentoExtrato, movement.id) is not None
+    entry = session.query(LancamentoContabil).one()
+    assert (entry.regra_contabil_id, entry.status) == (None, "pendente")
+
+
+def test_clearing_all_rules_removes_entries_left_by_inactive_rules():
+    session, reconciliation, _ = rules_session()
+    created = create_accounting_rule(reconciliation.id, rule_input(), session)
+    session.get(RegraContabil, created["id"]).ativo = False
+    session.commit()
+
+    delete_all_accounting_rules(reconciliation.id, session)
+
+    assert session.query(LancamentoContabil).filter_by(status="aplicado_por_regra").count() == 0
+    assert accounting_rules(reconciliation.id, session)["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00"}
+
+
+def test_deleting_a_rule_immediately_removes_its_value_from_reason():
+    session, reconciliation, _ = rules_session()
+    created = create_accounting_rule(reconciliation.id, rule_input(), session)
+
+    delete_accounting_rule(created["id"], session)
+
+    assert accounting_rules(reconciliation.id, session)["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00"}
+
+
+def test_updating_a_rule_to_not_match_removes_its_value_from_reason():
+    session, reconciliation, _ = rules_session()
+    created = create_accounting_rule(reconciliation.id, rule_input(), session)
+
+    update_accounting_rule(reconciliation.id, created["id"], rule_input("INEXISTENTE"), session)
+
+    assert accounting_rules(reconciliation.id, session)["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00"}
+
+
+def test_inactive_rule_residue_is_excluded_from_reason_and_coverage():
+    session, reconciliation, _ = rules_session()
+    created = create_accounting_rule(reconciliation.id, rule_input(), session)
+    session.get(RegraContabil, created["id"]).ativo = False
+    session.commit()
+
+    data = accounting_rules(reconciliation.id, session)
+
+    assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00"}
+    assert len(data["pendentes"]) == 1
+
+
+def test_other_bank_rule_never_enters_current_bank_reason():
+    session, reconciliation, movement = rules_session()
+    foreign_rule = RegraContabil(cliente_id=reconciliation.cliente_id, banco="Banco do Brasil", tipo_fonte="extrato", tipo_operacao="Crédito", favorecido_normalizado=normalize_name("FORNECEDOR"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento")
+    session.add(foreign_rule); session.flush()
+    match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id, regra_contabil_id=foreign_rule.id)
+    session.add(match); session.flush()
+    session.add(LancamentoContabil(correspondencia_id=match.id, regra_contabil_id=foreign_rule.id, componente="PRINCIPAL", valor=movement.valor, conta_debito="Despesa", conta_credito="Banco", historico="Pagamento", status="aplicado_por_regra"))
+    session.commit()
+
+    data = accounting_rules(reconciliation.id, session)
+
+    assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00"}
+    assert len(data["pendentes"]) == 1

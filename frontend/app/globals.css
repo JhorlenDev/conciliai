@@ -112,49 +112,49 @@ main.min-h-screen > div.grid > :nth-child(2) .flex.flex-wrap > select {
   flex-shrink: 0;
 }
 
-main.mx-auto.max-w-7xl {
+main.workspace-main {
   padding-top: 0.75rem;
   padding-bottom: 0.75rem;
 }
 
-main.mx-auto.max-w-7xl > header {
+main.workspace-main > header {
   margin-bottom: 0.75rem;
 }
 
-main.mx-auto.max-w-7xl > header img.h-10.w-10 {
+main.workspace-main > header img.h-10.w-10 {
   width: 2rem;
   height: 2rem;
 }
 
-main.mx-auto.max-w-7xl > header h1 {
+main.workspace-main > header h1 {
   font-size: 1rem;
 }
 
-main.mx-auto.max-w-7xl > header p,
-main.mx-auto.max-w-7xl label {
+main.workspace-main > header p,
+main.workspace-main label {
   font-size: 0.7rem;
 }
 
-main.mx-auto.max-w-7xl > .mb-5 {
+main.workspace-main > .mb-5 {
   margin-bottom: 0.75rem;
 }
 
-main.mx-auto.max-w-7xl > .mb-5 button {
+main.workspace-main > .mb-5 button {
   padding: 0.35rem 0.65rem;
   font-size: 0.75rem;
 }
 
-main.mx-auto.max-w-7xl .p-5 {
+main.workspace-main .p-5 {
   padding: 0.75rem;
 }
 
-main.mx-auto.max-w-7xl input,
-main.mx-auto.max-w-7xl select {
+main.workspace-main input,
+main.workspace-main select {
   padding: 0.35rem 0.5rem;
   font-size: 0.75rem;
 }
 
-main.mx-auto.max-w-7xl .px-4.py-2 {
+main.workspace-main .px-4.py-2 {
   padding: 0.35rem 0.65rem;
   font-size: 0.75rem;
 }

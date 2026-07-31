@@ -10,6 +10,7 @@ const banks = [
   "Santander",
   "BASA",
   "Bradesco",
+  "Caixa",
   "Conta Caixa",
   "Vendas com Cartão",
   "Comissões Getnet",
@@ -103,6 +104,10 @@ export default function EntryPage() {
   }
   const date = (value: string) =>
     new Date(`${value}T00:00:00`).toLocaleDateString("pt-BR");
+  const month = (value: string) => {
+    const label = new Date(`${value}T00:00:00`).toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
+    return label.charAt(0).toUpperCase() + label.slice(1);
+  };
   const dateTime = (value: string) =>
     new Date(value).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
   return (
@@ -207,20 +212,21 @@ export default function EntryPage() {
               <RefreshCw size={16} />
             </button>
           </div>
-          <div className="space-y-3">
-            {processes.map((process) => (
-                <article className="flex w-full items-center rounded-xl border bg-white shadow-sm transition hover:border-emerald-700 hover:shadow-md" key={process.id}>
-                  <button type="button" onClick={() => open(process)} className="flex min-w-0 flex-1 items-center justify-between p-5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700 focus-visible:ring-inset">
-                  <div>
-                    <h3 className="font-semibold">{process.cliente_nome}</h3>
-                    <p className="text-sm text-slate-500">
-                      {date(process.data_inicio)} a {date(process.data_fim)}
-                    </p>
-                    <p className="mt-1 text-xs text-slate-400">Criado em: {dateTime(process.criado_em)}</p>
-                  </div>
-                  <ArrowRight className="shrink-0 text-emerald-800" aria-hidden="true" />
-                  </button>
-                  <button type="button" onClick={() => setProcessToDelete(process)} aria-label={`Excluir processo de ${process.cliente_nome}`} title="Excluir processo" className="mr-4 rounded-md p-2 text-slate-500 hover:bg-red-50 hover:text-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600"><Trash2 size={18}/></button>
+           <div className="grid gap-2 md:grid-cols-2">
+             {processes.map((process) => (
+                <article className="flex min-w-0 items-center rounded-lg border bg-white shadow-sm transition hover:border-emerald-700 hover:shadow-md" key={process.id}>
+                  <button type="button" onClick={() => open(process)} className="flex min-w-0 flex-1 items-center justify-between p-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700 focus-visible:ring-inset">
+                   <div>
+                     <h3 className="text-sm font-semibold">{process.cliente_nome}</h3>
+                     <p className="mt-0.5 text-xs font-medium text-emerald-800">{month(process.data_inicio)}</p>
+                     <p className="text-xs text-slate-500">
+                       {date(process.data_inicio)} - {date(process.data_fim)}
+                     </p>
+                     <p className="mt-0.5 text-[10px] text-slate-400">Criado em: {dateTime(process.criado_em)}</p>
+                   </div>
+                   <ArrowRight size={16} className="shrink-0 text-emerald-800" aria-hidden="true" />
+                   </button>
+                  <button type="button" onClick={() => setProcessToDelete(process)} aria-label={`Excluir processo de ${process.cliente_nome}`} title="Excluir processo" className="mr-2 rounded-md p-1.5 text-slate-500 hover:bg-red-50 hover:text-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600"><Trash2 size={15}/></button>
                 </article>
             ))}
             {!processes.length && (

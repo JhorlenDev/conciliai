@@ -6,10 +6,10 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.api.routes import RegraContabilInput, accounting_csv, accounting_integrity, accounting_other_csv, accounting_rules, apply_accounting_rules, create_accounting_rule, delete_accounting_rule, delete_all_accounting_rules, rule_matches_movement, update_accounting_rule
+from app.api.routes import RegraContabilInput, accounting_csv, accounting_integrity, accounting_other_csv, accounting_pdf, accounting_rules, apply_accounting_rules, create_accounting_rule, delete_accounting_rule, delete_all_accounting_rules, rule_matches_movement, update_accounting_rule
 import app.api.routes as routes
 from app.core.database import Base
-from app.models import Arquivo, Cliente, Comprovante, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, RegraContabil
+from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, RegraContabil
 from app.services.normalization import normalize_name
 
 
@@ -41,7 +41,7 @@ def test_rule_application_and_csv_include_only_covered_movements():
     assert len(data["pendentes"]) == 1
     entry = session.query(LancamentoContabil).filter_by(status="aplicado_por_regra").one()
     assert (entry.valor, entry.conta_debito, entry.conta_credito) == (Decimal("12.50"), "Despesa", "Banco")
-    assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "12.50", "outros": "0.00"}
+    assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "12.50", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
 
 
 def test_credit_rule_moves_entry_to_saved_and_reason_only_sums_covered_value():
@@ -68,7 +68,7 @@ def test_credit_rule_moves_entry_to_saved_and_reason_only_sums_covered_value():
     assert data["salvas"][0]["movimentos"][0]["texto_comprovante"] == ""
     entry = session.query(LancamentoContabil).filter_by(status="aplicado_por_regra").one()
     assert (entry.valor, entry.conta_debito, entry.conta_credito) == (Decimal("20.00"), "Banco", "Receita")
-    assert data["resumo"]["razao"] == {"debito": "20.00", "credito": "0.00", "outros": "0.00"}
+    assert data["resumo"]["razao"] == {"debito": "20.00", "credito": "0.00", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
 
 
 def test_reason_separates_debit_and_credit_movements_without_double_counting():
@@ -92,7 +92,7 @@ def test_reason_separates_debit_and_credit_movements_without_double_counting():
     data = accounting_rules(reconciliation.id, session)
 
     assert session.query(LancamentoContabil).filter_by(status="aplicado_por_regra").count() == 2
-    assert data["resumo"]["razao"] == {"debito": "100.00", "credito": "100.00", "outros": "0.00"}
+    assert data["resumo"]["razao"] == {"debito": "100.00", "credito": "100.00", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
 
 
 def test_rule_requires_its_statement_and_receipt_triggers():
@@ -103,6 +103,31 @@ def test_rule_requires_its_statement_and_receipt_triggers():
     assert rule_matches_movement(rule, movement, receipt)
     assert not rule_matches_movement(rule, movement, Comprovante(favorecido="Outra Pessoa"))
     assert rule_matches_movement(RegraContabil(tipo_fonte="extrato", favorecido_normalizado=normalize_name("Transferência Agendada")), movement, None)
+
+
+def test_rule_receipt_trigger_combines_bank_and_rfb_keywords():
+    movement = MovimentoExtrato(historico="Pagamento de Boleto", natureza="saída")
+    receipt = Comprovante(favorecido="Bambuno Tecnologia")
+    rfb = ComprovanteRfb(tipo="DAS", razao_social="Empresa Simples Nacional")
+    rule = RegraContabil(tipo_fonte="extrato", favorecido_normalizado=normalize_name("Pagamento Boleto"), gatilho_comprovante_normalizado=normalize_name("Bambuno Simples"))
+
+    assert rule_matches_movement(rule, movement, receipt, "", rfb)
+    assert not rule_matches_movement(rule, movement, receipt, "", ComprovanteRfb(tipo="DARF", razao_social="Outra Empresa"))
+
+
+def test_pending_payload_exposes_linked_bank_and_rfb_documents():
+    session, reconciliation, movement = rules_session()
+    receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=movement.arquivo_id, pagina_numero=2, favorecido="Fornecedor Banco")
+    rfb = ComprovanteRfb(conciliacao_id=reconciliation.id, arquivo_id=movement.arquivo_id, pagina_numero=3, tipo="DAS", razao_social="Empresa Simples Nacional")
+    session.add_all([receipt, rfb]); session.flush()
+    session.add(Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id, comprovante_id=receipt.id, comprovante_rfb_id=rfb.id)); session.commit()
+
+    pending = accounting_rules(reconciliation.id, session)["pendentes"][0]
+
+    assert pending["comprovante_arquivo_id"] == receipt.arquivo_id
+    assert pending["comprovante_rfb_arquivo_id"] == rfb.arquivo_id
+    assert "FORNECEDOR" in pending["palavras_comprovante_banco"]
+    assert "SIMPLES" in pending["palavras_comprovante_rfb"]
 
 
 def test_legacy_rule_without_receipt_trigger_can_match_its_receipt_party():
@@ -137,7 +162,7 @@ def test_new_eligible_rule_is_returned_as_pending_suggestion():
 
     data = accounting_rules(reconciliation.id, session)
     assert len(data["pendentes"]) == 1
-    assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00"}
+    assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
 
 
 def test_saved_rule_disappears_from_pending_and_is_returned_as_saved_after_refresh():
@@ -286,7 +311,7 @@ def test_clearing_all_rules_removes_entries_left_by_inactive_rules():
     delete_all_accounting_rules(reconciliation.id, session)
 
     assert session.query(LancamentoContabil).filter_by(status="aplicado_por_regra").count() == 0
-    assert accounting_rules(reconciliation.id, session)["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00"}
+    assert accounting_rules(reconciliation.id, session)["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
 
 
 def test_deleting_a_rule_immediately_removes_its_value_from_reason():
@@ -295,7 +320,7 @@ def test_deleting_a_rule_immediately_removes_its_value_from_reason():
 
     delete_accounting_rule(created["id"], session)
 
-    assert accounting_rules(reconciliation.id, session)["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00"}
+    assert accounting_rules(reconciliation.id, session)["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
 
 
 def test_updating_a_rule_to_not_match_removes_its_value_from_reason():
@@ -304,7 +329,7 @@ def test_updating_a_rule_to_not_match_removes_its_value_from_reason():
 
     update_accounting_rule(reconciliation.id, created["id"], rule_input("INEXISTENTE"), session)
 
-    assert accounting_rules(reconciliation.id, session)["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00"}
+    assert accounting_rules(reconciliation.id, session)["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
 
 
 def test_inactive_rule_residue_is_excluded_from_reason_and_coverage():
@@ -315,7 +340,7 @@ def test_inactive_rule_residue_is_excluded_from_reason_and_coverage():
 
     data = accounting_rules(reconciliation.id, session)
 
-    assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00"}
+    assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
     assert len(data["pendentes"]) == 1
 
 
@@ -330,5 +355,16 @@ def test_other_bank_rule_never_enters_current_bank_reason():
 
     data = accounting_rules(reconciliation.id, session)
 
-    assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00"}
+    assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
     assert len(data["pendentes"]) == 1
+
+
+def test_pdf_export_groups_valid_entries_into_a_report():
+    session, reconciliation, _ = rules_session()
+    create_accounting_rule(reconciliation.id, rule_input(), session)
+
+    response = accounting_pdf(reconciliation.id, session)
+
+    assert response.media_type == "application/pdf"
+    assert response.body.startswith(b"%PDF")
+    assert response.headers["content-disposition"] == 'attachment; filename="lancamentos-contabeis.pdf"'

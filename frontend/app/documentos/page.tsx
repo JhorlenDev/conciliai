@@ -5,14 +5,137 @@ import { ChangeEvent, useEffect, useState } from "react";
 import { FileText, Trash2, Upload, Users } from "lucide-react";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-type Document = { id: string; nome: string; tipo: "plano_contas" | "historicos"; extensao: string };
+type Document = {
+  id: string;
+  nome: string;
+  tipo: "plano_contas" | "historicos";
+  extensao: string;
+};
 
 export default function DocumentosPage() {
-  const [documents, setDocuments] = useState<Document[]>([]), [message, setMessage] = useState("");
-  async function load() { const response = await fetch(`${API}/api/documentos-importantes`); if (response.ok) setDocuments(await response.json()); else setMessage("Não foi possível carregar documentos."); }
-  useEffect(() => { load(); }, []);
-  async function upload(type: Document["tipo"], event: ChangeEvent<HTMLInputElement>) { const file = event.target.files?.[0]; if (!file) return; const form = new FormData(); form.append("file", file); const response = await fetch(`${API}/api/documentos-importantes?tipo=${type}`, { method: "POST", body: form }); event.target.value = ""; if (!response.ok) return setMessage((await response.json()).detail ?? "Não foi possível enviar o documento."); setMessage("Documento importado."); load(); }
-  async function remove(id: string) { const response = await fetch(`${API}/api/documentos-importantes/${id}`, { method: "DELETE" }); if (!response.ok) return setMessage("Não foi possível excluir o documento."); setDocuments(items => items.filter(item => item.id !== id)); }
-  const label = (type: Document["tipo"]) => type === "plano_contas" ? "Plano de contas" : "Históricos contábeis";
-  return <main className="min-h-screen bg-slate-100"><header className="bg-emerald-800 px-6 py-3 text-white"><div className="mx-auto flex max-w-5xl items-center"><div><Link href="/" className="text-lg font-bold">Conciliaí</Link><p className="text-xs text-emerald-100">Documentos importantes</p></div><Link href="/clientes" className="ml-auto inline-flex items-center gap-1 rounded px-2 py-1 text-sm hover:bg-emerald-700"><Users size={15}/>Clientes</Link></div></header><section className="mx-auto max-w-5xl px-6 py-10"><div className="grid gap-5 md:grid-cols-2">{(["plano_contas", "historicos"] as const).map(type => <label className="cursor-pointer rounded-xl border-2 border-dashed border-emerald-200 bg-white p-6 text-center hover:border-emerald-600" key={type}><Upload className="mx-auto mb-2 text-emerald-700"/><strong className="block">{label(type)}</strong><span className="mt-1 block text-sm text-slate-500">Envie PDF ou XLSX</span><input className="hidden" type="file" accept=".pdf,.xlsx,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={event => upload(type, event)}/></label>)}</div>{message && <p className="mt-5 rounded bg-emerald-50 p-3 text-sm text-emerald-900">{message}</p>}<section className="mt-6 overflow-hidden rounded-xl border bg-white"><header className="border-b px-5 py-4"><h1 className="flex items-center gap-2 font-semibold"><FileText size={18}/>Documentos importados</h1></header><ul className="divide-y">{documents.map(document => <li className="flex items-center gap-3 px-5 py-3" key={document.id}><div><strong className="block text-sm">{document.nome}</strong><span className="text-xs text-slate-500">{label(document.tipo)} · {document.extensao.replace(".", "").toUpperCase()}</span></div><button onClick={() => remove(document.id)} className="ml-auto rounded p-1 text-red-600 hover:bg-red-50" aria-label={`Excluir ${document.nome}`}><Trash2 size={16}/></button></li>)}{!documents.length && <li className="px-5 py-8 text-center text-sm text-slate-500">Nenhum documento importado.</li>}</ul></section></section></main>;
+  const [documents, setDocuments] = useState<Document[]>([]),
+    [message, setMessage] = useState("");
+  async function load() {
+    const response = await fetch(`${API}/api/documentos-importantes`);
+    if (response.ok) setDocuments(await response.json());
+    else setMessage("Não foi possível carregar documentos.");
+  }
+  useEffect(() => {
+    load();
+  }, []);
+  async function upload(
+    type: Document["tipo"],
+    event: ChangeEvent<HTMLInputElement>,
+  ) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const form = new FormData();
+    form.append("file", file);
+    const response = await fetch(
+      `${API}/api/documentos-importantes?tipo=${type}`,
+      { method: "POST", body: form },
+    );
+    event.target.value = "";
+    if (!response.ok)
+      return setMessage(
+        (await response.json()).detail ??
+          "Não foi possível enviar o documento.",
+      );
+    setMessage("Documento importado.");
+    load();
+  }
+  async function remove(id: string) {
+    const response = await fetch(`${API}/api/documentos-importantes/${id}`, {
+      method: "DELETE",
+    });
+    if (!response.ok)
+      return setMessage("Não foi possível excluir o documento.");
+    setDocuments((items) => items.filter((item) => item.id !== id));
+  }
+  const label = (type: Document["tipo"]) =>
+    type === "plano_contas" ? "Plano de contas" : "Históricos contábeis";
+  return (
+    <main className="min-h-screen bg-slate-100">
+      <header className="bg-emerald-800 px-6 py-3 text-white">
+        <div className="mx-auto flex max-w-5xl items-center">
+          <div>
+            <Link href="/" className="text-lg font-bold">
+              ConcilIAí
+            </Link>
+            <p className="text-xs text-emerald-100">Documentos importantes</p>
+          </div>
+          <Link
+            href="/clientes"
+            className="ml-auto inline-flex items-center gap-1 rounded px-2 py-1 text-sm hover:bg-emerald-700"
+          >
+            <Users size={15} />
+            Clientes
+          </Link>
+        </div>
+      </header>
+      <section className="mx-auto max-w-5xl px-6 py-10">
+        <div className="grid gap-5 md:grid-cols-2">
+          {(["plano_contas", "historicos"] as const).map((type) => (
+            <label
+              className="cursor-pointer rounded-xl border-2 border-dashed border-emerald-200 bg-white p-6 text-center hover:border-emerald-600"
+              key={type}
+            >
+              <Upload className="mx-auto mb-2 text-emerald-700" />
+              <strong className="block">{label(type)}</strong>
+              <span className="mt-1 block text-sm text-slate-500">
+                Envie PDF ou XLSX
+              </span>
+              <input
+                className="hidden"
+                type="file"
+                accept=".pdf,.xlsx,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                onChange={(event) => upload(type, event)}
+              />
+            </label>
+          ))}
+        </div>
+        {message && (
+          <p className="mt-5 rounded bg-emerald-50 p-3 text-sm text-emerald-900">
+            {message}
+          </p>
+        )}
+        <section className="mt-6 overflow-hidden rounded-xl border bg-white">
+          <header className="border-b px-5 py-4">
+            <h1 className="flex items-center gap-2 font-semibold">
+              <FileText size={18} />
+              Documentos importados
+            </h1>
+          </header>
+          <ul className="divide-y">
+            {documents.map((document) => (
+              <li
+                className="flex items-center gap-3 px-5 py-3"
+                key={document.id}
+              >
+                <div>
+                  <strong className="block text-sm">{document.nome}</strong>
+                  <span className="text-xs text-slate-500">
+                    {label(document.tipo)} ·{" "}
+                    {document.extensao.replace(".", "").toUpperCase()}
+                  </span>
+                </div>
+                <button
+                  onClick={() => remove(document.id)}
+                  className="ml-auto rounded p-1 text-red-600 hover:bg-red-50"
+                  aria-label={`Excluir ${document.nome}`}
+                >
+                  <Trash2 size={16} />
+                </button>
+              </li>
+            ))}
+            {!documents.length && (
+              <li className="px-5 py-8 text-center text-sm text-slate-500">
+                Nenhum documento importado.
+              </li>
+            )}
+          </ul>
+        </section>
+      </section>
+    </main>
+  );
 }

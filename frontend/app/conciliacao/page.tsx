@@ -7,6 +7,7 @@ import {
   Copy,
   Download,
   Eye,
+  FileText,
   ListPlus,
   PenLine,
   Plus,
@@ -25,6 +26,7 @@ const banks = [
   "Santander",
   "BASA",
   "Bradesco",
+  "Caixa",
   "Conta Caixa",
   "Vendas com Cartão",
   "Comissões Getnet",
@@ -213,13 +215,11 @@ function AdvancedSummary({
   label,
   debit,
   credit,
-  other,
   current,
 }: {
   label: string;
   debit: number;
   credit: number;
-  other: number;
   current: number;
 }) {
   const money = (value: number) =>
@@ -232,28 +232,30 @@ function AdvancedSummary({
     ["Débito", debit, "border-blue-200 bg-blue-50 text-blue-800"],
     ["Crédito", credit, "border-red-200 bg-red-50 text-red-800"],
     ["Atual", current, "border-slate-200 bg-slate-50"],
-    ["Outros", other, "border-violet-200 bg-violet-50 text-violet-800"],
   ] as const;
   return (
     <div className="flex items-center gap-3">
       <div className="w-12 shrink-0 text-xs font-semibold text-slate-600">
         {label}
       </div>
-      <div className="grid flex-1 grid-cols-2 gap-1 sm:grid-cols-5">
+      <div className="grid flex-1 grid-cols-2 gap-1 sm:grid-cols-4">
         {cells.map(([title, value, color]) => (
           <div
-            className={`rounded-md border px-2 py-1 text-center ${color}`}
+            className={`flex items-baseline justify-center gap-1 rounded-md border px-2 py-1 text-center ${color}`}
             key={title}
           >
-            <span className="block text-[9px] uppercase text-slate-500">
-              {title}
-            </span>
-            <strong className="block text-xs">{money(value)}</strong>
+            <span className="text-[9px] uppercase text-slate-500">{title}:</span>
+            <strong className="text-xs">{money(value)}</strong>
           </div>
         ))}
       </div>
     </div>
   );
+}
+
+function OtherSummary({ debit, credit, total }: { debit: number; credit: number; total: number }) {
+  const money = (value: number) => value.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return <div className="flex items-center gap-3"><div className="w-12 shrink-0 text-xs font-semibold text-violet-700">Outros</div><div className="grid flex-1 grid-cols-3 gap-1"><div className="flex items-baseline justify-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 px-2 py-1 text-center text-indigo-800"><span className="text-[9px] uppercase text-indigo-600">Débito:</span><strong className="text-xs">{money(debit)}</strong></div><div className="flex items-baseline justify-center gap-1 rounded-md border border-fuchsia-200 bg-fuchsia-50 px-2 py-1 text-center text-fuchsia-800"><span className="text-[9px] uppercase text-fuchsia-600">Crédito:</span><strong className="text-xs">{money(credit)}</strong></div><div className="flex items-baseline justify-center gap-1 rounded-md border border-violet-300 bg-violet-100 px-2 py-1 text-center text-violet-900"><span className="text-[9px] uppercase text-violet-700">Total:</span><strong className="text-xs">{money(total)}</strong></div></div></div>;
 }
 
 function AdvancedOverview({
@@ -267,8 +269,8 @@ function AdvancedOverview({
     pendentes: unknown[];
     salvas: unknown[];
     resumo: {
-      extrato: { debito: string; credito: string; outros: string };
-      razao: { debito: string; credito: string; outros: string };
+      extrato: { debito: string; credito: string; outros: string; outros_debito: string; outros_credito: string };
+      razao: { debito: string; credito: string; outros: string; outros_debito: string; outros_credito: string };
     };
     integridade: { csv_permitido: boolean; diferenca: string; movimentos_incompletos: { data: string; historico: string }[] };
   } | null>(null);
@@ -287,7 +289,7 @@ function AdvancedOverview({
   const summary = data?.resumo;
   const csvBlocked = data?.integridade && !data.integridade.csv_permitido;
   return (
-    <section className="flex flex-wrap items-center gap-4 rounded-xl border border-slate-200 bg-white p-3">
+    <section className="flex flex-wrap items-center gap-3 rounded-xl border border-slate-200 bg-white p-2.5">
       <div className="flex flex-col gap-1.5">
         <button className="flex items-center rounded-md bg-teal-700 px-3 py-2 text-left text-xs font-semibold text-white">
           <PenLine className="mr-1.5" size={14} />
@@ -304,7 +306,7 @@ function AdvancedOverview({
           </span>
         </button>
       </div>
-      <div className="min-w-[430px] flex-1 space-y-1">
+      <div className="min-w-[560px] flex-[1.5] space-y-1">
         <AdvancedSummary
           label="Extrato"
           debit={Number(summary?.extrato.debito ?? 0)}
@@ -313,7 +315,6 @@ function AdvancedOverview({
             Number(summary?.extrato.credito ?? 0) -
             Number(summary?.extrato.debito ?? 0)
           }
-          other={Number(summary?.extrato.outros ?? 0)}
         />
         <AdvancedSummary
           label="Razão"
@@ -323,12 +324,12 @@ function AdvancedOverview({
             Number(summary?.razao.credito ?? 0) -
             Number(summary?.razao.debito ?? 0)
           }
-          other={Number(summary?.razao.outros ?? 0)}
         />
+        <OtherSummary debit={Number(summary?.razao.outros_debito ?? 0)} credit={Number(summary?.razao.outros_credito ?? 0)} total={Number(summary?.razao.outros ?? 0)} />
       </div>
       <div className="text-right text-[10px] text-slate-500">
         Gera o CSV pronto para importar no ERP.
-        {csvBlocked ? <span title={`Revise os lançamentos incompletos: ${data.integridade.movimentos_incompletos.map((item) => item.data).join(", ")}`} className="mt-1 flex cursor-not-allowed items-center rounded bg-slate-300 px-2 py-1 text-[10px] font-semibold text-slate-600"><Download className="mr-1" size={12} />CSV bloqueado</span> : <><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`} className="mt-1 flex items-center rounded bg-teal-700 px-2 py-1 text-[10px] font-semibold text-white"><Download className="mr-1" size={12} />Gerar CSV</a><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis-outros.csv`} className="mt-1 flex items-center rounded border border-violet-300 bg-violet-50 px-2 py-1 text-[10px] font-semibold text-violet-800"><Download className="mr-1" size={12} />CSV Outros</a></>}
+        {csvBlocked ? <span title={`Revise os lançamentos incompletos: ${data.integridade.movimentos_incompletos.map((item) => item.data).join(", ")}`} className="mt-1 flex cursor-not-allowed items-center rounded bg-slate-300 px-2 py-1 text-[10px] font-semibold text-slate-600"><Download className="mr-1" size={12} />CSV bloqueado</span> : <><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`} className="mt-1 flex items-center rounded bg-teal-700 px-2 py-1 text-[10px] font-semibold text-white"><Download className="mr-1" size={12} />Gerar CSV</a><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis-outros.csv`} className="mt-1 flex items-center rounded border border-violet-300 bg-violet-50 px-2 py-1 text-[10px] font-semibold text-violet-800"><Download className="mr-1" size={12} />CSV Outros</a><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.pdf`} className="mt-1 flex items-center rounded border border-slate-300 bg-white px-2 py-1 text-[10px] font-semibold text-slate-700"><FileText className="mr-1" size={12} />Gerar PDF</a></>}
       </div>
     </section>
   );
@@ -342,6 +343,8 @@ type PendingRule = {
   natureza: string;
   natureza_contabil?: string;
   palavras_comprovante?: string[];
+  palavras_comprovante_banco?: string[];
+  palavras_comprovante_rfb?: string[];
   movimento_composto?: boolean;
   componentes_documento?: string[];
   componentes_cobertos?: { componente: string; valor: string }[];
@@ -355,6 +358,8 @@ type PendingRule = {
   tarifa_referencia_data?: string;
   comprovante_arquivo_id?: string | null;
   comprovante_pagina?: number | null;
+  comprovante_rfb_arquivo_id?: string | null;
+  comprovante_rfb_pagina?: number | null;
   comprovante_confere?: boolean;
   regra_compartilhada?: {
     id: string;
@@ -997,9 +1002,9 @@ function AdvancedRulesPanel({
                   crie uma duplicada.
                 </p>
               )}
-              {pendingItem?.comprovante_confere && (
+              {(pendingItem?.comprovante_arquivo_id || pendingItem?.comprovante_rfb_arquivo_id) && (
                 <div className="mt-1 flex items-center gap-1 text-[10px] text-emerald-700">
-                  <button
+                  {pendingItem.comprovante_arquivo_id && <button
                     onClick={() =>
                       onView({
                         arquivoId: String(pendingItem.comprovante_arquivo_id),
@@ -1009,9 +1014,10 @@ function AdvancedRulesPanel({
                     }
                     className="rounded border border-emerald-200 px-1.5 py-0.5"
                   >
-                    📎 Comprovante
-                  </button>
-                  <span>✓ Confere com o extrato</span>
+                    Comprovante bancário
+                  </button>}
+                  {pendingItem.comprovante_rfb_arquivo_id && <button onClick={() => onView({ arquivoId: String(pendingItem.comprovante_rfb_arquivo_id), pagina: Number(pendingItem.comprovante_rfb_pagina || 1), titulo: "Comprovante RFB" })} className="rounded border border-violet-200 px-1.5 py-0.5 text-violet-800">Comprovante RFB</button>}
+                  {pendingItem.comprovante_confere && <span>✓ Confere com o extrato</span>}
                 </div>
               )}
             </td>
@@ -1121,7 +1127,7 @@ function AdvancedRulesPanel({
                 </>
               )}
             </div>
-            {pendingItem?.comprovante_arquivo_id && (
+            {(pendingItem?.comprovante_arquivo_id || pendingItem?.comprovante_rfb_arquivo_id) && (
               <div className="relative mt-1 flex items-center gap-1">
                 <input className="w-20 rounded border border-violet-200 px-1.5 py-1" placeholder="comprovante..." value={receiptKeyword} onChange={(event) => change(item.id, "gatilhoComprovante", event.target.value)} />
                 <button title="Usar comprovante completo" onClick={() => change(item.id, "gatilhoComprovante", (pendingItem.palavras_comprovante ?? []).join(" "))} className="rounded border border-violet-200 bg-violet-50 p-1 text-violet-700 hover:border-violet-500">
@@ -1132,8 +1138,8 @@ function AdvancedRulesPanel({
                 </button>
                 {receiptWordPicker === item.id && (
                   <div className="absolute left-0 top-8 z-30 w-56 rounded-lg border border-violet-200 bg-white p-2 shadow-xl">
-                    <div className="mb-2 flex items-center justify-between border-b pb-1 text-[10px] font-semibold text-violet-800">Palavras do comprovante<button onClick={() => setReceiptWordPicker(null)} className="text-sm leading-none text-slate-500">✕</button></div>
-                    <div className="flex flex-wrap gap-1">{(pendingItem.palavras_comprovante ?? []).map((word, index) => { const selected = receiptKeyword.toUpperCase().split(/\s+/).includes(word); return <button onClick={() => change(item.id, "gatilhoComprovante", selected ? receiptKeyword.split(/\s+/).filter(part => part !== word).join(" ") : [receiptKeyword, word].filter(Boolean).join(" "))} className={`rounded px-1.5 py-0.5 text-[10px] ${selected ? "bg-violet-700 text-white" : "bg-violet-50 text-violet-800"}`} key={`${word}-${index}`}>{word}</button>; })}</div>
+                    <div className="mb-2 flex items-center justify-between border-b pb-1 text-[10px] font-semibold text-violet-800">Palavras dos comprovantes<button onClick={() => setReceiptWordPicker(null)} className="text-sm leading-none text-slate-500">✕</button></div>
+                    {[["Banco", pendingItem.palavras_comprovante_banco ?? []], ["RFB", pendingItem.palavras_comprovante_rfb ?? []]].map(([source, words]) => Array.isArray(words) && words.length > 0 && <div className="mb-2" key={source as string}><p className="mb-1 text-[9px] font-semibold uppercase text-violet-500">{source as string}</p><div className="flex flex-wrap gap-1">{words.map((word, index) => { const selected = receiptKeyword.toUpperCase().split(/\s+/).includes(word); return <button onClick={() => change(item.id, "gatilhoComprovante", selected ? receiptKeyword.split(/\s+/).filter(part => part !== word).join(" ") : [receiptKeyword, word].filter(Boolean).join(" "))} className={`rounded px-1.5 py-0.5 text-[10px] ${selected ? "bg-violet-700 text-white" : "bg-violet-50 text-violet-800"}`} key={`${source}-${word}-${index}`}>{word}</button>; })}</div></div>)}
                   </div>
                 )}
               </div>
@@ -1209,6 +1215,12 @@ function AdvancedRulesPanel({
   const visible = pending.filter((item) =>
     item.historico.toLowerCase().includes(filter.toLowerCase()),
   );
+  const visibleSaved = saved.filter((item) =>
+    [item.gatilho, item.historico, item.complemento]
+      .join(" ")
+      .toLowerCase()
+      .includes(filter.toLowerCase()),
+  );
   const pendingGroups = Object.values(
     visible.reduce<Record<string, PendingRule[]>>((groups, item) => {
       const movementId = item.id.split(":")[0];
@@ -1216,12 +1228,12 @@ function AdvancedRulesPanel({
       return groups;
     }, {}),
   );
-  const displayedItems = view === "pending" ? visible : saved;
+  const displayedItems = view === "pending" ? visible : visibleSaved;
   const showActions = displayedItems.some(
     (item) => !("data" in item && item.regra_compartilhada),
   );
   return (
-    <section className="space-y-3 rounded-xl border border-slate-200 bg-white p-3">
+    <section className="space-y-2 rounded-xl border border-slate-200 bg-white p-2.5">
       <datalist id="catalogo-contas">
         {catalog.contas.map((option) => (
           <option value={option} key={option} />
@@ -1232,24 +1244,24 @@ function AdvancedRulesPanel({
           <option value={option} key={option} />
         ))}
       </datalist>
-      <div className="flex flex-wrap items-end gap-2 rounded-md bg-slate-50 p-3">
-        <label className="text-xs font-medium text-slate-600">
-          Conta deste banco no plano de contas
+      <div className="hidden flex-wrap items-center gap-1.5 rounded-md bg-slate-50 p-2">
+        <label className="flex items-center gap-1.5 text-[11px] font-medium text-slate-600">
+          <span className="whitespace-nowrap">Conta deste banco</span>
           <input
             list="catalogo-contas"
             value={account}
             onChange={(e) => setAccount(e.target.value)}
-            className="mt-1 block w-72 rounded border bg-white px-2 py-1.5 text-sm"
+            className="w-64 rounded border bg-white px-2 py-1 text-xs"
             placeholder="Ex.: 33 - Banco Santander S/A"
           />
         </label>
         <button
           onClick={saveAccount}
-          className="rounded border border-teal-700 px-3 py-1.5 text-xs font-semibold text-teal-800"
+          className="rounded border border-teal-700 px-2 py-1 text-[11px] font-semibold text-teal-800"
         >
           Salvar conta
         </button>
-        {csvPermitted ? <><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`} className="rounded bg-teal-700 px-3 py-1.5 text-xs font-semibold text-white">Gerar CSV</a><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis-outros.csv`} className="rounded border border-violet-300 bg-violet-50 px-3 py-1.5 text-xs font-semibold text-violet-800">CSV Outros</a></> : <span className="cursor-not-allowed rounded bg-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-500">CSV bloqueado</span>}
+        {csvPermitted ? <><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`} className="rounded bg-teal-700 px-2 py-1 text-[11px] font-semibold text-white">Gerar CSV</a><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis-outros.csv`} className="rounded border border-violet-300 bg-violet-50 px-2 py-1 text-[11px] font-semibold text-violet-800">CSV Outros</a><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.pdf`} className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px] font-semibold text-slate-700">Gerar PDF</a></> : <span className="cursor-not-allowed rounded bg-slate-200 px-2 py-1 text-[11px] font-semibold text-slate-500">CSV bloqueado</span>}
       </div>
       <div className="flex flex-wrap items-center gap-2">
         <button
@@ -1264,23 +1276,29 @@ function AdvancedRulesPanel({
         >
           Regras salvas ({saved.length})
         </button>
+        <input
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          className="w-32 rounded border px-2 py-1.5 text-xs"
+          placeholder="Filtrar histórico"
+        />
         {saved.length > 0 && <button onClick={() => setConfirmClearAll(true)} className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-semibold text-red-700">Limpar todas</button>}
-        {view === "pending" && (
-          <input
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            className="ml-auto rounded border px-2 py-1.5 text-xs"
-            placeholder="Filtrar histórico"
-          />
-        )}
+        <div className="ml-auto flex flex-wrap items-center gap-1.5 rounded-md bg-slate-50 p-1.5">
+          <label className="flex items-center gap-1 text-[11px] font-medium text-slate-600">
+            <span className="whitespace-nowrap">Conta deste banco</span>
+            <input list="catalogo-contas" value={account} onChange={(e) => setAccount(e.target.value)} className="w-52 rounded border bg-white px-2 py-1 text-xs" placeholder="Ex.: 33 - Banco Santander S/A" />
+          </label>
+          <button title="Salvar conta" aria-label="Salvar conta" onClick={saveAccount} className="rounded border border-teal-700 p-1.5 text-teal-800"><CheckCircle2 size={14}/></button>
+          {csvPermitted ? <><a title="Gerar CSV" aria-label="Gerar CSV" href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`} className="rounded bg-teal-700 p-1.5 text-white"><Download size={14}/></a><a title="CSV Outros" aria-label="CSV Outros" href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis-outros.csv`} className="rounded border border-violet-300 bg-violet-50 p-1.5 text-violet-800"><Download size={14}/></a><a title="Gerar PDF" aria-label="Gerar PDF" href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.pdf`} className="rounded border border-slate-300 bg-white p-1.5 text-slate-700"><FileText size={14}/></a></> : <span title="CSV bloqueado por integridade" className="cursor-not-allowed rounded bg-slate-200 p-1.5 text-slate-500"><Download size={14}/></span>}
+        </div>
       </div>
       {message && <p className="text-xs text-teal-800">{message}</p>}
-      <div className="overflow-x-auto rounded border">
+      <div className="max-h-[calc(100dvh-330px)] overflow-auto rounded border overscroll-contain">
         <table className={`w-full text-left text-xs ${view === "saved" ? "table-fixed" : ""}`}>
           <thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase text-slate-500 shadow-sm">
             <tr>
               {[
-                "Data/cobertura",
+                "Data",
                 "Histórico",
                 "Tipo",
                 "Valor",
@@ -1348,9 +1366,10 @@ function AdvancedRulesPanel({
                                 }
                                 className="rounded border border-emerald-200 bg-white/80 px-1.5 py-0.5 text-[10px] text-emerald-700"
                               >
-                                Comprovante
+                                Comprovante bancário
                               </button>
                             )}
+                            {movement.comprovante_rfb_arquivo_id && <button onClick={() => onView({ arquivoId: String(movement.comprovante_rfb_arquivo_id), pagina: Number(movement.comprovante_rfb_pagina || 1), titulo: "Comprovante RFB" })} className="rounded border border-violet-200 bg-white/80 px-1.5 py-0.5 text-[10px] text-violet-800">Comprovante RFB</button>}
                           </div>
                         </td>
                       </tr>
@@ -1377,7 +1396,7 @@ function AdvancedRulesPanel({
                     </Fragment>
                   );
                 })
-              : saved.map((item) => (
+               : visibleSaved.map((item) => (
                   <Fragment key={item.id}>
                     {editor(item, true, false, false, showActions)}
                     {item.movimentos?.length ? (
@@ -2445,7 +2464,7 @@ function ConciliacaoFlow({
         ? "border-red-600 text-red-800 bg-red-50"
         : bank === "BASA"
           ? "border-lime-600 text-lime-800 bg-lime-50"
-          : bank === "Conta Caixa"
+          : bank === "Caixa"
             ? "border-sky-600 text-sky-800 bg-sky-50"
             : "border-emerald-700 text-emerald-800 bg-emerald-50";
   const numberValue = (value: string | null | undefined) =>
@@ -2483,8 +2502,8 @@ function ConciliacaoFlow({
           />
         )}
       </>
-      <main className="mx-auto max-w-7xl px-4 py-6 sm:px-8">
-        <div className="mb-5 flex overflow-x-auto border-b text-sm">
+      <main className="workspace-main mx-auto max-w-[90rem] px-3 py-3 sm:px-4">
+        <div className="mb-5 flex justify-center overflow-x-auto border-b text-sm">
           {[
             "Início",
             ...(review.arquivos.length
@@ -2547,7 +2566,7 @@ function ConciliacaoFlow({
                 </label>
                 <button
                   onClick={createReconciliation}
-                  className={`rounded-md px-4 py-2 font-medium text-white ${bank === "Banco do Brasil" ? "bg-amber-600" : bank === "Santander" || bank === "Bradesco" ? "bg-red-700" : bank === "BASA" ? "bg-lime-700" : bank === "Conta Caixa" ? "bg-sky-700" : "bg-emerald-800"}`}
+                  className={`rounded-md px-4 py-2 font-medium text-white ${bank === "Banco do Brasil" ? "bg-amber-600" : bank === "Santander" || bank === "Bradesco" ? "bg-red-700" : bank === "BASA" ? "bg-lime-700" : bank === "Caixa" ? "bg-sky-700" : bank === "Conta Caixa" ? "bg-cyan-800" : "bg-emerald-800"}`}
                 >
                   Iniciar conciliação
                 </button>

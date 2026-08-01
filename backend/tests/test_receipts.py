@@ -221,6 +221,21 @@ Conselho Federal
     assert len(deduplicate_statement_records(records)) == 3
 
 
+def test_banco_do_brasil_keeps_ted_codes_and_full_counterparty_text():
+    text = """01/01/2024
+0000
+438 TED
+033 2478 008695575000188 CENTRO ODONTO
+1.000,00 D
+"""
+
+    record = extract_statement(text, 1, "Banco do Brasil")[0]
+
+    assert record.historico == "438 TED 033 2478 008695575000188 CENTRO ODONTO"
+    assert record.nome == ""
+    assert f"{record.historico} {record.nome}".strip() == "438 TED 033 2478 008695575000188 CENTRO ODONTO"
+
+
 def test_payment_receipt_uses_beneficiario_final_and_valor_documento():
     text = """DATA DO PAGAMENTO: 02/01/2024
 BENEFICIARIO FINAL: QUANTITY SERVICOS E COMERCIO DE PRO

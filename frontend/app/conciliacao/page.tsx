@@ -990,7 +990,7 @@ function AdvancedRulesPanel({
               {"data" in item ? item.data : `${item.cobertos} cobertos`}
             </td>
             <td className={`${existing ? "w-[14%]" : "w-64 max-w-64"} px-2 py-2`}>
-              <p className={`${existing ? "break-words" : "max-w-64 truncate"}`} title={"gatilho" in item ? item.gatilho : item.historico}>{"gatilho" in item ? item.gatilho : item.historico}</p>
+              <p className="line-clamp-2 break-words leading-4" title={"gatilho" in item ? item.gatilho : item.historico}>{"gatilho" in item ? item.gatilho : item.historico}</p>
               {"gatilho" in item && item.gatilho_comprovante && <p className={`mt-1 text-[10px] text-violet-700 ${existing ? "break-words" : "max-w-64 truncate"}`} title={item.gatilho_comprovante}>Comprovante: {item.gatilho_comprovante}</p>}
               {pendingItem?.tarifa_no_extrato && <p className="mt-1 text-[10px] text-sky-700">Tarifa do comprovante está presente no extrato.</p>}
               {pendingItem?.tarifa_referente_ao_comprovante && <p className="mt-1 text-[10px] text-slate-500">Esta tarifa é referente ao comprovante de {pendingItem.tarifa_referencia_nome}, R$ {Number(pendingItem.tarifa_referencia_valor || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2 })} em {pendingItem.tarifa_referencia_data}.</p>}

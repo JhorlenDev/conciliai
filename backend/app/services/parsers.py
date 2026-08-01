@@ -252,13 +252,17 @@ def _extract_banco_do_brasil_statement(text: str, page_number: int) -> list[Pars
     for match in pattern.finditer(text):
         parsed_date, _ = parse_date_time(match.group("data"))
         amount = parse_brl(match.group("valor"))
-        history = re.sub(r"^\d+\s+\d+\s+", "", match.group("historico")).strip()
+        # BB codes identify the operation and counterparty. Keep them intact so
+        # the extracted statement remains auditable and can be matched precisely.
+        document = " ".join(match.group("documento").split())
+        full_document = document if re.search(r"\s", document) else ""
+        history = " ".join(part for part in [" ".join(match.group("historico").split()), full_document] if part)
         if re.search(r"\b(?:saldo anterior|saldo do dia|saldo final|limite|valor total devido|cheque especial)\b", history, re.I):
             continue
         detail = match.group("detalhe").strip()
         _, hour = parse_date_time(detail)
-        name = re.sub(r"^\d{2}/\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?\s+", "", detail)
-        name = re.sub(r"^(?:\d[\d. ]{6,}\s+)+", "", name).strip()
+        detail = re.sub(r"^\d{2}/\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?\s+", "", detail)
+        name = detail.strip()
         origin_date = re.search(r"^\s*(\d{2}/\d{2})(?:\s|$)", detail)
         data_origem = origin_date.group(1) if origin_date and re.search(r"transfer[êe]ncia", history, re.I) else ""
         if data_origem and name == data_origem:

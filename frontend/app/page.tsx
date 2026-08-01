@@ -108,6 +108,9 @@ export default function EntryPage() {
     const label = new Date(`${value}T00:00:00`).toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
     return label.charAt(0).toUpperCase() + label.slice(1);
   };
+  const orderedProcesses = [...processes].sort((left, right) =>
+    left.data_inicio.localeCompare(right.data_inicio),
+  );
   const dateTime = (value: string) =>
     new Date(value).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
   return (
@@ -213,7 +216,7 @@ export default function EntryPage() {
             </button>
           </div>
            <div className="grid gap-2 md:grid-cols-2">
-             {processes.map((process) => (
+             {orderedProcesses.map((process) => (
                 <article className="flex min-w-0 items-center rounded-lg border bg-white shadow-sm transition hover:border-emerald-700 hover:shadow-md" key={process.id}>
                   <button type="button" onClick={() => open(process)} className="flex min-w-0 flex-1 items-center justify-between p-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700 focus-visible:ring-inset">
                    <div>

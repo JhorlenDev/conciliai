@@ -86,7 +86,7 @@ def _rfb_lines(rfb) -> list[RuleLine]:
 
 def _receipt_lines(receipt) -> list[RuleLine]:
     values = getattr(receipt, "financeiros", receipt)
-    additions = (("JUROS", values.valor_juros), ("MULTA", values.valor_multa), ("ENCARGOS", values.valor_encargos))
+    additions = (("MULTA", values.valor_multa), ("JUROS", values.valor_juros), ("ENCARGOS", values.valor_encargos))
     reductions = (("DESCONTO", values.valor_desconto), ("ABATIMENTO", values.valor_abatimento), ("DESCONTO_ABATIMENTO", values.valor_desconto_abatimento))
     has_reductions = any(value and value > 0 for _, value in reductions)
     additions_total = sum((value or Decimal("0.00") for _, value in additions), Decimal("0.00"))

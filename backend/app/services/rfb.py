@@ -40,6 +40,33 @@ class ParsedRfb:
     itens: list[ParsedRfbItem] = field(default_factory=list)
 
 
+def normalize_competence(value: str) -> str:
+    text = " ".join((value or "").split())
+    date_match = re.search(r"\b\d{2}[/.\-](\d{2})[/.\-](\d{4})\b", text)
+    if date_match:
+        return f"{date_match.group(1)}/{date_match.group(2)}"
+    month_year = re.search(r"\b(0[1-9]|1[0-2])\s*[/.\-]\s*(\d{4})\b", text)
+    if month_year:
+        return f"{month_year.group(1)}/{month_year.group(2)}"
+    compact = re.search(r"\b(0[1-9]|1[0-2])(\d{4})\b", text)
+    if compact:
+        return f"{compact.group(1)}/{compact.group(2)}"
+    return ""
+
+
+def extract_competence(text: str, *stored_values: str) -> str:
+    for value in stored_values:
+        competence = normalize_competence(value)
+        if competence:
+            return competence
+    labels = r"compet[êe]ncia|per[ií]odo\s+de\s+apura[cç][aã]o|\bpa\b|refer[êe]ncia"
+    for match in re.finditer(rf"(?im)^\s*(?:{labels})\s*:?[ \t]*(?:\n\s*)?([^\n]+)", text or ""):
+        competence = normalize_competence(match.group(1))
+        if competence:
+            return competence
+    return ""
+
+
 def parse_rfb_page(text: str, page_number: int) -> ParsedRfb | None:
     type_match = re.search(r"registro de arrecadação de (DARF|DAS)", text, re.I)
     if not type_match:
@@ -66,7 +93,8 @@ def parse_rfb_page(text: str, page_number: int) -> ParsedRfb | None:
     if bank:
         collected_date, _ = parse_date_time(bank.group(1)); bank_code, bank_name, agency = bank.group(2), bank.group(3).strip(), bank.group(4)
     divergent = bool(total is not None and principal is not None and abs((principal or Decimal()) + (multa or Decimal()) + (juros or Decimal()) - total) > Decimal("0.01"))
-    return ParsedRfb(tipo, cnpj, razao, "" if "Período Apuração" in text else period, period if "Período Apuração" in text else "", due_date, collected_date, document, bank_code, bank_name, agency, principal, multa, juros, total, text, page_number, divergent, items)
+    competence = extract_competence(text, "" if "Período Apuração" in text else period, period if "Período Apuração" in text else "")
+    return ParsedRfb(tipo, cnpj, razao, competence, "", due_date, collected_date, document, bank_code, bank_name, agency, principal, multa, juros, total, text, page_number, divergent, items)
 
 
 def belongs_to_selected_bank(receipt: ParsedRfb, selected_bank: str) -> bool:

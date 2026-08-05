@@ -47,6 +47,11 @@ type AccountingItem = {
   conta_debito: string;
   conta_credito: string;
   historico: string;
+  complemento: string;
+  imposto?: string;
+  competencia?: string;
+  competencia_nao_identificada?: boolean;
+  comprovante_origem?: string;
   origem: string;
   status: string;
 };
@@ -379,7 +384,7 @@ type SavedRule = {
   historico: string;
   complemento: string;
   cobertos: number;
-  movimentos?: { data: string; historico: string; texto_extrato?: string; texto_comprovante?: string; tem_comprovante?: boolean; valor: string; natureza: string; natureza_contabil: string }[];
+  movimentos?: { data: string; historico: string; texto_extrato?: string; texto_comprovante?: string; tem_comprovante?: boolean; valor: string; tipo_componente?: string; natureza: string; natureza_contabil: string }[];
 };
 
 function LegacyAdvancedRulesPanel({
@@ -639,7 +644,7 @@ function AdvancedRulesPanel({
 }) {
   const [pending, setPending] = useState<PendingRule[]>([]);
   const [saved, setSaved] = useState<SavedRule[]>([]);
-  const [account, setAccount] = useState("");
+  const [account, setAccount] = useState("Sem conta");
   const [drafts, setDrafts] = useState<Record<string, Record<string, string>>>(
     {},
   );
@@ -684,7 +689,7 @@ function AdvancedRulesPanel({
     const bankAccount = await accountResponse.json();
     if (request !== loadRequest.current) return null;
     applyRulesSnapshot(rules);
-    setAccount(bankAccount.conta_contabil || "");
+    setAccount(bankAccount.conta_contabil || "Sem conta");
     return rules;
   }
   useEffect(() => {
@@ -967,6 +972,7 @@ function AdvancedRulesPanel({
         .split(/\s+/)
         .filter(Boolean)
         .every((word) => source.toUpperCase().includes(word.toUpperCase()));
+    const componentKey = (component = "") => ["", "VALOR_COBRADO"].includes(component) ? "PRINCIPAL" : component;
     const coveredCount =
       "cobertos" in item && keyword === fields.gatilho && receiptKeyword === fields.gatilhoComprovante
         ? item.cobertos
@@ -975,6 +981,7 @@ function AdvancedRulesPanel({
               (candidate) =>
                 (!keyword || matchesKeyword(candidate.historico, keyword)) &&
                 (!receiptKeyword || matchesKeyword([...(candidate.palavras_comprovante_banco ?? []), ...(candidate.palavras_comprovante_rfb ?? [])].join(" "), receiptKeyword)) &&
+                componentKey(candidate.tipo_componente) === componentKey(item.tipo_componente) &&
                 (candidate.natureza_contabil || candidate.natureza) === (item.natureza_contabil || item.natureza),
             ).length
           : 0;
@@ -1039,9 +1046,9 @@ function AdvancedRulesPanel({
               >
                 {isDebit ? "Débito" : "Crédito"}
               </span>
-          {pendingItem?.tipo_componente && !simple && (
+          {item.tipo_componente && !simple && (
                 <span className="ml-1 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700">
-                  {componentLabel(pendingItem.tipo_componente)}
+                  {componentLabel(item.tipo_componente)}
                 </span>
               )}
             </td>
@@ -1425,7 +1432,7 @@ function AdvancedRulesPanel({
                                   <p><span className="text-[10px] font-semibold text-slate-500">Texto Extrato: </span>{movement.texto_extrato || movement.historico}</p>
                                   {movement.tem_comprovante && <p><span className="text-[10px] font-semibold text-slate-500">Texto Comprovante: </span>{movement.texto_comprovante || "Não identificado"}</p>}
                                 </div>
-                                <span className="whitespace-nowrap text-slate-700">R$ {Number(movement.valor).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}</span>
+                                <span className="whitespace-nowrap text-slate-700">{movement.tipo_componente && `${componentLabel(movement.tipo_componente)} · `}R$ {Number(movement.valor).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}</span>
                                 <span className="whitespace-nowrap text-slate-700">{movement.natureza_contabil}</span>
                               </div>
                             ))}
@@ -1736,12 +1743,12 @@ function EditableResultTable({
   const value = (
     rowId: string,
     item: AccountingItem,
-    field: "conta_debito" | "conta_credito" | "historico",
+    field: "conta_debito" | "conta_credito" | "historico" | "complemento",
   ) => drafts[rowId]?.[item.id]?.[field] ?? item[field];
   const change = (
     rowId: string,
     item: AccountingItem,
-    field: "conta_debito" | "conta_credito" | "historico",
+    field: "conta_debito" | "conta_credito" | "historico" | "complemento",
     input: string,
   ) =>
     setDrafts((current) => ({
@@ -1750,9 +1757,10 @@ function EditableResultTable({
         ...current[rowId],
         [item.id]: {
           ...current[rowId]?.[item.id],
-          conta_debito: value(rowId, item, "conta_debito"),
-          conta_credito: value(rowId, item, "conta_credito"),
-          historico: value(rowId, item, "historico"),
+           conta_debito: value(rowId, item, "conta_debito"),
+           conta_credito: value(rowId, item, "conta_credito"),
+           historico: value(rowId, item, "historico"),
+           complemento: value(rowId, item, "complemento"),
           [field]: input,
         },
       },
@@ -1777,14 +1785,16 @@ function EditableResultTable({
     const items = selected ? [selected] : itemsFor(row);
     const payload = items.map((item) => {
       const valor = decimal(drafts[rowId]?.[item.id]?.valor ?? item.valor);
-      return (
-        valor && {
+        return (
+          valor && {
+          id: item.id.startsWith("novo-") ? "" : item.id,
           componente: item.componente,
           valor,
           efeito_no_total: item.efeito_no_total,
           conta_debito: value(rowId, item, "conta_debito"),
           conta_credito: value(rowId, item, "conta_credito"),
           historico: value(rowId, item, "historico"),
+          complemento: value(rowId, item, "complemento"),
           descricao: item.descricao,
           tributo: item.tributo,
           codigo_receita: item.codigo_receita,
@@ -1958,10 +1968,11 @@ function EditableResultTable({
                                           descricao: "Lançamento manual",
                                           efeito_no_total: "SOMA",
                                           valor: "R$ 0,00",
-                                          conta_debito: "",
-                                          conta_credito: "",
-                                          historico: "",
-                                          origem: "manual",
+                                           conta_debito: "",
+                                           conta_credito: "",
+                                           historico: "",
+                                           complemento: "",
+                                           origem: "manual",
                                           status: "novo",
                                         },
                                       ],
@@ -1990,9 +2001,11 @@ function EditableResultTable({
                                     "Valor",
                                     "Efeito",
                                     "Débito",
-                                    "Crédito",
-                                    "Histórico",
-                                  ].map((column) => (
+                                     "Crédito",
+                                     "Histórico",
+                                     "Complemento",
+                                     "Ação",
+                                   ].map((column) => (
                                     <th className="px-3 py-2" key={column}>
                                       {column}
                                     </th>
@@ -2089,6 +2102,15 @@ function EditableResultTable({
                                       />
                                     </td>
                                     <td className="px-3 py-1">
+                                      <input
+                                        value={value(rowId, item, "complemento")}
+                                        onChange={(event) => change(rowId, item, "complemento", event.target.value)}
+                                        className="w-64 rounded border px-1.5 py-1"
+                                        placeholder={item.competencia_nao_identificada ? "Competência não identificada" : "Complemento"}
+                                      />
+                                      {item.imposto && <p className={`mt-1 text-[10px] ${item.competencia_nao_identificada ? "text-amber-700" : "text-emerald-700"}`}>{item.imposto}{item.competencia ? ` · Competência ${item.competencia}` : " · Competência não identificada"}{item.comprovante_origem ? ` · ${item.comprovante_origem}` : ""}</p>}
+                                    </td>
+                                    <td className="px-3 py-1">
                                       <button
                                         disabled={saving === rowId}
                                         onClick={() => save(row, item)}
@@ -2097,7 +2119,6 @@ function EditableResultTable({
                                         Salvar
                                       </button>
                                     </td>
-                                    <th className="px-3 py-2">Ação</th>
                                   </tr>
                                 ))}
                               </tbody>
@@ -2131,6 +2152,7 @@ function ConciliacaoFlow({
     [start, setStart] = useState(""),
     [end, setEnd] = useState(""),
     [reconciliationId, setReconciliationId] = useState("");
+  const [selectedBankAccount, setSelectedBankAccount] = useState<{ agencia: string; conta: string; titular: string } | null>(null);
   const [processId, setProcessId] = useState(""),
     [processBanks, setProcessBanks] = useState<
       { id: string; banco: string; status: string }[]
@@ -2210,6 +2232,22 @@ function ConciliacaoFlow({
         if (data) setReview(data);
       });
   }, [reconciliationId]);
+  useEffect(() => {
+    if (!clientId) {
+      setSelectedBankAccount(null);
+      return;
+    }
+    let cancelled = false;
+    fetch(`${API}/api/clientes/${clientId}/contas-bancarias`)
+      .then((response) => (response.ok ? response.json() : []))
+      .then((accounts) => {
+        if (!cancelled) setSelectedBankAccount(accounts.find((account: { banco: string }) => account.banco === bank) ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setSelectedBankAccount(null);
+      });
+    return () => { cancelled = true; };
+  }, [clientId, bank]);
   useEffect(() => {
     if (!message) return;
     const timeout = window.setTimeout(() => setMessage(""), 6000);
@@ -2578,12 +2616,15 @@ function ConciliacaoFlow({
                     className="mt-1 w-full rounded-md border p-2 text-sm text-slate-800"
                   />
                 </label>
-                <button
-                  onClick={createReconciliation}
-                  className={`rounded-md px-4 py-2 font-medium text-white ${bank === "Banco do Brasil" ? "bg-amber-600" : bank === "Santander" || bank === "Bradesco" ? "bg-red-700" : bank === "BASA" ? "bg-lime-700" : bank === "Caixa" ? "bg-sky-700" : bank === "Conta Caixa" ? "bg-cyan-800" : "bg-emerald-800"}`}
-                >
-                  Iniciar conciliação
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={createReconciliation}
+                    className={`rounded-md px-4 py-2 font-medium text-white ${bank === "Banco do Brasil" ? "bg-amber-600" : bank === "Santander" || bank === "Bradesco" ? "bg-red-700" : bank === "BASA" ? "bg-lime-700" : bank === "Caixa" ? "bg-sky-700" : bank === "Conta Caixa" ? "bg-cyan-800" : "bg-emerald-800"}`}
+                  >
+                    Iniciar conciliação
+                  </button>
+                  <span className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-900" title={`Titular: ${selectedBankAccount?.titular || "Não informado"}`}>Agência: <strong>{selectedBankAccount?.agencia || "—"}</strong> · Conta: <strong>{selectedBankAccount?.conta || "Sem conta"}</strong></span>
+                </div>
               </div>
             </section>
             {reconciliationId && (
@@ -2766,7 +2807,7 @@ function ConciliacaoFlow({
             )}
             {results && results.length > 0 && (
               <>
-                <LegacyResultTable rows={results} onView={setViewer} />
+                <EditableResultTable rows={results} reconciliationId={reconciliationId} onView={setViewer} onSaved={() => setResultsVersion((version) => version + 1)} />
                 <section className="grid gap-3 md:grid-cols-2">
                   <div className="rounded-xl border bg-white p-4 text-sm">
                     <strong>Resumo dos comprovantes bancários</strong>

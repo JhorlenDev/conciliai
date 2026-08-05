@@ -95,4 +95,4 @@ def test_receipt_interest_and_fine_create_separate_components():
 
     result = choose_rule_source(Decimal("105.00"), receipt)
 
-    assert [(line.componente, line.valor) for line in result.linhas] == [("VALOR_COBRADO", Decimal("100.00")), ("JUROS", Decimal("2.00")), ("MULTA", Decimal("3.00"))]
+    assert [(line.componente, line.valor) for line in result.linhas] == [("VALOR_COBRADO", Decimal("100.00")), ("MULTA", Decimal("3.00")), ("JUROS", Decimal("2.00"))]

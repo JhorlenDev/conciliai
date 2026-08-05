@@ -312,6 +312,61 @@ def test_discount_is_accounted_as_other_and_exported_in_its_own_csv():
     assert other_csv.splitlines() == ["Data;Debito;Credito;Historico;Valor;Complemento", "02/01/2024;Descontos;Despesa;Desconto obtido;2.50;"]
 
 
+def test_csv_is_ordered_by_date_and_names_the_client_bank_account():
+    session, reconciliation, later_movement = rules_session()
+    earlier_movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=later_movement.arquivo_id, pagina_numero=1, data=date(2024, 1, 1), historico="PIX ANTERIOR", valor=Decimal("10.00"), natureza="saída")
+    session.add(earlier_movement); session.flush()
+    later_match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=later_movement.id)
+    earlier_match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=earlier_movement.id)
+    session.add_all([later_match, earlier_match]); session.flush()
+    session.add_all([
+        LancamentoContabil(correspondencia_id=later_match.id, valor=Decimal("12.50"), conta_debito="254", conta_credito="219", historico="348", status="editado_manual"),
+        LancamentoContabil(correspondencia_id=earlier_match.id, valor=Decimal("10.00"), conta_debito="254", conta_credito="219", historico="348", status="editado_manual"),
+    ])
+    session.add(ContaBancaria(cliente_id=reconciliation.cliente_id, banco="Santander", conta_contabil="219 - Banco", agencia="1234-5", conta="98765-4"))
+    session.commit()
+
+    response = accounting_csv(reconciliation.id, session)
+
+    assert response.body.decode("utf-8-sig").splitlines()[1:3] == ["01/01/2024;254;219;348;10.00;", "02/01/2024;254;219;348;12.50;"]
+    assert response.headers["content-disposition"] == 'attachment; filename="0124219.csv"'
+
+
+def test_saved_discount_rule_is_listed_after_being_applied_as_other():
+    session, reconciliation, movement = rules_session()
+    match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id)
+    session.add(match); session.flush()
+    session.add(LancamentoContabil(correspondencia_id=match.id, componente="DESCONTO", efeito_no_total="OUTROS", valor=Decimal("2.50"), origem="comprovante", status="pendente_regra"))
+    session.commit()
+
+    create_accounting_rule(reconciliation.id, RegraContabilInput(gatilho="FORNECEDOR", natureza="Crédito", tipo_componente="DESCONTO", conta_debito="Descontos", conta_credito="Despesa", historico="Desconto obtido"), session)
+
+    data = accounting_rules(reconciliation.id, session)
+    assert data["pendentes"] == []
+    assert [(rule["tipo_componente"], rule["cobertos"]) for rule in data["salvas"]] == [("DESCONTO", 1)]
+
+
+def test_saved_rules_keep_each_component_value_in_document_order():
+    session, reconciliation, movement = rules_session()
+    match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id)
+    session.add(match); session.flush()
+    rules = [
+        RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco=reconciliation.banco, tipo_fonte="extrato", tipo_operacao="Crédito", tipo_componente=component, favorecido_normalizado=normalize_name("FORNECEDOR"), conta_debito="Débito", conta_credito="Crédito", historico=component)
+        for component in ("PRINCIPAL", "MULTA", "JUROS")
+    ]
+    session.add_all(rules); session.flush()
+    session.add_all([
+        LancamentoContabil(correspondencia_id=match.id, regra_contabil_id=rules[0].id, componente="PRINCIPAL", valor=Decimal("100.00"), conta_debito="Débito", conta_credito="Crédito", historico="Principal", ordem=1, status="aplicado_por_regra"),
+        LancamentoContabil(correspondencia_id=match.id, regra_contabil_id=rules[1].id, componente="MULTA", valor=Decimal("3.00"), conta_debito="Débito", conta_credito="Crédito", historico="Multa", ordem=2, status="aplicado_por_regra"),
+        LancamentoContabil(correspondencia_id=match.id, regra_contabil_id=rules[2].id, componente="JUROS", valor=Decimal("2.00"), conta_debito="Débito", conta_credito="Crédito", historico="Juros", ordem=3, status="aplicado_por_regra"),
+    ])
+    session.commit()
+
+    data = accounting_rules(reconciliation.id, session)
+
+    assert [(rule["tipo_componente"], rule["cobertos"], rule["movimentos"][0]["valor"]) for rule in data["salvas"]] == [("PRINCIPAL", 1, "100.00"), ("MULTA", 1, "3.00"), ("JUROS", 1, "2.00")]
+
+
 def test_remaining_discount_stays_identified_as_a_compound_pending_component():
     session, reconciliation, movement = rules_session()
     match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id)

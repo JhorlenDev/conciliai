@@ -236,4 +236,5 @@ class LancamentoContabil(Base):
     conta_debito: Mapped[str] = mapped_column(String(100), default="")
     conta_credito: Mapped[str] = mapped_column(String(100), default="")
     historico: Mapped[str] = mapped_column(Text, default="")
+    complemento: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(40), default="pendente")

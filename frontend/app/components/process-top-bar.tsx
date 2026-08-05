@@ -90,7 +90,7 @@ export function ProcessTopBar({
           <span className="rounded-md bg-teal-700 p-1 text-white">
             <Building2 size={14} />
           </span>
-          <span>ConcilIAí</span>
+          <span>Concil<span className="inline-block text-[1.18em] leading-none">IA</span></span>
         </Link>
         <nav
           aria-label="Navegação principal"

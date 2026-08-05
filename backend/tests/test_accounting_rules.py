@@ -2,6 +2,7 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
+import fitz
 from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -25,9 +26,9 @@ def test_rule_application_and_csv_include_only_covered_movements():
     session.add(file); session.flush()
     covered = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 2), historico="PIX FORNECEDOR", valor=Decimal("12.50"), natureza="saída")
     pending = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 3), historico="TARIFA", valor=Decimal("5.00"), natureza="saída")
-    rule = RegraContabil(cliente_id=client.id, banco="Santander", tipo_fonte="extrato", tipo_operacao="saída", favorecido_normalizado=normalize_name("PIX"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento", complemento="Extrato")
+    rule = RegraContabil(cliente_id=client.id, conciliacao_id=reconciliation.id, banco="Santander", tipo_fonte="extrato", tipo_operacao="saída", favorecido_normalizado=normalize_name("PIX"), conta_debito="1.1.01 - Despesa", conta_credito="1.1.02 - Banco", historico="101 - Pagamento", complemento="Pagamento ao fornecedor conforme extrato")
     session.add_all([covered, pending, rule]); session.flush()
-    session.add(ContaBancaria(cliente_id=client.id, banco="Santander", conta_contabil="Banco"))
+    session.add(ContaBancaria(cliente_id=client.id, banco="Santander", conta_contabil="1.1.02 - Banco"))
 
     assert apply_accounting_rules(reconciliation, session) == 1
     assert apply_accounting_rules(reconciliation, session) == 1
@@ -36,11 +37,11 @@ def test_rule_application_and_csv_include_only_covered_movements():
 
     response = accounting_csv(reconciliation.id, session)
     csv = response.body.decode("utf-8-sig")
-    assert csv.splitlines() == ["data;debito;credito;historico;complemento;valor", "02/01/2024;Despesa;Banco;Pagamento;Extrato;12,50"]
+    assert csv.splitlines() == ["Data;Debito;Credito;Historico;Valor;Complemento", "02/01/2024;1.1.01;1.1.02;101;12.50;Pagamento ao fornecedor conforme extrato"]
     data = accounting_rules(reconciliation.id, session)
     assert len(data["pendentes"]) == 1
     entry = session.query(LancamentoContabil).filter_by(status="aplicado_por_regra").one()
-    assert (entry.valor, entry.conta_debito, entry.conta_credito) == (Decimal("12.50"), "Despesa", "Banco")
+    assert (entry.valor, entry.conta_debito, entry.conta_credito) == (Decimal("12.50"), "1.1.01 - Despesa", "1.1.02 - Banco")
     assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "12.50", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
 
 
@@ -55,7 +56,7 @@ def test_credit_rule_moves_entry_to_saved_and_reason_only_sums_covered_value():
     file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Banco do Brasil", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
     session.add(file); session.flush()
     movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 2), historico="RECEBIMENTO CLIENTE", valor=Decimal("20.00"), natureza="entrada")
-    rule = RegraContabil(cliente_id=client.id, banco="Banco do Brasil", tipo_fonte="extrato", tipo_operacao="entrada", favorecido_normalizado=normalize_name("RECEBIMENTO"), conta_debito="Banco", conta_credito="Receita", historico="Recebimento", complemento="Extrato")
+    rule = RegraContabil(cliente_id=client.id, conciliacao_id=reconciliation.id, banco="Banco do Brasil", tipo_fonte="extrato", tipo_operacao="entrada", favorecido_normalizado=normalize_name("RECEBIMENTO"), conta_debito="Banco", conta_credito="Receita", historico="Recebimento", complemento="Extrato")
     session.add_all([movement, rule]); session.flush()
 
     assert apply_accounting_rules(reconciliation, session) == 1
@@ -83,8 +84,8 @@ def test_reason_separates_debit_and_credit_movements_without_double_counting():
     session.add(file); session.flush()
     debit = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 2), historico="PIX RECEBIDO", valor=Decimal("100.00"), natureza="saída")
     credit = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 2), historico="PIX ENVIADO", valor=Decimal("100.00"), natureza="entrada")
-    debit_rule = RegraContabil(cliente_id=client.id, banco="Banco do Brasil", tipo_fonte="extrato", tipo_operacao="saída", favorecido_normalizado=normalize_name("RECEBIDO"), conta_debito="Banco", conta_credito="Receita", historico="Recebimento")
-    credit_rule = RegraContabil(cliente_id=client.id, banco="Banco do Brasil", tipo_fonte="extrato", tipo_operacao="entrada", favorecido_normalizado=normalize_name("ENVIADO"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento")
+    debit_rule = RegraContabil(cliente_id=client.id, conciliacao_id=reconciliation.id, banco="Banco do Brasil", tipo_fonte="extrato", tipo_operacao="saída", favorecido_normalizado=normalize_name("RECEBIDO"), conta_debito="Banco", conta_credito="Receita", historico="Recebimento")
+    credit_rule = RegraContabil(cliente_id=client.id, conciliacao_id=reconciliation.id, banco="Banco do Brasil", tipo_fonte="extrato", tipo_operacao="entrada", favorecido_normalizado=normalize_name("ENVIADO"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento")
     session.add_all([debit, credit, debit_rule, credit_rule]); session.flush()
 
     assert apply_accounting_rules(reconciliation, session) == 2
@@ -105,6 +106,19 @@ def test_rule_requires_its_statement_and_receipt_triggers():
     assert rule_matches_movement(RegraContabil(tipo_fonte="extrato", favorecido_normalizado=normalize_name("Transferência Agendada")), movement, None)
 
 
+def test_rule_with_only_receipt_trigger_is_saved_and_applied():
+    session, reconciliation, movement = rules_session("PAGAMENTO DIVERSO")
+    receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=movement.arquivo_id, pagina_numero=1, favorecido="Fornecedor específico")
+    session.add(receipt); session.flush()
+    session.add(Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id, comprovante_id=receipt.id)); session.commit()
+
+    create_accounting_rule(reconciliation.id, rule_input("", "FORNECEDOR ESPECÍFICO"), session)
+
+    data = accounting_rules(reconciliation.id, session)
+    assert data["pendentes"] == []
+    assert data["salvas"][0]["cobertos"] == 1
+
+
 def test_rule_receipt_trigger_combines_bank_and_rfb_keywords():
     movement = MovimentoExtrato(historico="Pagamento de Boleto", natureza="saída")
     receipt = Comprovante(favorecido="Bambuno Tecnologia")
@@ -117,7 +131,7 @@ def test_rule_receipt_trigger_combines_bank_and_rfb_keywords():
 
 def test_pending_payload_exposes_linked_bank_and_rfb_documents():
     session, reconciliation, movement = rules_session()
-    receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=movement.arquivo_id, pagina_numero=2, favorecido="Fornecedor Banco")
+    receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=movement.arquivo_id, pagina_numero=2, favorecido="Fornecedor Banco", numero_documento="13.101")
     rfb = ComprovanteRfb(conciliacao_id=reconciliation.id, arquivo_id=movement.arquivo_id, pagina_numero=3, tipo="DAS", razao_social="Empresa Simples Nacional")
     session.add_all([receipt, rfb]); session.flush()
     session.add(Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id, comprovante_id=receipt.id, comprovante_rfb_id=rfb.id)); session.commit()
@@ -127,6 +141,7 @@ def test_pending_payload_exposes_linked_bank_and_rfb_documents():
     assert pending["comprovante_arquivo_id"] == receipt.arquivo_id
     assert pending["comprovante_rfb_arquivo_id"] == rfb.arquivo_id
     assert "FORNECEDOR" in pending["palavras_comprovante_banco"]
+    assert "13.101" in pending["palavras_comprovante_banco"]
     assert "SIMPLES" in pending["palavras_comprovante_rfb"]
 
 
@@ -165,6 +180,15 @@ def test_new_eligible_rule_is_returned_as_pending_suggestion():
     assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
 
 
+def test_rule_without_eligible_movement_is_not_saved():
+    session, reconciliation, _ = rules_session()
+
+    with pytest.raises(HTTPException, match="não cobre nenhum lançamento"):
+        create_accounting_rule(reconciliation.id, rule_input("GATILHO INEXISTENTE"), session)
+
+    assert session.query(RegraContabil).count() == 0
+
+
 def test_saved_rule_disappears_from_pending_and_is_returned_as_saved_after_refresh():
     session, reconciliation, _ = rules_session()
 
@@ -177,9 +201,25 @@ def test_saved_rule_disappears_from_pending_and_is_returned_as_saved_after_refre
     assert first_load["salvas"][0]["cobertos"] == 1
 
 
+def test_rule_created_in_one_period_does_not_apply_to_another_period():
+    session, reconciliation, _ = rules_session()
+    next_period = Conciliacao(cliente_id=reconciliation.cliente_id, banco=reconciliation.banco, data_inicio=date(2024, 2, 1), data_fim=date(2024, 2, 29))
+    session.add(next_period); session.flush()
+    file = Arquivo(conciliacao_id=next_period.id, tipo_documento="extrato", banco_selecionado=next_period.banco, nome_original="fevereiro.pdf", caminho="/tmp/fevereiro.pdf")
+    session.add(file); session.flush()
+    session.add(MovimentoExtrato(conciliacao_id=next_period.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 2, 2), historico="PIX FORNECEDOR", valor=Decimal("20.00"), natureza="saída"))
+    session.commit()
+    create_accounting_rule(reconciliation.id, rule_input(), session)
+
+    data = accounting_rules(next_period.id, session)
+
+    assert data["pendentes"] == []
+    assert data["salvas"][0]["cobertos"] == 1
+
+
 def test_persisted_covered_entry_does_not_return_zero_eligible_suggestion():
     session, reconciliation, movement = rules_session("PIX ATUAL")
-    legacy_rule = RegraContabil(cliente_id=reconciliation.cliente_id, banco="Santander", tipo_fonte="extrato", tipo_operacao="Crédito", favorecido_normalizado=normalize_name("FORNECEDOR ANTIGO"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento")
+    legacy_rule = RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco="Santander", tipo_fonte="extrato", tipo_operacao="Crédito", favorecido_normalizado=normalize_name("FORNECEDOR ANTIGO"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento")
     session.add(legacy_rule); session.flush()
     match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id, regra_contabil_id=legacy_rule.id)
     session.add(match); session.flush()
@@ -188,7 +228,7 @@ def test_persisted_covered_entry_does_not_return_zero_eligible_suggestion():
     data = accounting_rules(reconciliation.id, session)
 
     assert len(data["pendentes"]) == 1
-    assert data["salvas"][0]["cobertos"] == 0
+    assert data["salvas"] == []
     assert data["integridade"]["movimentos_incompletos"][0]["movimento_id"] == movement.id
 
 
@@ -269,7 +309,7 @@ def test_discount_is_accounted_as_other_and_exported_in_its_own_csv():
     other_csv = accounting_other_csv(reconciliation.id, session).body.decode("utf-8-sig")
 
     assert (integrity["debito"], integrity["credito"], integrity["outros"]) == (Decimal("0.00"), Decimal("12.50"), Decimal("2.50"))
-    assert other_csv.splitlines() == ["data;debito;credito;historico;complemento;valor", "02/01/2024;Descontos;Despesa;Desconto obtido;;2,50"]
+    assert other_csv.splitlines() == ["Data;Debito;Credito;Historico;Valor;Complemento", "02/01/2024;Descontos;Despesa;Desconto obtido;2.50;"]
 
 
 def test_remaining_discount_stays_identified_as_a_compound_pending_component():
@@ -286,6 +326,21 @@ def test_remaining_discount_stays_identified_as_a_compound_pending_component():
 
     pending = accounting_rules(reconciliation.id, session)["pendentes"]
     assert [(item["tipo_componente"], item["movimento_composto"], item["componentes_documento"], item["componentes_cobertos"]) for item in pending] == [("DESCONTO", True, ["VALOR_COBRADO", "DESCONTO"], [{"componente": "VALOR_COBRADO", "valor": "12.50"}])]
+
+
+def test_zero_value_component_is_not_listed_for_accounting_rules():
+    session, reconciliation, movement = rules_session()
+    match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id)
+    session.add(match); session.flush()
+    session.add_all([
+        LancamentoContabil(correspondencia_id=match.id, componente="MULTA", valor=Decimal("18.82"), origem="rfb", status="pendente_regra"),
+        LancamentoContabil(correspondencia_id=match.id, componente="JUROS", valor=Decimal("0.00"), origem="rfb", status="pendente_regra"),
+    ])
+    session.commit()
+
+    pending = accounting_rules(reconciliation.id, session)["pendentes"]
+
+    assert [(item["tipo_componente"], item["valor"]) for item in pending] == [("MULTA", "18.82")]
 
 
 def test_clearing_all_rules_recalculates_pending_movements_without_deleting_them():
@@ -346,7 +401,7 @@ def test_inactive_rule_residue_is_excluded_from_reason_and_coverage():
 
 def test_other_bank_rule_never_enters_current_bank_reason():
     session, reconciliation, movement = rules_session()
-    foreign_rule = RegraContabil(cliente_id=reconciliation.cliente_id, banco="Banco do Brasil", tipo_fonte="extrato", tipo_operacao="Crédito", favorecido_normalizado=normalize_name("FORNECEDOR"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento")
+    foreign_rule = RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco="Banco do Brasil", tipo_fonte="extrato", tipo_operacao="Crédito", favorecido_normalizado=normalize_name("FORNECEDOR"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento")
     session.add(foreign_rule); session.flush()
     match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id, regra_contabil_id=foreign_rule.id)
     session.add(match); session.flush()
@@ -361,10 +416,15 @@ def test_other_bank_rule_never_enters_current_bank_reason():
 
 def test_pdf_export_groups_valid_entries_into_a_report():
     session, reconciliation, _ = rules_session()
-    create_accounting_rule(reconciliation.id, rule_input(), session)
+    create_accounting_rule(reconciliation.id, RegraContabilInput(gatilho="FORNECEDOR", natureza="Crédito", tipo_componente="PRINCIPAL", conta_debito="1.1.01 - Despesa", conta_credito="1.1.02 - Banco", historico="101 - Pagamento", complemento="Pagamento ao fornecedor conforme extrato"), session)
 
     response = accounting_pdf(reconciliation.id, session)
+    document = fitz.open(stream=response.body, filetype="pdf")
+    text = "".join(page.get_text() for page in document)
 
     assert response.media_type == "application/pdf"
     assert response.body.startswith(b"%PDF")
     assert response.headers["content-disposition"] == 'attachment; filename="lancamentos-contabeis.pdf"'
+    assert "Data" in text and "Debito" in text and "Credito" in text and "Historico" in text and "Valor" in text and "Complemento" in text
+    assert "1.1.01" in text and "1.1.02" in text and "101" in text
+    assert "Pagamento ao fornecedor conforme extrato" in text

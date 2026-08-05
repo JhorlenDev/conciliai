@@ -59,7 +59,7 @@ def parse_rfb_page(text: str, page_number: int) -> ParsedRfb | None:
     composition = text.split("Totais", 1)[0]
     item_pattern = re.compile(r"(?m)^(\d{4})\s*\n([^\n]+)\n([\d.,-]+)\n([\d.,-]+)\n([\d.,-]+)\n([\d.,-]+)")
     for match in item_pattern.finditer(composition):
-        code, description, item_total, item_juros, item_multa, item_principal = match.groups()
+        code, description, item_principal, item_multa, item_juros, item_total = match.groups()
         items.append(ParsedRfbItem(code, description.strip(), parse_brl(item_principal), parse_brl(item_multa), parse_brl(item_juros), parse_brl(item_total)))
     bank = re.search(r"Referência\s*\n\s*(\d{2}/\d{2}/\d{4})\s*\n\s*(\d{3})\s*-\s*([^\n]+)\s*\n\s*(\d+)", text, re.I)
     collected_date, bank_code, bank_name, agency = (None, "", "", "")

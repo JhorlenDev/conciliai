@@ -111,6 +111,7 @@ class Comprovante(RegistroBase, Base):
     valor_pago: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     detalhes_financeiros: Mapped[dict] = mapped_column(JSON, default=dict)
     tipo_operacao: Mapped[str] = mapped_column(String(20), default="")
+    numero_documento: Mapped[str] = mapped_column(String(80), default="")
     banco_detectado: Mapped[str | None] = mapped_column(String(100))
     beneficiario: Mapped[str] = mapped_column(Text, default="")
     nome_fantasia: Mapped[str] = mapped_column(Text, default="")
@@ -189,6 +190,7 @@ class RegraContabil(Base):
     __tablename__ = "regras_contabeis"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     cliente_id: Mapped[str | None] = mapped_column(ForeignKey("clientes.id"), index=True)
+    conciliacao_id: Mapped[str | None] = mapped_column(ForeignKey("conciliacoes.id"), index=True)
     banco: Mapped[str] = mapped_column(String(100), default="")
     tipo_fonte: Mapped[str] = mapped_column(String(30))
     tipo_operacao: Mapped[str] = mapped_column(String(80), default="")
@@ -210,6 +212,9 @@ class ContaBancaria(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     cliente_id: Mapped[str] = mapped_column(ForeignKey("clientes.id"), index=True)
     banco: Mapped[str] = mapped_column(String(100))
+    agencia: Mapped[str] = mapped_column(String(30), default="")
+    conta: Mapped[str] = mapped_column(String(50), default="")
+    titular: Mapped[str] = mapped_column(String(255), default="")
     conta_contabil: Mapped[str] = mapped_column(String(100), default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

@@ -60,7 +60,7 @@ export default function DocumentosPage() {
         <div className="mx-auto flex max-w-5xl items-center">
           <div>
             <Link href="/" className="text-lg font-bold">
-              ConcilIAí
+              Concil<span className="inline-block text-[1.18em] leading-none">IA</span>
             </Link>
             <p className="text-xs text-emerald-100">Documentos importantes</p>
           </div>

@@ -4,9 +4,9 @@ from decimal import Decimal
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.api.routes import accounting_rules, create_reconciliation_process, delete_reconciliation_process, reconcile, reprocess_document, resume_process_bank
+from app.api.routes import ContaBancariaClienteInput, accounting_rules, client_bank_accounts, create_reconciliation_process, delete_client_bank_account, delete_reconciliation_process, reconcile, reprocess_document, resume_process_bank, save_client_bank_account
 from app.core.database import Base
-from app.models import Arquivo, Cliente, Comprovante, Conciliacao, Correspondencia, LancamentoContabil, MovimentoExtrato, ProcessoConciliacao, RegraContabil
+from app.models import Arquivo, Cliente, Comprovante, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, ProcessoConciliacao, RegraContabil
 from app.services.normalization import normalize_name
 from app.api.routes import ProcessoBancoInput, ProcessoConciliacaoInput
 
@@ -26,7 +26,7 @@ def test_process_resumes_the_same_bank_and_exposes_shared_rule_source():
     statement = Arquivo(conciliacao_id=bradesco["id"], tipo_documento="extrato", banco_selecionado="Bradesco", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
     session.add(statement); session.flush()
     session.add(MovimentoExtrato(conciliacao_id=bradesco["id"], arquivo_id=statement.id, pagina_numero=1, data=date(2024, 1, 2), historico="PIX FORNECEDOR", natureza="saída"))
-    session.add(RegraContabil(cliente_id=client.id, banco="Santander", tipo_fonte="extrato", tipo_operacao="saída", favorecido_normalizado=normalize_name("PIX"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento"))
+    session.add(RegraContabil(cliente_id=client.id, conciliacao_id=santander["id"], banco="Santander", tipo_fonte="extrato", tipo_operacao="saída", favorecido_normalizado=normalize_name("PIX"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento"))
     session.commit()
 
     rules = accounting_rules(bradesco["id"], session)
@@ -34,6 +34,23 @@ def test_process_resumes_the_same_bank_and_exposes_shared_rule_source():
     assert source["banco_origem"] == "Santander"
     assert source["gatilho"] == normalize_name("PIX")
     assert rules["salvas"] == []
+
+
+def test_client_bank_account_crud_preserves_accounting_account():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    session.add(ContaBancaria(cliente_id=client.id, banco="Santander", conta_contabil="1.1.02 - Banco"))
+    session.commit()
+
+    saved = save_client_bank_account(client.id, "Santander", ContaBancariaClienteInput(agencia="1234-5", conta="98765-4", titular="Cliente Titular"), session)
+
+    assert saved == {"id": saved["id"], "banco": "Santander", "agencia": "1234-5", "conta": "98765-4", "titular": "Cliente Titular", "conta_contabil": "1.1.02 - Banco"}
+    assert client_bank_accounts(client.id, session) == [saved]
+    delete_client_bank_account(client.id, "Santander", session)
+    assert client_bank_accounts(client.id, session) == []
 
 
 def test_delete_process_removes_its_reconciliations_and_files(tmp_path):

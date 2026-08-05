@@ -81,6 +81,15 @@ def test_darf_consolidates_irrf_and_remaining_codes_as_inss_with_penalties():
     assert not result.exige_revisao
 
 
+def test_darf_zero_interest_does_not_fall_back_to_item_fines():
+    item = SimpleNamespace(codigo="1082", descricao="CONTRIBUIÇÃO PREVIDENCIÁRIA", valor_principal=Decimal("100.00"), valor_multa=Decimal("0.00"), valor_juros=Decimal("18.82"))
+    rfb = SimpleNamespace(tipo="DARF", valor_principal=Decimal("100.00"), valor_multa=Decimal("18.82"), valor_juros=Decimal("0.00"), itens=[item])
+
+    result = choose_rule_source(Decimal("118.82"), True, rfb)
+
+    assert [(line.componente, line.valor) for line in result.linhas] == [("INSS", Decimal("100.00")), ("MULTA", Decimal("18.82"))]
+
+
 def test_receipt_interest_and_fine_create_separate_components():
     receipt = SimpleNamespace(financeiros=FinancialValues(valor_original=Decimal("100.00"), valor_juros=Decimal("2.00"), valor_multa=Decimal("3.00"), valor_pago=Decimal("105.00")))
 

@@ -1,4 +1,4 @@
-# Conciliação Bancária
+# ConcilIA
 
 Primeira entrega de um sistema novo e independente para conferência de PDFs bancários com texto selecionável. Não há login, integração externa, IA ou lançamentos contábeis.
 

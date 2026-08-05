@@ -45,6 +45,7 @@ class ParsedReceipt:
     pagador: str = ""
     cnpj_beneficiario: str = ""
     cnpj_beneficiario_final: str = ""
+    numero_documento: str = ""
 
 
 @dataclass
@@ -146,6 +147,21 @@ def receipt_participants(text: str) -> dict[str, str]:
     return participants
 
 
+def receipt_document_number(text: str) -> str:
+    """Reads the document identifier printed by bank receipt layouts."""
+    patterns = (
+        r"^\s*(?:N[ÚU]MERO|NUMERO|N[º°O])\s*(?:DO|DE)?\s*DOCUMENTO\s*:?[ \t]*([^\n]+)",
+        r"^\s*DOCUMENTO\s*:?[ \t]+([^\n]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I | re.M)
+        if match:
+            value = " ".join(match.group(1).split())
+            if value and value.upper() not in {"PIX", "TED", "DOCUMENTO"}:
+                return value
+    return ""
+
+
 def extract_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
     """A record is emitted only from a self-contained block with required labels."""
     blocks = re.split(r"(?=^\s*VALOR\s*:)", text, flags=re.I | re.M)
@@ -163,7 +179,7 @@ def extract_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
         if not parsed_date or amount is None or not name:
             continue
         operation = "PIX" if re.search(r"\bPIX\b", block, re.I) else "TED" if re.search(r"\bTED|TRANSFER[ÊE]NCIA\b", block, re.I) else ""
-        participants = receipt_participants(block); results.append(ParsedReceipt(parsed_date, parsed_time, name, amount, operation, block.strip(), page_number, name_info[1], financial, participants.get("beneficiario", name), participants.get("nome_fantasia", ""), participants.get("beneficiario_final", ""), participants.get("pagador", ""), participants.get("cnpj_beneficiario", ""), participants.get("cnpj_beneficiario_final", "")))
+        participants = receipt_participants(block); results.append(ParsedReceipt(parsed_date, parsed_time, name, amount, operation, block.strip(), page_number, name_info[1], financial, participants.get("beneficiario", name), participants.get("nome_fantasia", ""), participants.get("beneficiario_final", ""), participants.get("pagador", ""), participants.get("cnpj_beneficiario", ""), participants.get("cnpj_beneficiario_final", ""), receipt_document_number(block)))
     if results:
         return results
 
@@ -186,7 +202,7 @@ def extract_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
         amount = financial.valor_pago
         if parsed_date and amount is not None and name and name.upper() not in {"PIX", "TED", "DOCUMENTO"}:
             operation = "PIX" if re.search(r"\bPIX\b", text, re.I) else "TED" if re.search(r"\bTED|TRANSFER[ÊE]NCIA\b", text, re.I) else "RECEBIMENTO" if re.search(r"RECEB", text, re.I) else "PAGAMENTO"
-            participants = receipt_participants(text); return [ParsedReceipt(parsed_date, parsed_time, name, amount, operation, text.strip(), page_number, name_info[1], financial, participants.get("beneficiario", name), participants.get("nome_fantasia", ""), participants.get("beneficiario_final", ""), participants.get("pagador", ""), participants.get("cnpj_beneficiario", ""), participants.get("cnpj_beneficiario_final", ""))]
+            participants = receipt_participants(text); return [ParsedReceipt(parsed_date, parsed_time, name, amount, operation, text.strip(), page_number, name_info[1], financial, participants.get("beneficiario", name), participants.get("nome_fantasia", ""), participants.get("beneficiario_final", ""), participants.get("pagador", ""), participants.get("cnpj_beneficiario", ""), participants.get("cnpj_beneficiario_final", ""), receipt_document_number(text))]
     return results
 
 
@@ -201,7 +217,7 @@ def _extract_banco_do_brasil_receipt(text: str, page_number: int) -> list[Parsed
         financial = extract_financial_values(text)
         amount = financial.valor_pago
         if parsed_date and amount is not None:
-            return [ParsedReceipt(parsed_date, None, payment_name, amount, "PAGAMENTO", text.strip(), page_number, "BENEFICIARIO", financial, participants.get("beneficiario", payment_name), participants.get("nome_fantasia", ""), participants.get("beneficiario_final", ""), participants.get("pagador", ""), participants.get("cnpj_beneficiario", ""), participants.get("cnpj_beneficiario_final", ""))]
+            return [ParsedReceipt(parsed_date, None, payment_name, amount, "PAGAMENTO", text.strip(), page_number, "BENEFICIARIO", financial, participants.get("beneficiario", payment_name), participants.get("nome_fantasia", ""), participants.get("beneficiario_final", ""), participants.get("pagador", ""), participants.get("cnpj_beneficiario", ""), participants.get("cnpj_beneficiario_final", ""), receipt_document_number(text))]
 
     transfer_name = re.search(r"TRANSFERIDO PARA\s*:\s*\n\s*CLIENTE\s*:\s*([^\n]+)", text, re.I)
     transfer_date = re.search(r"^\s*DATA DA TRANSFER[ÊE]NCIA\s+(\d{2}/\d{2}/\d{4})", text, re.I | re.M)
@@ -211,7 +227,7 @@ def _extract_banco_do_brasil_receipt(text: str, page_number: int) -> list[Parsed
         financial = extract_financial_values(text)
         amount = financial.valor_pago
         if parsed_date and amount is not None:
-            return [ParsedReceipt(parsed_date, None, transfer_name.group(1).strip(), amount, "TRANSFERÊNCIA", text.strip(), page_number, "TRANSFERIDO PARA", financial)]
+            return [ParsedReceipt(parsed_date, None, transfer_name.group(1).strip(), amount, "TRANSFERÊNCIA", text.strip(), page_number, "TRANSFERIDO PARA", financial, numero_documento=receipt_document_number(text))]
     return []
 
 

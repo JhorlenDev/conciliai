@@ -4,6 +4,8 @@ from decimal import Decimal
 from app.services.normalization import accounting_nature, names_similar, normalize_statement_nature
 from app.services.matching import invoice_is_candidate
 from app.services.parsers import deduplicate_statement_records, extract_financial_values, extract_receipts, extract_statement, parse_brl, parse_date_time
+from app.api.routes import receipt_match_criterion
+from app.models import Comprovante
 
 
 def test_receipt_is_one_line_even_with_institutional_text():
@@ -30,6 +32,7 @@ def test_documento_pix_and_ted_are_never_names():
     records = extract_receipts("VALOR: R$2.300,00\nTED\nDOCUMENTO: 12\nFAVORECIDO: C ODONTO\nDEBITO EM: 02/01/2024", 1)
     assert records[0].favorecido not in {"DOCUMENTO", "PIX", "TED"}
     assert records[0].tipo_operacao == "TED"
+    assert records[0].numero_documento == "12"
 
 
 def test_abbreviated_names_match_only_when_initials_follow_full_name_order():
@@ -257,6 +260,25 @@ VALOR DO DOCUMENTO                        680,49
     record = extract_receipts(text, 1)[0]
     assert record.favorecido == "QUANTITY SERVICOS E COMERCIO DE PRO"
     assert record.valor == Decimal("680.49")
+
+
+def test_banco_do_brasil_receipt_keeps_document_number():
+    text = """DOCUMENTO: 13.101
+BENEFICIARIO FINAL:
+QUANTITY SERVICOS E COMERCIO DE PRO
+DATA DO PAGAMENTO                     02/01/2024
+VALOR DO DOCUMENTO                    680,49
+"""
+
+    record = extract_receipts(text, 1)[0]
+
+    assert record.numero_documento == "13.101"
+
+
+def test_receipt_document_number_matches_the_banco_do_brasil_statement_history():
+    receipt = Comprovante(numero_documento="13.101", beneficiario="Outro favorecido")
+
+    assert receipt_match_criterion("Pagamento de Boleto 13.101", receipt) == "número do documento"
 
 
 def test_banco_do_brasil_transfer_receipt_reads_transferred_client():

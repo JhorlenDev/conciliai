@@ -46,12 +46,13 @@ def choose_rule_source(extrato_valor: Decimal | None, receipt=None, rfb=None, ta
 
 def _rfb_lines(rfb) -> list[RuleLine]:
     items = getattr(rfb, "itens", [])
+    value_or_items = lambda field: getattr(rfb, field, None) if getattr(rfb, field, None) is not None else sum((getattr(item, field, None) or Decimal("0.00") for item in items), Decimal("0.00"))
     is_simples = getattr(rfb, "tipo", "").upper() == "DAS" or any("SIMPLES NACIONAL" in (item.descricao or "").upper() for item in items)
     if is_simples:
-        principal = rfb.valor_principal or sum((item.valor_principal or Decimal("0.00") for item in items), Decimal("0.00"))
-        multa = rfb.valor_multa or sum((item.valor_multa or Decimal("0.00") for item in items), Decimal("0.00"))
-        juros = rfb.valor_juros or sum((item.valor_juros or Decimal("0.00") for item in items), Decimal("0.00"))
-        total = getattr(rfb, "valor_total", None) or principal + multa + juros
+        principal = value_or_items("valor_principal")
+        multa = value_or_items("valor_multa")
+        juros = value_or_items("valor_juros")
+        total = getattr(rfb, "valor_total", None) if getattr(rfb, "valor_total", None) is not None else principal + multa + juros
         return [RuleLine("SIMPLES_NACIONAL", total, descricao="SIMPLES NACIONAL", origem="rfb")] if total > 0 else []
     if getattr(rfb, "tipo", "").upper() == "DARF":
         items = getattr(rfb, "itens", [])
@@ -63,8 +64,8 @@ def _rfb_lines(rfb) -> list[RuleLine]:
             lines.append(RuleLine("IRRF", irrf, irrf_items[0].codigo, "IRRF", origem="rfb"))
         if inss > 0:
             lines.append(RuleLine("INSS", inss, descricao="INSS", origem="rfb"))
-        multa = rfb.valor_multa or sum((item.valor_multa or Decimal("0.00") for item in items), Decimal("0.00"))
-        juros = rfb.valor_juros or sum((item.valor_juros or Decimal("0.00") for item in items), Decimal("0.00"))
+        multa = value_or_items("valor_multa")
+        juros = value_or_items("valor_juros")
         for component, value in (("MULTA", multa), ("JUROS", juros)):
             if value and value > 0:
                 lines.append(RuleLine(component, value, descricao=component, origem="rfb"))

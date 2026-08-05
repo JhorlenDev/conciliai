@@ -663,29 +663,29 @@ function AdvancedRulesPanel({
     contas: string[];
     historicos: string[];
   }>({ contas: [], historicos: [] });
+  const loadRequest = useRef(0);
+  function applyRulesSnapshot(rules: { pendentes: PendingRule[]; salvas: SavedRule[]; integridade?: { csv_permitido?: boolean } }) {
+    loadRequest.current += 1;
+    setPending(rules.pendentes.map((item) => ({ ...item, historico: cleanHistory(item.historico) })));
+    setSaved(rules.salvas.map((item) => ({ ...item, historico: cleanHistory(item.historico) })));
+    setCsvPermitted(rules.integridade?.csv_permitido !== false);
+  }
   async function load() {
+    const request = ++loadRequest.current;
     const [rulesResponse, accountResponse] = await Promise.all([
       fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis`, { cache: "no-store" }),
       fetch(`${API}/api/conciliacoes/${reconciliationId}/conta-bancaria`, { cache: "no-store" }),
     ]);
-    if (!rulesResponse.ok || !accountResponse.ok)
+    if (!rulesResponse.ok || !accountResponse.ok) {
+      if (request !== loadRequest.current) return null;
       return setMessage("Não foi possível carregar as regras.");
+    }
     const rules = await rulesResponse.json();
     const bankAccount = await accountResponse.json();
-    setPending(
-      rules.pendentes.map((item: PendingRule) => ({
-        ...item,
-        historico: cleanHistory(item.historico),
-      })),
-    );
-    setSaved(
-      rules.salvas.map((item: SavedRule) => ({
-        ...item,
-        historico: cleanHistory(item.historico),
-      })),
-    );
-    setCsvPermitted(rules.integridade?.csv_permitido !== false);
+    if (request !== loadRequest.current) return null;
+    applyRulesSnapshot(rules);
     setAccount(bankAccount.conta_contabil || "");
+    return rules;
   }
   useEffect(() => {
     load();
@@ -759,13 +759,15 @@ function AdvancedRulesPanel({
         const error = await response.json();
         return setMessage(error.detail ?? "Não foi possível salvar a regra.");
       }
+      const result = await response.json();
       setMessage(
         existing
           ? "Regra atualizada e reaplicada."
           : "Regra salva e aplicada aos lançamentos compatíveis.",
       );
       setDrafts((items) => ({ ...items, [item.id]: {} }));
-      await load();
+      if (result.regras) applyRulesSnapshot(result.regras);
+      else await load();
       onRulesChanged();
     } finally {
       setBusyRuleId(null);
@@ -779,7 +781,9 @@ function AdvancedRulesPanel({
         method: "DELETE",
       });
       if (!response.ok) return setMessage("Não foi possível excluir a regra.");
-      await load();
+      const result = await response.json();
+      if (result.regras) applyRulesSnapshot(result.regras);
+      else await load();
       onRulesChanged();
     } finally {
       setBusyRuleId(null);
@@ -791,9 +795,11 @@ function AdvancedRulesPanel({
     try {
       const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis`, { method: "DELETE" });
       if (!response.ok) return setMessage("Não foi possível limpar as regras.");
+      const result = await response.json();
       setConfirmClearAll(false);
       setMessage("Todas as regras deste banco foram limpas e os lançamentos foram recalculados.");
-      await load();
+      if (result.regras) applyRulesSnapshot(result.regras);
+      else await load();
       onRulesChanged();
     } finally {
       setBusyRuleId(null);
@@ -955,18 +961,24 @@ function AdvancedRulesPanel({
     const words = pendingItem?.historico.match(/[\p{L}\p{N}]+/gu) ?? [];
     const keyword = value(item.id, "gatilho", fields.gatilho);
     const receiptKeyword = value(item.id, "gatilhoComprovante", fields.gatilhoComprovante);
+    const matchesKeyword = (source: string, trigger: string) =>
+      trigger
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .every((word) => source.toUpperCase().includes(word.toUpperCase()));
     const coveredCount =
-      "cobertos" in item && keyword === fields.gatilho
+      "cobertos" in item && keyword === fields.gatilho && receiptKeyword === fields.gatilhoComprovante
         ? item.cobertos
-        : keyword
+        : keyword || receiptKeyword
           ? pending.filter(
               (candidate) =>
-                candidate.historico
-                  .toUpperCase()
-                  .includes(keyword.toUpperCase()) &&
+                (!keyword || matchesKeyword(candidate.historico, keyword)) &&
+                (!receiptKeyword || matchesKeyword([...(candidate.palavras_comprovante_banco ?? []), ...(candidate.palavras_comprovante_rfb ?? [])].join(" "), receiptKeyword)) &&
                 (candidate.natureza_contabil || candidate.natureza) === (item.natureza_contabil || item.natureza),
             ).length
           : 0;
+    const canSave = existing || coveredCount > 0;
     return (
       <tr
         className={`border-t align-top ${compact ? "bg-inherit" : simple ? "border-y border-l-4 border-emerald-200 border-l-emerald-300 bg-emerald-50/70" : ""}`}
@@ -1128,7 +1140,7 @@ function AdvancedRulesPanel({
               )}
             </div>
             {(pendingItem?.comprovante_arquivo_id || pendingItem?.comprovante_rfb_arquivo_id) && (
-              <div className="relative mt-1 flex items-center gap-1">
+              <div className="mt-1 flex items-center gap-1">
                 <input className="w-20 rounded border border-violet-200 px-1.5 py-1" placeholder="comprovante..." value={receiptKeyword} onChange={(event) => change(item.id, "gatilhoComprovante", event.target.value)} />
                 <button title="Usar comprovante completo" onClick={() => change(item.id, "gatilhoComprovante", (pendingItem.palavras_comprovante ?? []).join(" "))} className="rounded border border-violet-200 bg-violet-50 p-1 text-violet-700 hover:border-violet-500">
                   <Copy size={13} />
@@ -1137,23 +1149,25 @@ function AdvancedRulesPanel({
                   <Tags size={13} />
                 </button>
                 {receiptWordPicker === item.id && (
-                  <div className="absolute left-0 top-8 z-30 w-56 rounded-lg border border-violet-200 bg-white p-2 shadow-xl">
+                  <div className="absolute left-24 top-8 z-30 w-56 rounded-lg border border-violet-200 bg-white p-2 shadow-xl">
                     <div className="mb-2 flex items-center justify-between border-b pb-1 text-[10px] font-semibold text-violet-800">Palavras dos comprovantes<button onClick={() => setReceiptWordPicker(null)} className="text-sm leading-none text-slate-500">✕</button></div>
                     {[["Banco", pendingItem.palavras_comprovante_banco ?? []], ["RFB", pendingItem.palavras_comprovante_rfb ?? []]].map(([source, words]) => Array.isArray(words) && words.length > 0 && <div className="mb-2" key={source as string}><p className="mb-1 text-[9px] font-semibold uppercase text-violet-500">{source as string}</p><div className="flex flex-wrap gap-1">{words.map((word, index) => { const selected = receiptKeyword.toUpperCase().split(/\s+/).includes(word); return <button onClick={() => change(item.id, "gatilhoComprovante", selected ? receiptKeyword.split(/\s+/).filter(part => part !== word).join(" ") : [receiptKeyword, word].filter(Boolean).join(" "))} className={`rounded px-1.5 py-0.5 text-[10px] ${selected ? "bg-violet-700 text-white" : "bg-violet-50 text-violet-800"}`} key={`${source}-${word}-${index}`}>{word}</button>; })}</div></div>)}
                   </div>
                 )}
               </div>
             )}
-            {keyword && (
+            {(keyword || receiptKeyword) && (
               <div className="mt-1 w-48 text-[10px] leading-4 text-emerald-700">
                 <span className="font-semibold">
-                  {keywordMode[item.id] === "full"
+                  {keyword && keywordMode[item.id] === "full"
                     ? "Histórico completo"
-                    : "Palavras selecionadas"}
+                    : keyword
+                      ? "Palavras do extrato"
+                      : "Palavras do comprovante"}
                 </span>
-                <br />✓ Este gatilho vai cobrir {coveredCount} lançamento(s)
+                <br /><span className={coveredCount ? "" : "text-red-700"}>{coveredCount ? "✓" : "!"} Este gatilho vai cobrir {coveredCount} lançamento(s)</span>
                 <br />
-                <span className="text-slate-500">«{keyword}»</span>
+                <span className="text-slate-500">«{[keyword, receiptKeyword].filter(Boolean).join(" | ")}»</span>
               </div>
             )}
           </div>
@@ -1202,9 +1216,9 @@ function AdvancedRulesPanel({
         {showAction && <td className={`${existing ? "w-[6%]" : "w-px"} whitespace-nowrap px-2 py-1`}>
           {!pendingItem?.regra_compartilhada && (
             <>
-              <button title={existing ? "Atualizar regra" : "Salvar regra"} aria-label={existing ? "Atualizar regra" : "Salvar regra"} disabled={busyRuleId === item.id} onClick={() => saveRule(item, existing)} className="rounded bg-teal-700 px-2 py-1 text-white disabled:cursor-wait disabled:opacity-60">
+              {canSave && <button title={existing ? "Atualizar regra" : "Salvar regra"} aria-label={existing ? "Atualizar regra" : "Salvar regra"} disabled={busyRuleId === item.id} onClick={() => saveRule(item, existing)} className="rounded bg-teal-700 px-2 py-1 text-white disabled:cursor-wait disabled:opacity-60">
                 {busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : existing ? <RefreshCw size={14} /> : <CheckCircle2 size={14} />}
-              </button>
+              </button>}
               {existing && <button title="Excluir regra" aria-label="Excluir regra" disabled={busyRuleId === item.id} onClick={() => remove(item.id)} className="ml-1 rounded border border-red-200 px-2 py-1 text-red-700 disabled:cursor-wait disabled:opacity-60"><Trash2 size={14} /></button>}
             </>
           )}
@@ -2663,6 +2677,7 @@ function ConciliacaoFlow({
             columns={[
               "Data",
               "Hora",
+              "Documento",
               "Favorecido",
               "Valor original",
               "Ajustes",

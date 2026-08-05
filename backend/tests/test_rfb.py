@@ -48,3 +48,25 @@ def test_divergent_composition_is_preserved_and_marked():
     record = parse_rfb_page(rfb_page(total="1.040,00"), 1)
     assert record and record.composicao_divergente
     assert record.valor_total == Decimal("1040.00")
+
+
+def test_darf_item_columns_keep_fine_separate_from_zero_interest():
+    text = """Comprovamos que consta nos sistemas da Receita Federal registro de arrecadação de DARF com os dados a seguir:
+Comprovante de Arrecadação
+1082
+CONTRIBUIÇÃO PREVIDENCIÁRIA
+483,29
+1,59
+-
+484,88
+Totais
+483,29
+1,59
+0,00
+484,88
+"""
+
+    record = parse_rfb_page(text, 1)
+
+    assert record is not None
+    assert [(item.valor_principal, item.valor_multa, item.valor_juros, item.valor_total) for item in record.itens] == [(Decimal("483.29"), Decimal("1.59"), None, Decimal("484.88"))]

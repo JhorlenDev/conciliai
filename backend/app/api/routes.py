@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import UPLOAD_DIR
 from app.core.database import get_db
-from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, ComprovanteRfbItem, Conciliacao, ContaBancaria, Correspondencia, DocumentoImportante, LancamentoContabil, MovimentoExtrato, NotaFiscal, ProcessoConciliacao, RegraContabil
+from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, ComprovanteRfbItem, Conciliacao, ContaBancaria, Correspondencia, DocumentoImportante, LancamentoContabil, MovimentoExtrato, NotaFiscal, ProcessoConciliacao, RegraContabil, RegraContabilExcecao
 from app.services.normalization import accounting_nature, is_statement_debit, normalize_name, normalize_rule_accounting_nature, normalize_statement_nature
 from app.services.matching import names_similar
 from app.services.parsers import deduplicate_statement_records, extract_receipts, extract_statement
@@ -598,7 +598,8 @@ def scoped_reconciliations(reconciliation: Conciliacao, db: Session) -> list[Con
 
 
 def current_bank_rules(reconciliation: Conciliacao, db: Session) -> list[RegraContabil]:
-    return [rule for rule in scoped_rules(reconciliation, db) if rule.banco == reconciliation.banco]
+    ignored_rule_ids = {item.regra_contabil_id for item in db.query(RegraContabilExcecao).filter_by(conciliacao_id=reconciliation.id)}
+    return [rule for rule in scoped_rules(reconciliation, db) if rule.banco == reconciliation.banco and rule.id not in ignored_rule_ids]
 
 
 def complete_accounting_entry(entry: LancamentoContabil) -> bool:
@@ -792,9 +793,15 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     saved_payloads = [rule_payload(rule, movements, receipts, covered_by_rule[rule.id]) for rule in same_bank_rules]
     saved_payloads.sort(key=lambda item: min((accounting_entry_order(entry) for _, entry in covered_by_rule[item["id"]]), default=(10**9, 10**9, "")))
+    ignored = []
+    for exception in db.query(RegraContabilExcecao).filter_by(conciliacao_id=reconciliation.id):
+        rule = db.get(RegraContabil, exception.regra_contabil_id)
+        if rule and rule.ativo and rule.cliente_id == reconciliation.cliente_id and rule.banco == reconciliation.banco:
+            ignored.append({"id": rule.id, "gatilho": rule.favorecido_normalizado, "gatilho_comprovante": rule.gatilho_comprovante_normalizado, "tipo_componente": rule.tipo_componente, "historico": rule.historico})
     return {
         "pendentes": pending,
         "salvas": [item for item in saved_payloads if item["cobertos"] > 0],
+        "ignoradas": ignored,
         "resumo": {
             "extrato": {
                 "debito": str(sum((item.valor or 0 for item in movements if is_statement_debit(item.natureza)), 0)),
@@ -851,11 +858,14 @@ def create_accounting_rule(conciliacao_id: str, payload: RegraContabilInput, db:
     return {"id": rule.id, "movimentos_aplicados": applied, "regras": accounting_rules(conciliacao_id, db)}
 
 
-def release_rule_entries(rule_ids: list[str], db: Session) -> None:
+def release_rule_entries(rule_ids: list[str], db: Session, conciliacao_id: str | None = None) -> None:
     """Returns source components to the pending list without losing their composition."""
     if not rule_ids:
         return
-    for entry in db.query(LancamentoContabil).filter(LancamentoContabil.regra_contabil_id.in_(rule_ids)):
+    entries = db.query(LancamentoContabil).filter(LancamentoContabil.regra_contabil_id.in_(rule_ids))
+    if conciliacao_id:
+        entries = entries.join(Correspondencia, LancamentoContabil.correspondencia_id == Correspondencia.id).filter(Correspondencia.conciliacao_id == conciliacao_id)
+    for entry in entries:
         entry.regra_contabil_id = None
         entry.conta_debito = ""
         entry.conta_credito = ""
@@ -894,19 +904,82 @@ def update_accounting_rule(conciliacao_id: str, regra_id: str, payload: RegraCon
     return {"id": rule.id, "regras": accounting_rules(conciliacao_id, db)}
 
 
+def delete_rule_globally(rule: RegraContabil, db: Session) -> int:
+    rule.ativo = False
+    db.query(RegraContabilExcecao).filter_by(regra_contabil_id=rule.id).delete(synchronize_session=False)
+    release_rule_entries([rule.id], db)
+    for match in db.query(Correspondencia).filter_by(regra_contabil_id=rule.id):
+        match.regra_contabil_id = None
+    reconciliations = db.query(Conciliacao).filter_by(cliente_id=rule.cliente_id, banco=rule.banco).all()
+    for item in reconciliations:
+        apply_accounting_rules(item, db)
+    return len(reconciliations)
+
+
+@router.delete("/conciliacoes/{conciliacao_id}/regras-contabeis/{regra_id}/periodo")
+def ignore_rule_in_period(conciliacao_id: str, regra_id: str, db: Session = Depends(get_db)):
+    reconciliation = reconciliation_or_404(conciliacao_id, db)
+    rule = db.get(RegraContabil, regra_id)
+    if not rule or rule.cliente_id != reconciliation.cliente_id or rule.banco != reconciliation.banco or not rule.ativo:
+        raise HTTPException(404, "Regra não encontrada para este cliente e banco")
+    try:
+        if not db.query(RegraContabilExcecao).filter_by(regra_contabil_id=rule.id, conciliacao_id=reconciliation.id).first():
+            db.add(RegraContabilExcecao(regra_contabil_id=rule.id, conciliacao_id=reconciliation.id))
+        release_rule_entries([rule.id], db, reconciliation.id)
+        for match in db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id, regra_contabil_id=rule.id):
+            match.regra_contabil_id = None
+        apply_accounting_rules(reconciliation, db)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"message": f"Regra removida somente deste período ({reconciliation.data_inicio.strftime('%m/%Y')}).", "regras": accounting_rules(conciliacao_id, db)}
+
+
+@router.delete("/conciliacoes/{conciliacao_id}/regras-contabeis/{regra_id}/periodo/excecao")
+def restore_rule_in_period(conciliacao_id: str, regra_id: str, db: Session = Depends(get_db)):
+    reconciliation = reconciliation_or_404(conciliacao_id, db)
+    rule = db.get(RegraContabil, regra_id)
+    exception = db.query(RegraContabilExcecao).filter_by(regra_contabil_id=regra_id, conciliacao_id=conciliacao_id).first()
+    if not rule or rule.cliente_id != reconciliation.cliente_id or rule.banco != reconciliation.banco or not exception:
+        raise HTTPException(404, "Regra ignorada não encontrada neste período")
+    try:
+        db.delete(exception)
+        apply_accounting_rules(reconciliation, db)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"message": f"Regra restaurada neste período ({reconciliation.data_inicio.strftime('%m/%Y')}).", "regras": accounting_rules(conciliacao_id, db)}
+
+
+@router.delete("/conciliacoes/{conciliacao_id}/regras-contabeis/{regra_id}")
+def delete_accounting_rule_for_reconciliation(conciliacao_id: str, regra_id: str, db: Session = Depends(get_db)):
+    reconciliation = reconciliation_or_404(conciliacao_id, db)
+    rule = db.get(RegraContabil, regra_id)
+    if not rule or rule.cliente_id != reconciliation.cliente_id or rule.banco != reconciliation.banco or not rule.ativo:
+        raise HTTPException(404, "Regra não encontrada para este cliente e banco")
+    try:
+        affected = delete_rule_globally(rule, db)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"message": f"Regra excluída de {affected} período{'s' if affected != 1 else ''}.", "regras": accounting_rules(conciliacao_id, db), "periodos_afetados": affected}
+
+
 @router.delete("/regras-contabeis/{regra_id}")
 def delete_accounting_rule(regra_id: str, db: Session = Depends(get_db)):
     rule = db.get(RegraContabil, regra_id)
     if not rule:
         raise HTTPException(404, "Regra não encontrada")
-    rule.ativo = False
-    release_rule_entries([rule.id], db)
-    for match in db.query(Correspondencia).filter_by(regra_contabil_id=rule.id):
-        match.regra_contabil_id = None
-    for reconciliation in db.query(Conciliacao).filter_by(cliente_id=rule.cliente_id, banco=rule.banco):
-        apply_accounting_rules(reconciliation, db)
-    db.commit()
-    return {}
+    try:
+        affected = delete_rule_globally(rule, db)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"periodos_afetados": affected}
 
 
 @router.delete("/conciliacoes/{conciliacao_id}/regras-contabeis")
@@ -919,17 +992,22 @@ def delete_all_accounting_rules(conciliacao_id: str, db: Session = Depends(get_d
     for rule in rules:
         rule.ativo = False
     if rule_ids:
+        db.query(RegraContabilExcecao).filter(RegraContabilExcecao.regra_contabil_id.in_(rule_ids)).delete(synchronize_session=False)
         release_rule_entries(rule_ids, db)
         for match in db.query(Correspondencia).filter(Correspondencia.regra_contabil_id.in_(rule_ids)):
             match.regra_contabil_id = None
-    for item in scoped_reconciliations(reconciliation, db):
-        if item.banco == reconciliation.banco:
-            apply_accounting_rules(item, db)
-    db.commit()
+    try:
+        for item in scoped_reconciliations(reconciliation, db):
+            if item.banco == reconciliation.banco:
+                apply_accounting_rules(item, db)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return {"regras": accounting_rules(conciliacao_id, db)}
 
 
-def accounting_csv_response(conciliacao_id: str, db: Session, only_others: bool = False):
+def accounting_csv_response(conciliacao_id: str, db: Session):
     reconciliation = reconciliation_or_404(conciliacao_id, db)
     account = db.query(ContaBancaria).filter_by(cliente_id=reconciliation.cliente_id, banco=reconciliation.banco).first()
     if not account or not account.conta_contabil.strip():
@@ -944,7 +1022,7 @@ def accounting_csv_response(conciliacao_id: str, db: Session, only_others: bool 
     output = io.StringIO(newline="")
     writer = csv.writer(output, delimiter=";", lineterminator="\n")
     writer.writerow(["Data", "Debito", "Credito", "Historico", "Valor", "Complemento"])
-    entries = integrity["lancamentos_outros"] if only_others else integrity["lancamentos_validos"]
+    entries = integrity["lancamentos_validos"]
     rows = []
     for entry in entries:
         match = db.get(Correspondencia, entry.correspondencia_id)
@@ -962,8 +1040,7 @@ def accounting_csv_response(conciliacao_id: str, db: Session, only_others: bool 
         ])
     period = reconciliation.data_inicio.strftime("%m%y")
     bank_account = re.sub(r"\D", "", accounting_code(account.conta_contabil)) or "conta_bancaria"
-    suffix = "_outros" if only_others else ""
-    filename = f"{period}{bank_account}{suffix}.csv"
+    filename = f"{period}{bank_account}.csv"
     return Response(output.getvalue().encode("utf-8-sig"), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
@@ -976,11 +1053,6 @@ def accounting_code(value: str) -> str:
 @router.get("/conciliacoes/{conciliacao_id}/lancamentos-contabeis.csv")
 def accounting_csv(conciliacao_id: str, db: Session = Depends(get_db)):
     return accounting_csv_response(conciliacao_id, db)
-
-
-@router.get("/conciliacoes/{conciliacao_id}/lancamentos-contabeis-outros.csv")
-def accounting_other_csv(conciliacao_id: str, db: Session = Depends(get_db)):
-    return accounting_csv_response(conciliacao_id, db, only_others=True)
 
 
 @router.get("/conciliacoes/{conciliacao_id}/lancamentos-contabeis.pdf")
@@ -1022,7 +1094,7 @@ def accounting_pdf(conciliacao_id: str, db: Session = Depends(get_db)):
             page.insert_text((x, y), label, fontsize=7, fontname="hebo")
         y += 12
 
-    def table_row(values: list[str]):
+    def table_row(values: list[str], italic: bool = False):
         nonlocal page, y
         fragments = [textwrap.wrap(value, width=width) or [""] for value, (_, _, width) in zip(values, columns)]
         height = max(len(parts) for parts in fragments) * 10 + 3
@@ -1033,7 +1105,7 @@ def accounting_pdf(conciliacao_id: str, db: Session = Depends(get_db)):
         for index, parts in enumerate(fragments):
             x = columns[index][0]
             for row, part in enumerate(parts):
-                page.insert_text((x, y + row * 10), part, fontsize=7, fontname="helv")
+                page.insert_text((x, y + row * 10), part, fontsize=7, fontname="helvi" if italic else "helv")
         y += height
 
     line("Relatório de lançamentos contábeis", 15, True)
@@ -1071,7 +1143,7 @@ def accounting_pdf(conciliacao_id: str, db: Session = Depends(get_db)):
             accounting_code(entry.historico),
             value,
             entry.complemento or (rule.complemento if rule else ""),
-        ])
+        ], italic=is_other)
     if current_month:
         line(f"Subtotal {months[current_month[1] - 1]}: Bancários R$ {month_bank:,.2f} | Outros R$ {month_other:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), 8, True)
     line("", 5)
@@ -1265,7 +1337,9 @@ def reconcile(conciliacao_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/conciliacoes/{conciliacao_id}/resultado")
-def result(conciliacao_id: str, db: Session = Depends(get_db)):
+def result(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPIResponse = None):
+    if response:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     matches = db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id).all()
     rows = []
     def money(value):
@@ -1347,7 +1421,9 @@ def save_accounting_items(conciliacao_id: str, correspondencia_id: str, payload:
 
 
 @router.get("/conciliacoes/{conciliacao_id}/documentos-nao-utilizados")
-def unused_documents(conciliacao_id: str, db: Session = Depends(get_db)):
+def unused_documents(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPIResponse = None):
+    if response:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     reconciliation = db.get(Conciliacao, conciliacao_id)
     matches = db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id).all()
     used_receipts = {item.comprovante_id for item in matches if item.comprovante_id}
@@ -1363,7 +1439,9 @@ def unused_documents(conciliacao_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/conciliacoes/{conciliacao_id}/revisao")
-def review(conciliacao_id: str, db: Session = Depends(get_db)):
+def review(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPIResponse = None):
+    if response:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     def base(record, fields):
         return {"id": record.id, "arquivo_id": record.arquivo_id, "pagina": record.pagina_numero, "revisao": getattr(record, "status_revisao", record.status if hasattr(record, "status") else ""), **fields}
 

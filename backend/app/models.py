@@ -206,6 +206,15 @@ class RegraContabil(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class RegraContabilExcecao(Base):
+    __tablename__ = "regras_contabeis_excecoes"
+    __table_args__ = (UniqueConstraint("regra_contabil_id", "conciliacao_id", name="uq_regra_excecao_conciliacao"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    regra_contabil_id: Mapped[str] = mapped_column(ForeignKey("regras_contabeis.id"), index=True)
+    conciliacao_id: Mapped[str] = mapped_column(ForeignKey("conciliacoes.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class ContaBancaria(Base):
     __tablename__ = "contas_bancarias"
     __table_args__ = (UniqueConstraint("cliente_id", "banco", name="uq_contas_bancarias_cliente_banco"),)

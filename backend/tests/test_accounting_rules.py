@@ -3,14 +3,14 @@ from decimal import Decimal
 
 import pytest
 import fitz
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.api.routes import RegraContabilInput, accounting_csv, accounting_integrity, accounting_other_csv, accounting_pdf, accounting_rules, apply_accounting_rules, create_accounting_rule, delete_accounting_rule, delete_all_accounting_rules, rule_matches_movement, update_accounting_rule
+from app.api.routes import RegraContabilInput, accounting_csv, accounting_integrity, accounting_pdf, accounting_rules, apply_accounting_rules, create_accounting_rule, delete_accounting_rule, delete_accounting_rule_for_reconciliation, delete_all_accounting_rules, ignore_rule_in_period, result, restore_rule_in_period, review, rule_matches_movement, unused_documents, update_accounting_rule
 import app.api.routes as routes
 from app.core.database import Base
-from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, RegraContabil
+from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, RegraContabil, RegraContabilExcecao
 from app.services.normalization import normalize_name
 
 
@@ -241,6 +241,40 @@ def test_deleting_saved_rule_recalculates_its_pending_suggestion():
     assert len(accounting_rules(reconciliation.id, session)["pendentes"]) == 1
 
 
+def test_ignoring_global_rule_only_removes_it_from_current_period_and_can_restore():
+    session, reconciliation, _ = rules_session()
+    created = create_accounting_rule(reconciliation.id, rule_input(), session)
+
+    removed = ignore_rule_in_period(reconciliation.id, created["id"], session)
+
+    rule = session.get(RegraContabil, created["id"])
+    assert rule.ativo is True
+    assert session.query(RegraContabilExcecao).filter_by(regra_contabil_id=rule.id, conciliacao_id=reconciliation.id).count() == 1
+    assert removed["regras"]["ignoradas"]
+    assert accounting_rules(reconciliation.id, session)["salvas"] == []
+    assert len(accounting_rules(reconciliation.id, session)["pendentes"]) == 1
+    apply_accounting_rules(reconciliation, session)
+    assert accounting_rules(reconciliation.id, session)["salvas"] == []
+
+    restored = restore_rule_in_period(reconciliation.id, created["id"], session)
+
+    assert "restaurada" in restored["message"]
+    assert session.query(RegraContabilExcecao).filter_by(regra_contabil_id=rule.id, conciliacao_id=reconciliation.id).count() == 0
+    assert len(accounting_rules(reconciliation.id, session)["salvas"]) == 1
+
+
+def test_global_deletion_returns_affected_periods_and_removes_period_exceptions():
+    session, reconciliation, _ = rules_session()
+    created = create_accounting_rule(reconciliation.id, rule_input(), session)
+    ignore_rule_in_period(reconciliation.id, created["id"], session)
+
+    deleted = delete_accounting_rule_for_reconciliation(reconciliation.id, created["id"], session)
+
+    assert deleted["periodos_afetados"] == 1
+    assert session.get(RegraContabil, created["id"]).ativo is False
+    assert session.query(RegraContabilExcecao).filter_by(regra_contabil_id=created["id"]).count() == 0
+
+
 def test_receipt_and_statement_triggers_must_both_match_when_filtering_pending():
     session, reconciliation, movement = rules_session("TRANSFERENCIA AGENDADA")
     receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id="arquivo", pagina_numero=1, tipo_operacao="Transferência", favorecido="Maria Luzirda C Miranda", beneficiario_final="Destino Final")
@@ -294,22 +328,31 @@ def test_csv_is_blocked_when_integrity_reports_an_unbalanced_reason(monkeypatch)
         accounting_csv(reconciliation.id, session)
 
 
-def test_discount_is_accounted_as_other_and_exported_in_its_own_csv():
+def test_dynamic_reconciliation_endpoints_are_never_cached():
+    session, reconciliation, _ = rules_session()
+
+    for endpoint in (result, review, unused_documents):
+        response = Response()
+        endpoint(reconciliation.id, session, response)
+        assert response.headers["cache-control"] == "no-store, no-cache, must-revalidate"
+
+
+def test_discount_is_accounted_as_other_and_exported_in_main_csv():
     session, reconciliation, movement = rules_session()
     match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id)
     session.add(match); session.flush()
     session.add_all([
-        LancamentoContabil(correspondencia_id=match.id, componente="VALOR_COBRADO", valor=Decimal("12.50"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento", status="editado_manual"),
-        LancamentoContabil(correspondencia_id=match.id, componente="DESCONTO", efeito_no_total="SOMA", valor=Decimal("2.50"), conta_debito="Descontos", conta_credito="Despesa", historico="Desconto obtido", status="editado_manual"),
+        LancamentoContabil(correspondencia_id=match.id, componente="VALOR_COBRADO", valor=Decimal("12.50"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento", ordem=1, status="editado_manual"),
+        LancamentoContabil(correspondencia_id=match.id, componente="DESCONTO", efeito_no_total="SOMA", valor=Decimal("2.50"), conta_debito="Descontos", conta_credito="Despesa", historico="Desconto obtido", ordem=2, status="editado_manual"),
     ])
     session.add(ContaBancaria(cliente_id=reconciliation.cliente_id, banco=reconciliation.banco, conta_contabil="Banco"))
     session.commit()
 
     integrity = accounting_integrity(reconciliation, session)
-    other_csv = accounting_other_csv(reconciliation.id, session).body.decode("utf-8-sig")
+    csv = accounting_csv(reconciliation.id, session).body.decode("utf-8-sig")
 
     assert (integrity["debito"], integrity["credito"], integrity["outros"]) == (Decimal("0.00"), Decimal("12.50"), Decimal("2.50"))
-    assert other_csv.splitlines() == ["Data;Debito;Credito;Historico;Valor;Complemento", "02/01/2024;Descontos;Despesa;Desconto obtido;2.50;"]
+    assert csv.splitlines() == ["Data;Debito;Credito;Historico;Valor;Complemento", "02/01/2024;Despesa;Banco;Pagamento;12.50;", "02/01/2024;Descontos;Despesa;Desconto obtido;2.50;"]
 
 
 def test_csv_is_ordered_by_date_and_names_the_client_bank_account():

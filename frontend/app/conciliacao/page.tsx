@@ -258,9 +258,13 @@ function AdvancedSummary({
   );
 }
 
-function OtherSummary({ debit, credit, total }: { debit: number; credit: number; total: number }) {
+function OtherSummary({ previous, debit, credit, total }: { previous: number; debit: number; credit: number; total: number }) {
   const money = (value: number) => value.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  return <div className="flex items-center gap-3"><div className="w-12 shrink-0 text-xs font-semibold text-violet-700">Outros</div><div className="grid flex-1 grid-cols-3 gap-1"><div className="flex items-baseline justify-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 px-2 py-1 text-center text-indigo-800"><span className="text-[9px] uppercase text-indigo-600">Débito:</span><strong className="text-xs">{money(debit)}</strong></div><div className="flex items-baseline justify-center gap-1 rounded-md border border-fuchsia-200 bg-fuchsia-50 px-2 py-1 text-center text-fuchsia-800"><span className="text-[9px] uppercase text-fuchsia-600">Crédito:</span><strong className="text-xs">{money(credit)}</strong></div><div className="flex items-baseline justify-center gap-1 rounded-md border border-violet-300 bg-violet-100 px-2 py-1 text-center text-violet-900"><span className="text-[9px] uppercase text-violet-700">Total:</span><strong className="text-xs">{money(total)}</strong></div></div></div>;
+  return <div className="flex items-center gap-3"><div className="w-12 shrink-0 text-xs font-semibold text-violet-700">Outros</div><div className="grid flex-1 grid-cols-2 gap-1 sm:grid-cols-4"><div className="flex items-baseline justify-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-center text-slate-700"><span className="text-[9px] uppercase text-slate-500">Anterior:</span><strong className="text-xs">{money(previous)}</strong></div><div className="flex items-baseline justify-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 px-2 py-1 text-center text-indigo-800"><span className="text-[9px] uppercase text-indigo-600">Débito:</span><strong className="text-xs">{money(debit)}</strong></div><div className="flex items-baseline justify-center gap-1 rounded-md border border-fuchsia-200 bg-fuchsia-50 px-2 py-1 text-center text-fuchsia-800"><span className="text-[9px] uppercase text-fuchsia-600">Crédito:</span><strong className="text-xs">{money(credit)}</strong></div><div className="flex items-baseline justify-center gap-1 rounded-md border border-violet-300 bg-violet-100 px-2 py-1 text-center text-violet-900"><span className="text-[9px] uppercase text-violet-700">Atual:</span><strong className="text-xs">{money(total)}</strong></div></div></div>;
+}
+
+function LoadingValuesOverlay() {
+  return <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/15 p-4 backdrop-blur-sm"><div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white px-5 py-4 text-sm font-semibold text-slate-700 shadow-xl"><RefreshCw className="animate-spin text-teal-700" size={20} />Aguarde, carregando valores...</div></div>;
 }
 
 function AdvancedOverview({
@@ -330,11 +334,11 @@ function AdvancedOverview({
             Number(summary?.razao.debito ?? 0)
           }
         />
-        <OtherSummary debit={Number(summary?.razao.outros_debito ?? 0)} credit={Number(summary?.razao.outros_credito ?? 0)} total={Number(summary?.razao.outros ?? 0)} />
+        <OtherSummary previous={0} debit={Number(summary?.razao.outros_debito ?? 0)} credit={Number(summary?.razao.outros_credito ?? 0)} total={Number(summary?.razao.outros ?? 0)} />
       </div>
       <div className="text-right text-[10px] text-slate-500">
         Gera o CSV pronto para importar no ERP.
-        {csvBlocked ? <span title={`Revise os lançamentos incompletos: ${data.integridade.movimentos_incompletos.map((item) => item.data).join(", ")}`} className="mt-1 flex cursor-not-allowed items-center rounded bg-slate-300 px-2 py-1 text-[10px] font-semibold text-slate-600"><Download className="mr-1" size={12} />CSV bloqueado</span> : <><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`} className="mt-1 flex items-center rounded bg-teal-700 px-2 py-1 text-[10px] font-semibold text-white"><Download className="mr-1" size={12} />Gerar CSV</a><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis-outros.csv`} className="mt-1 flex items-center rounded border border-violet-300 bg-violet-50 px-2 py-1 text-[10px] font-semibold text-violet-800"><Download className="mr-1" size={12} />CSV Outros</a><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.pdf`} className="mt-1 flex items-center rounded border border-slate-300 bg-white px-2 py-1 text-[10px] font-semibold text-slate-700"><FileText className="mr-1" size={12} />Gerar PDF</a></>}
+        {csvBlocked ? <span title={`Revise os lançamentos incompletos: ${data.integridade.movimentos_incompletos.map((item) => item.data).join(", ")}`} className="mt-1 flex cursor-not-allowed items-center rounded bg-slate-300 px-2 py-1 text-[10px] font-semibold text-slate-600"><Download className="mr-1" size={12} />CSV bloqueado</span> : <><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`} className="mt-1 flex items-center rounded bg-teal-700 px-2 py-1 text-[10px] font-semibold text-white"><Download className="mr-1" size={12} />Gerar CSV</a><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.pdf`} className="mt-1 flex items-center rounded border border-slate-300 bg-white px-2 py-1 text-[10px] font-semibold text-slate-700"><FileText className="mr-1" size={12} />Gerar PDF</a></>}
       </div>
     </section>
   );
@@ -386,6 +390,8 @@ type SavedRule = {
   cobertos: number;
   movimentos?: { data: string; historico: string; texto_extrato?: string; texto_comprovante?: string; tem_comprovante?: boolean; valor: string; tipo_componente?: string; natureza: string; natureza_contabil: string }[];
 };
+
+type IgnoredRule = Pick<SavedRule, "id" | "gatilho" | "gatilho_comprovante" | "tipo_componente" | "historico">;
 
 function LegacyAdvancedRulesPanel({
   reconciliationId,
@@ -635,15 +641,18 @@ function LegacyAdvancedRulesPanel({
 
 function AdvancedRulesPanel({
   reconciliationId,
+  version,
   onView,
   onRulesChanged,
 }: {
   reconciliationId: string;
+  version: number;
   onView: (viewer: Viewer) => void;
   onRulesChanged: () => void;
 }) {
   const [pending, setPending] = useState<PendingRule[]>([]);
   const [saved, setSaved] = useState<SavedRule[]>([]);
+  const [ignored, setIgnored] = useState<IgnoredRule[]>([]);
   const [account, setAccount] = useState("Sem conta");
   const [drafts, setDrafts] = useState<Record<string, Record<string, string>>>(
     {},
@@ -663,16 +672,18 @@ function AdvancedRulesPanel({
   const [message, setMessage] = useState("");
   const [busyRuleId, setBusyRuleId] = useState<string | null>(null);
   const [confirmClearAll, setConfirmClearAll] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<SavedRule | null>(null);
   const [csvPermitted, setCsvPermitted] = useState(true);
   const [catalog, setCatalog] = useState<{
     contas: string[];
     historicos: string[];
   }>({ contas: [], historicos: [] });
   const loadRequest = useRef(0);
-  function applyRulesSnapshot(rules: { pendentes: PendingRule[]; salvas: SavedRule[]; integridade?: { csv_permitido?: boolean } }) {
+  function applyRulesSnapshot(rules: { pendentes: PendingRule[]; salvas: SavedRule[]; ignoradas?: IgnoredRule[]; integridade?: { csv_permitido?: boolean } }) {
     loadRequest.current += 1;
     setPending(rules.pendentes.map((item) => ({ ...item, historico: cleanHistory(item.historico) })));
     setSaved(rules.salvas.map((item) => ({ ...item, historico: cleanHistory(item.historico) })));
+    setIgnored(rules.ignoradas ?? []);
     setCsvPermitted(rules.integridade?.csv_permitido !== false);
   }
   async function load() {
@@ -699,11 +710,19 @@ function AdvancedRulesPanel({
       .then((data) => {
         if (data) setCatalog(data);
       });
-  }, [reconciliationId]);
+  }, [reconciliationId, version]);
   const value = (id: string, name: string, fallback = "") =>
     drafts[id]?.[name] ?? fallback;
   const change = (id: string, name: string, input: string) =>
     setDrafts((items) => ({ ...items, [id]: { ...items[id], [name]: input } }));
+  const errorMessage = async (response: Response, fallback: string) => {
+    try {
+      const error = await response.json();
+      return error.detail ?? error.message ?? fallback;
+    } catch {
+      return fallback;
+    }
+  };
   const defaults = (item: PendingRule | SavedRule) =>
     "gatilho" in item
       ? {
@@ -774,22 +793,48 @@ function AdvancedRulesPanel({
       if (result.regras) applyRulesSnapshot(result.regras);
       else await load();
       onRulesChanged();
+    } catch {
+      setMessage("Não foi possível salvar a regra. Verifique a conexão e tente novamente.");
     } finally {
       setBusyRuleId(null);
     }
   }
-  async function remove(id: string) {
+  async function remove(scope: "periodo" | "global") {
+    if (!deleteTarget) return;
     if (busyRuleId) return;
-    setBusyRuleId(id);
+    setBusyRuleId(deleteTarget.id);
     try {
-      const response = await fetch(`${API}/api/regras-contabeis/${id}`, {
+      const path = scope === "periodo"
+        ? `${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/${deleteTarget.id}/periodo`
+        : `${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/${deleteTarget.id}`;
+      const response = await fetch(path, {
         method: "DELETE",
       });
-      if (!response.ok) return setMessage("Não foi possível excluir a regra.");
+      if (!response.ok) return setMessage(await errorMessage(response, "Não foi possível excluir a regra."));
       const result = await response.json();
       if (result.regras) applyRulesSnapshot(result.regras);
       else await load();
+      setDeleteTarget(null);
+      setMessage(result.message ?? "Regra excluída.");
       onRulesChanged();
+    } catch {
+      setMessage("Não foi possível concluir a exclusão. Verifique a conexão e tente novamente.");
+    } finally {
+      setBusyRuleId(null);
+    }
+  }
+  async function restore(id: string) {
+    if (busyRuleId) return;
+    setBusyRuleId(id);
+    try {
+      const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/${id}/periodo/excecao`, { method: "DELETE" });
+      if (!response.ok) return setMessage(await errorMessage(response, "Não foi possível restaurar a regra."));
+      const result = await response.json();
+      if (result.regras) applyRulesSnapshot(result.regras);
+      setMessage(result.message ?? "Regra restaurada neste período.");
+      onRulesChanged();
+    } catch {
+      setMessage("Não foi possível restaurar a regra. Verifique a conexão e tente novamente.");
     } finally {
       setBusyRuleId(null);
     }
@@ -799,13 +844,15 @@ function AdvancedRulesPanel({
     setBusyRuleId("all");
     try {
       const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis`, { method: "DELETE" });
-      if (!response.ok) return setMessage("Não foi possível limpar as regras.");
+      if (!response.ok) return setMessage(await errorMessage(response, "Não foi possível limpar as regras."));
       const result = await response.json();
       setConfirmClearAll(false);
       setMessage("Todas as regras deste banco foram limpas e os lançamentos foram recalculados.");
       if (result.regras) applyRulesSnapshot(result.regras);
       else await load();
       onRulesChanged();
+    } catch {
+      setMessage("Não foi possível limpar as regras. Verifique a conexão e tente novamente.");
     } finally {
       setBusyRuleId(null);
     }
@@ -931,7 +978,7 @@ function AdvancedRulesPanel({
           </button>
           {existing && (
             <button
-              onClick={() => remove(item.id)}
+              onClick={() => setDeleteTarget(item as SavedRule)}
               className="ml-1 rounded border border-red-200 px-2 py-1 text-red-700"
             >
               Excluir
@@ -1226,7 +1273,7 @@ function AdvancedRulesPanel({
               {canSave && <button title={existing ? "Atualizar regra" : "Salvar regra"} aria-label={existing ? "Atualizar regra" : "Salvar regra"} disabled={busyRuleId === item.id} onClick={() => saveRule(item, existing)} className="rounded bg-teal-700 px-2 py-1 text-white disabled:cursor-wait disabled:opacity-60">
                 {busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : existing ? <RefreshCw size={14} /> : <CheckCircle2 size={14} />}
               </button>}
-              {existing && <button title="Excluir regra" aria-label="Excluir regra" disabled={busyRuleId === item.id} onClick={() => remove(item.id)} className="ml-1 rounded border border-red-200 px-2 py-1 text-red-700 disabled:cursor-wait disabled:opacity-60"><Trash2 size={14} /></button>}
+              {existing && <button title="Excluir regra" aria-label="Excluir regra" disabled={busyRuleId === item.id} onClick={() => setDeleteTarget(item as SavedRule)} className="ml-1 rounded border border-red-200 px-2 py-1 text-red-700 disabled:cursor-wait disabled:opacity-60">{busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : <Trash2 size={14} />}</button>}
             </>
           )}
         </td>}
@@ -1282,7 +1329,7 @@ function AdvancedRulesPanel({
         >
           Salvar conta
         </button>
-        {csvPermitted ? <><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`} className="rounded bg-teal-700 px-2 py-1 text-[11px] font-semibold text-white">Gerar CSV</a><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis-outros.csv`} className="rounded border border-violet-300 bg-violet-50 px-2 py-1 text-[11px] font-semibold text-violet-800">CSV Outros</a><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.pdf`} className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px] font-semibold text-slate-700">Gerar PDF</a></> : <span className="cursor-not-allowed rounded bg-slate-200 px-2 py-1 text-[11px] font-semibold text-slate-500">CSV bloqueado</span>}
+        {csvPermitted ? <><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`} className="rounded bg-teal-700 px-2 py-1 text-[11px] font-semibold text-white">Gerar CSV</a><a href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.pdf`} className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px] font-semibold text-slate-700">Gerar PDF</a></> : <span className="cursor-not-allowed rounded bg-slate-200 px-2 py-1 text-[11px] font-semibold text-slate-500">CSV bloqueado</span>}
       </div>
       <div className="flex flex-wrap items-center gap-2">
         <button
@@ -1310,10 +1357,16 @@ function AdvancedRulesPanel({
             <input list="catalogo-contas" value={account} onChange={(e) => setAccount(e.target.value)} className="w-52 rounded border bg-white px-2 py-1 text-xs" placeholder="Ex.: 33 - Banco Santander S/A" />
           </label>
           <button title="Salvar conta" aria-label="Salvar conta" onClick={saveAccount} className="rounded border border-teal-700 p-1.5 text-teal-800"><CheckCircle2 size={14}/></button>
-          {csvPermitted ? <><a title="Gerar CSV" aria-label="Gerar CSV" href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`} className="rounded bg-teal-700 p-1.5 text-white"><Download size={14}/></a><a title="CSV Outros" aria-label="CSV Outros" href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis-outros.csv`} className="rounded border border-violet-300 bg-violet-50 p-1.5 text-violet-800"><Download size={14}/></a><a title="Gerar PDF" aria-label="Gerar PDF" href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.pdf`} className="rounded border border-slate-300 bg-white p-1.5 text-slate-700"><FileText size={14}/></a></> : <span title="CSV bloqueado por integridade" className="cursor-not-allowed rounded bg-slate-200 p-1.5 text-slate-500"><Download size={14}/></span>}
+          {csvPermitted ? <><a title="Gerar CSV" aria-label="Gerar CSV" href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`} className="rounded bg-teal-700 p-1.5 text-white"><Download size={14}/></a><a title="Gerar PDF" aria-label="Gerar PDF" href={`${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.pdf`} className="rounded border border-slate-300 bg-white p-1.5 text-slate-700"><FileText size={14}/></a></> : <span title="CSV bloqueado por integridade" className="cursor-not-allowed rounded bg-slate-200 p-1.5 text-slate-500"><Download size={14}/></span>}
         </div>
       </div>
       {message && <p className="text-xs text-teal-800">{message}</p>}
+      {ignored.length > 0 && <section className="rounded-md border border-violet-200 bg-violet-50 p-3 text-xs text-violet-950">
+        <div className="flex items-center justify-between gap-3"><div><strong>Regras ignoradas neste período</strong><p className="mt-0.5 text-violet-800">Elas continuam ativas nos demais períodos deste cliente e banco.</p></div><span className="rounded bg-violet-200 px-2 py-0.5 font-semibold">{ignored.length}</span></div>
+        <div className="mt-2 divide-y divide-violet-200">
+          {ignored.map((rule) => <div className="flex items-center justify-between gap-3 py-2" key={rule.id}><span className="min-w-0 truncate"><strong>{rule.gatilho || rule.historico}</strong>{rule.tipo_componente ? ` · ${rule.tipo_componente}` : ""}</span><button disabled={busyRuleId === rule.id} onClick={() => restore(rule.id)} className="shrink-0 rounded border border-violet-300 bg-white px-2 py-1 font-semibold text-violet-800 disabled:opacity-60">{busyRuleId === rule.id ? "Restaurando..." : "Restaurar regra"}</button></div>)}
+        </div>
+      </section>}
       <div className="max-h-[calc(100dvh-330px)] overflow-auto rounded border overscroll-contain">
         <table className={`w-full text-left text-xs ${view === "saved" ? "table-fixed" : ""}`}>
           <thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase text-slate-500 shadow-sm">
@@ -1453,6 +1506,17 @@ function AdvancedRulesPanel({
             <button disabled={busyRuleId === "all"} onClick={() => setConfirmClearAll(false)} className="rounded border px-3 py-1.5 text-xs font-semibold text-slate-700">Cancelar</button>
             <button disabled={busyRuleId === "all"} onClick={clearAllRules} className="rounded bg-red-700 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-60">{busyRuleId === "all" ? "Limpando..." : "Sim, limpar todas"}</button>
           </div>
+        </div>
+      </div>}
+      {deleteTarget && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
+        <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl">
+          <h3 className="text-sm font-semibold text-slate-900">Esta regra é global</h3>
+          <p className="mt-2 text-xs leading-5 text-slate-600">A regra <strong>{deleteTarget.gatilho || deleteTarget.historico}</strong> está disponível para todas as conciliações deste cliente e banco. Escolha onde ela deve ser removida.</p>
+          <div className="mt-4 space-y-2">
+            <button disabled={busyRuleId === deleteTarget.id} onClick={() => remove("periodo")} className="w-full rounded border border-violet-300 bg-violet-50 px-3 py-2 text-left text-xs font-semibold text-violet-900 disabled:opacity-60">{busyRuleId === deleteTarget.id ? "Removendo..." : "Remover somente deste período"}<span className="mt-0.5 block font-normal text-violet-700">Os demais meses continuam usando a regra.</span></button>
+            <button disabled={busyRuleId === deleteTarget.id} onClick={() => remove("global")} className="w-full rounded border border-red-200 bg-red-50 px-3 py-2 text-left text-xs font-semibold text-red-800 disabled:opacity-60">{busyRuleId === deleteTarget.id ? "Excluindo..." : "Excluir de todos os períodos"}<span className="mt-0.5 block font-normal text-red-700">A regra será desativada para este cliente e banco.</span></button>
+          </div>
+          <div className="mt-4 flex justify-end"><button disabled={busyRuleId === deleteTarget.id} onClick={() => setDeleteTarget(null)} className="rounded border px-3 py-1.5 text-xs font-semibold text-slate-700">Cancelar</button></div>
         </div>
       </div>}
     </section>
@@ -2015,7 +2079,7 @@ function EditableResultTable({
                               <tbody>
                                 {itemsFor(row).map((item) => (
                                   <tr
-                                    className="border-t align-top"
+                                    className={`border-t align-top ${item.efeito_no_total === "OUTROS" || ["DESCONTO", "ABATIMENTO", "DESCONTO_ABATIMENTO"].includes(item.componente) ? "bg-violet-50/70 italic text-violet-950" : ""}`}
                                     key={item.id}
                                   >
                                     <td className="px-3 py-2">
@@ -2023,6 +2087,7 @@ function EditableResultTable({
                                         {item.componente}
                                       </strong>
                                       <span>{item.descricao}</span>
+                                      {(item.efeito_no_total === "OUTROS" || ["DESCONTO", "ABATIMENTO", "DESCONTO_ABATIMENTO"].includes(item.componente)) && <span className="ml-1 rounded bg-violet-200 px-1 py-0.5 text-[9px] font-semibold not-italic text-violet-900">Outros</span>}
                                     </td>
                                     <td className="whitespace-nowrap px-3 py-2">
                                       <input
@@ -2165,6 +2230,8 @@ function ConciliacaoFlow({
       arquivos: [],
     }),
     [results, setResults] = useState<ResultRow[] | null>(null),
+    [reviewLoading, setReviewLoading] = useState(false),
+    [resultsLoading, setResultsLoading] = useState(false),
     [unused, setUnused] = useState<Unused>({
       comprovantes: [],
       rfb: [],
@@ -2175,7 +2242,8 @@ function ConciliacaoFlow({
     [message, setMessage] = useState(""),
     [isReconciling, setIsReconciling] = useState(false),
     [rulesVersion, setRulesVersion] = useState(0),
-    [resultsVersion, setResultsVersion] = useState(0);
+    [resultsVersion, setResultsVersion] = useState(0),
+    [reviewVersion, setReviewVersion] = useState(0);
   const resultRequest = useRef(0);
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -2226,12 +2294,34 @@ function ConciliacaoFlow({
   }, [initialBank, initialClientId]);
   useEffect(() => {
     if (!reconciliationId) return;
-    fetch(`${API}/api/conciliacoes/${reconciliationId}/revisao`)
+    let cancelled = false;
+    setReviewLoading(true);
+    fetch(`${API}/api/conciliacoes/${reconciliationId}/revisao`, { cache: "no-store" })
       .then((response) => (response.ok ? response.json() : null))
       .then((data) => {
-        if (data) setReview(data);
+        if (!cancelled && data) setReview(data);
+      })
+      .finally(() => {
+        if (!cancelled) setReviewLoading(false);
       });
-  }, [reconciliationId]);
+    return () => { cancelled = true; };
+  }, [reconciliationId, reviewVersion]);
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState !== "visible") return;
+      setReviewVersion((version) => version + 1);
+      setRulesVersion((version) => version + 1);
+      setResultsVersion((version) => version + 1);
+    };
+    window.addEventListener("focus", refresh);
+    window.addEventListener("pageshow", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      window.removeEventListener("pageshow", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, []);
   useEffect(() => {
     if (!clientId) {
       setSelectedBankAccount(null);
@@ -2257,21 +2347,31 @@ function ConciliacaoFlow({
     if (
       !reconciliationId ||
       !["Conciliação", "Conciliação Avançada"].includes(activeTab)
-    )
+    ) {
+      setResultsLoading(false);
       return;
+    }
     const request = ++resultRequest.current;
+    const controller = new AbortController();
+    setResultsLoading(true);
     Promise.all([
-      fetch(`${API}/api/conciliacoes/${reconciliationId}/resultado`).then(
+      fetch(`${API}/api/conciliacoes/${reconciliationId}/resultado`, { cache: "no-store", signal: controller.signal }).then(
         (response) => (response.ok ? response.json() : []),
       ),
       fetch(
         `${API}/api/conciliacoes/${reconciliationId}/documentos-nao-utilizados`,
+        { cache: "no-store", signal: controller.signal },
       ).then((response) => (response.ok ? response.json() : null)),
     ]).then(([storedResults, storedUnused]) => {
       if (request !== resultRequest.current) return;
       setResults(Array.isArray(storedResults) ? storedResults : []);
       if (storedUnused) setUnused(storedUnused);
+    }).catch((error) => {
+      if (error.name !== "AbortError" && request === resultRequest.current) setMessage("Não foi possível carregar os valores.");
+    }).finally(() => {
+      if (request === resultRequest.current) setResultsLoading(false);
     });
+    return () => controller.abort();
   }, [activeTab, reconciliationId, resultsVersion]);
   async function createClient() {
     const response = await fetch(`${API}/api/clientes`, {
@@ -2554,6 +2654,7 @@ function ConciliacaoFlow({
           />
         )}
       </>
+      {(reviewLoading || resultsLoading) && <LoadingValuesOverlay />}
       <main className="workspace-main mx-auto max-w-[90rem] px-3 py-3 sm:px-4">
         <div className="mb-5 flex justify-center overflow-x-auto border-b text-sm">
           {[
@@ -2755,8 +2856,12 @@ function ConciliacaoFlow({
             />
             <AdvancedRulesPanel
               reconciliationId={reconciliationId}
+              version={rulesVersion}
               onView={setViewer}
-              onRulesChanged={() => setRulesVersion((version) => version + 1)}
+              onRulesChanged={() => {
+                setRulesVersion((version) => version + 1);
+                setResultsVersion((version) => version + 1);
+              }}
             />
           </div>
         )}
@@ -2807,7 +2912,10 @@ function ConciliacaoFlow({
             )}
             {results && results.length > 0 && (
               <>
-                <EditableResultTable rows={results} reconciliationId={reconciliationId} onView={setViewer} onSaved={() => setResultsVersion((version) => version + 1)} />
+                <EditableResultTable rows={results} reconciliationId={reconciliationId} onView={setViewer} onSaved={() => {
+                  setRulesVersion((version) => version + 1);
+                  setResultsVersion((version) => version + 1);
+                }} />
                 <section className="grid gap-3 md:grid-cols-2">
                   <div className="rounded-xl border bg-white p-4 text-sm">
                     <strong>Resumo dos comprovantes bancários</strong>

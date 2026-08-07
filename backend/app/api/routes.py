@@ -98,6 +98,14 @@ class RegraContabilInput(BaseModel):
     historico: str
     complemento: str = ""
     tipo_componente: str = ""
+    escopo: str = "periodo"
+
+
+class RegraContabilPreviaInput(BaseModel):
+    gatilho: str = ""
+    gatilho_comprovante: str = ""
+    natureza: str
+    tipo_componente: str = ""
 
 
 class ContaBancariaInput(BaseModel):
@@ -479,9 +487,9 @@ def tax_complement(entry: LancamentoContabil, match: Correspondencia, db: Sessio
         tax = "FGTS"
     else:
         return "", "", "", ""
-    competence = extract_competence(rfb.texto_original, rfb.competencia, rfb.periodo_apuracao) if rfb else extract_competence(receipt.texto_original if receipt else "")
+    competence = extract_competence(rfb.texto_original, rfb.competencia, rfb.periodo_apuracao) if rfb else ""
     origin = "Comprovante RFB" if rfb else "Comprovante bancário" if receipt else ""
-    complement = f"{tax} - COMPETÊNCIA {competence}" if competence else ""
+    complement = competence
     return tax, competence, complement, origin
 
 
@@ -522,10 +530,23 @@ def legacy_trigger_matches_receipt(rule: RegraContabil, history: str, receipt: C
     return bool(trigger_tokens & receipt_tokens)
 
 
+def rule_match_history(movement: MovimentoExtrato, receipt: Comprovante | None) -> str:
+    history = " ".join(item for item in [movement.historico, movement.nome_encontrado] if item)
+    if receipt and receipt.beneficiario_final:
+        if receipt.beneficiario and receipt.beneficiario.lower() in history.lower():
+            return re.sub(re.escape(receipt.beneficiario), receipt.beneficiario_final, history, flags=re.I)
+        return f"{movement.historico} {receipt.beneficiario_final}".strip()
+    return history
+
+
+def rule_component_key(component: str) -> str:
+    return "PRINCIPAL" if component in {"", "PRINCIPAL", "VALOR_COBRADO"} else component
+
+
 def rule_matches_movement(rule: RegraContabil, movement: MovimentoExtrato, receipt: Comprovante | None = None, component: str = "", rfb: ComprovanteRfb | None = None, rfb_items: list[ComprovanteRfbItem] | None = None) -> bool:
     trigger = rule.favorecido_normalizado
-    history = " ".join(item for item in [movement.historico, movement.nome_encontrado] if item)
-    component_matches = not component or (rule.tipo_componente == component if rule.tipo_componente else component in {"PRINCIPAL", "VALOR_COBRADO"})
+    history = rule_match_history(movement, receipt)
+    component_matches = not component or (rule_component_key(rule.tipo_componente) == rule_component_key(component) if rule.tipo_componente else rule_component_key(component) == "PRINCIPAL")
     receipt_source = receipt_trigger_text(receipt, rfb, rfb_items)
     receipt_trigger = normalize_name(rule.gatilho_comprovante_normalizado or "")
     receipt_tokens_match = not receipt_trigger or receipt_trigger in normalize_name(receipt_source) or set(receipt_trigger.split()) <= set(normalize_name(receipt_source).split())
@@ -586,11 +607,12 @@ def is_transfer_without_counterparty(movement: MovimentoExtrato) -> bool:
 def rule_payload(rule: RegraContabil, movements: list[MovimentoExtrato], receipts: dict[str, Comprovante], covered_entries: list[tuple[str, LancamentoContabil]]) -> dict:
     movement_by_id = {movement.id: movement for movement in movements}
     covered = [(movement_by_id[movement_id], entry) for movement_id, entry in covered_entries if movement_id in movement_by_id]
-    return {"id": rule.id, "gatilho": rule.favorecido_normalizado, "gatilho_comprovante": rule.gatilho_comprovante_normalizado, "natureza": normalize_rule_accounting_nature(rule.tipo_operacao), "tipo_componente": rule.tipo_componente, "conta_debito": rule.conta_debito, "conta_credito": rule.conta_credito, "historico": rule.historico, "complemento": rule.complemento, "banco_origem": rule.banco, "cobertos": len(covered), "movimentos": [{"data": movement.data.strftime("%d/%m/%Y") if movement.data else "—", "historico": " ".join(part for part in [movement.historico, movement.nome_encontrado] if part), "texto_extrato": " ".join(part for part in [movement.historico, movement.nome_encontrado] if part), "texto_comprovante": receipt_description(receipts.get(movement.id)), "tem_comprovante": bool(receipts.get(movement.id)), "valor": str(entry.valor or 0), "tipo_componente": entry.componente, "natureza": normalize_statement_nature(movement.natureza), "natureza_contabil": accounting_nature(movement.natureza)} for movement, entry in covered]}
+    return {"id": rule.id, "gatilho": rule.favorecido_normalizado, "gatilho_comprovante": rule.gatilho_comprovante_normalizado, "natureza": normalize_rule_accounting_nature(rule.tipo_operacao), "tipo_componente": rule.tipo_componente, "conta_debito": rule.conta_debito, "conta_credito": rule.conta_credito, "historico": rule.historico, "complemento": rule.complemento, "escopo": rule.escopo, "banco_origem": rule.banco, "cobertos": len(covered), "movimentos": [{"data": movement.data.strftime("%d/%m/%Y") if movement.data else "—", "historico": " ".join(part for part in [movement.historico, movement.nome_encontrado] if part), "texto_extrato": " ".join(part for part in [movement.historico, movement.nome_encontrado] if part), "texto_comprovante": receipt_description(receipts.get(movement.id)), "tem_comprovante": bool(receipts.get(movement.id)), "valor": str(entry.valor or 0), "tipo_componente": entry.componente, "natureza": normalize_statement_nature(movement.natureza), "natureza_contabil": accounting_nature(movement.natureza)} for movement, entry in covered]}
 
 
 def scoped_rules(reconciliation: Conciliacao, db: Session) -> list[RegraContabil]:
-    return db.query(RegraContabil).filter_by(cliente_id=reconciliation.cliente_id, tipo_fonte="extrato", ativo=True).order_by(RegraContabil.created_at.desc()).all()
+    rules = db.query(RegraContabil).filter_by(cliente_id=reconciliation.cliente_id, tipo_fonte="extrato", ativo=True).order_by(RegraContabil.created_at.desc()).all()
+    return [rule for rule in rules if rule.escopo == "global" or rule.conciliacao_id == reconciliation.id]
 
 
 def scoped_reconciliations(reconciliation: Conciliacao, db: Session) -> list[Conciliacao]:
@@ -650,7 +672,9 @@ def accounting_integrity(reconciliation: Conciliacao, db: Session) -> dict:
         for entry in completed:
             if is_other_accounting_entry(entry):
                 other += entry.valor
-                if accounting_nature(movement.natureza) == "Débito":
+                if entry.componente in {"DESCONTO", "ABATIMENTO", "DESCONTO_ABATIMENTO"}:
+                    other_debit += entry.valor
+                elif accounting_nature(movement.natureza) == "Débito":
                     other_debit += entry.valor
                 else:
                     other_credit += entry.valor
@@ -755,12 +779,7 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
         receipt = db.get(Comprovante, match.comprovante_id) if match and match.comprovante_id else None
         rfb = db.get(ComprovanteRfb, match.comprovante_rfb_id) if match and match.comprovante_rfb_id else None
         rfb_items = db.query(ComprovanteRfbItem).filter_by(comprovante_rfb_id=rfb.id).all() if rfb else []
-        history = " ".join(part for part in [item.historico, item.nome_encontrado] if part)
-        if receipt and receipt.beneficiario_final:
-            if receipt.beneficiario and receipt.beneficiario.lower() in history.lower():
-                history = re.sub(re.escape(receipt.beneficiario), receipt.beneficiario_final, history, flags=re.I)
-            else:
-                history = f"{item.historico} {receipt.beneficiario_final}".strip()
+        history = rule_match_history(item, receipt)
         shared_rule = next((rule for rule in rules if rule.banco != reconciliation.banco and rule_matches_movement(rule, item, receipt, component, rfb, rfb_items)), None)
         tariff_in_statement = bool(receipt and receipt.valor_tarifa and "TARIFA PIX" not in normalize_name(item.historico) and any(other.comprovante_id == receipt.id and other.movimento_extrato_id != item.id and "TARIFA PIX" in normalize_name(db.get(MovimentoExtrato, other.movimento_extrato_id).historico) for other in matches.values()))
         tariff_reference = bool(receipt and "TARIFA PIX" in normalize_name(item.historico))
@@ -816,21 +835,51 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
     }
 
 
-def rule_has_eligible_movement(rule: RegraContabil, reconciliation: Conciliacao, db: Session) -> bool:
+def rule_preview(rule: RegraContabil, reconciliation: Conciliacao, db: Session) -> list[dict]:
+    matches = []
     movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=reconciliation.id, ativo=True) if in_reconciliation_period(reconciliation, item)]
+    correspondences = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id).all()
+    match_by_movement = {item.movimento_extrato_id: item for item in correspondences}
+    match_ids = [item.id for item in correspondences]
+    receipt_ids = [item.comprovante_id for item in correspondences if item.comprovante_id]
+    rfb_ids = [item.comprovante_rfb_id for item in correspondences if item.comprovante_rfb_id]
+    receipts = {item.id: item for item in db.query(Comprovante).filter(Comprovante.id.in_(receipt_ids)).all()} if receipt_ids else {}
+    rfb_receipts = {item.id: item for item in db.query(ComprovanteRfb).filter(ComprovanteRfb.id.in_(rfb_ids)).all()} if rfb_ids else {}
+    entries_by_match: dict[str, list[LancamentoContabil]] = {item_id: [] for item_id in match_ids}
+    if match_ids:
+        for entry in db.query(LancamentoContabil).filter(LancamentoContabil.correspondencia_id.in_(match_ids)).all():
+            entries_by_match[entry.correspondencia_id].append(entry)
+    rfb_items_by_receipt: dict[str, list[ComprovanteRfbItem]] = {item_id: [] for item_id in rfb_ids}
+    if rfb_ids:
+        for item in db.query(ComprovanteRfbItem).filter(ComprovanteRfbItem.comprovante_rfb_id.in_(rfb_ids)).all():
+            rfb_items_by_receipt[item.comprovante_rfb_id].append(item)
     for movement in movements:
-        match = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id).first()
-        receipt = db.get(Comprovante, match.comprovante_id) if match and match.comprovante_id else None
-        rfb = db.get(ComprovanteRfb, match.comprovante_rfb_id) if match and match.comprovante_rfb_id else None
-        rfb_items = db.query(ComprovanteRfbItem).filter_by(comprovante_rfb_id=rfb.id).all() if rfb else []
-        entries = db.query(LancamentoContabil).filter_by(correspondencia_id=match.id).all() if match else []
+        match = match_by_movement.get(movement.id)
+        receipt = receipts.get(match.comprovante_id) if match and match.comprovante_id else None
+        rfb = rfb_receipts.get(match.comprovante_rfb_id) if match and match.comprovante_rfb_id else None
+        rfb_items = rfb_items_by_receipt.get(rfb.id, []) if rfb else []
+        entries = entries_by_match.get(match.id, []) if match else []
         candidates = entries or [SimpleNamespace(componente="PRINCIPAL", status="pendente", valor=Decimal("0"), conta_debito="", conta_credito="", historico="")]
         for entry in candidates:
             if complete_accounting_entry(entry):
                 continue
             if rule_matches_movement(rule, movement, receipt, entry.componente, rfb, rfb_items):
-                return True
-    return False
+                original_history = " ".join(item for item in [movement.historico, movement.nome_encontrado] if item)
+                source = "Beneficiário final" if receipt and receipt.beneficiario_final and not trigger_matches(original_history, rule.favorecido_normalizado) else "Extrato"
+                matches.append({"movimento_id": movement.id, "data": movement.data.strftime("%d/%m/%Y") if movement.data else "—", "historico": rule_match_history(movement, receipt), "componente": entry.componente, "fonte": source})
+    return matches
+
+
+def rule_has_eligible_movement(rule: RegraContabil, reconciliation: Conciliacao, db: Session) -> bool:
+    return bool(rule_preview(rule, reconciliation, db))
+
+
+@router.post("/conciliacoes/{conciliacao_id}/regras-contabeis/previa")
+def preview_accounting_rule(conciliacao_id: str, payload: RegraContabilPreviaInput, db: Session = Depends(get_db)):
+    reconciliation = reconciliation_or_404(conciliacao_id, db)
+    rule = RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco=reconciliation.banco, tipo_fonte="extrato", tipo_operacao=payload.natureza, tipo_componente=payload.tipo_componente.strip().upper(), favorecido_normalizado=normalize_name(payload.gatilho), gatilho_comprovante_normalizado=normalize_name(payload.gatilho_comprovante))
+    matches = rule_preview(rule, reconciliation, db)
+    return {"quantidade": len(matches), "lancamentos": matches, "motivo": "Nenhum lançamento elegível corresponde ao gatilho informado." if not matches else ""}
 
 
 @router.post("/conciliacoes/{conciliacao_id}/regras-contabeis")
@@ -845,12 +894,14 @@ def create_accounting_rule(conciliacao_id: str, payload: RegraContabilInput, db:
     shared_rule = next((item for item in scoped_rules(reconciliation, db) if item.banco != reconciliation.banco and item.tipo_operacao == payload.natureza and item.tipo_componente == payload.tipo_componente.strip().upper() and normalize_name(item.favorecido_normalizado) == normalize_name(payload.gatilho) and normalize_name(item.gatilho_comprovante_normalizado) == normalize_name(payload.gatilho_comprovante)), None)
     if shared_rule:
         raise HTTPException(409, f"Já existe uma regra deste cliente criada no banco {shared_rule.banco}")
-    rule = RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco=reconciliation.banco, tipo_fonte="extrato", tipo_operacao=payload.natureza, tipo_componente=payload.tipo_componente.strip().upper(), favorecido_normalizado=normalize_name(payload.gatilho), gatilho_comprovante_normalizado=normalize_name(payload.gatilho_comprovante), conta_debito=payload.conta_debito.strip(), conta_credito=payload.conta_credito.strip(), historico=payload.historico.strip(), complemento=payload.complemento.strip())
+    scope = "global" if payload.escopo == "global" else "periodo"
+    rule = RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco=reconciliation.banco, tipo_fonte="extrato", tipo_operacao=payload.natureza, tipo_componente=payload.tipo_componente.strip().upper(), favorecido_normalizado=normalize_name(payload.gatilho), gatilho_comprovante_normalizado=normalize_name(payload.gatilho_comprovante), conta_debito=payload.conta_debito.strip(), conta_credito=payload.conta_credito.strip(), historico=payload.historico.strip(), complemento=payload.complemento.strip(), escopo=scope)
     if not rule_has_eligible_movement(rule, reconciliation, db):
         raise HTTPException(422, "O gatilho não cobre nenhum lançamento elegível nesta conciliação")
     try:
         db.add(rule); db.flush()
-        applied = sum(apply_accounting_rules(item, db) for item in scoped_reconciliations(reconciliation, db) if item.banco == reconciliation.banco)
+        targets = [item for item in scoped_reconciliations(reconciliation, db) if item.banco == reconciliation.banco] if scope == "global" else [reconciliation]
+        applied = sum(apply_accounting_rules(item, db) for item in targets)
         db.commit(); db.refresh(rule)
     except Exception:
         db.rollback()
@@ -893,10 +944,10 @@ def update_accounting_rule(conciliacao_id: str, regra_id: str, payload: RegraCon
         rule.conta_credito = payload.conta_credito.strip()
         rule.historico = payload.historico.strip()
         rule.complemento = payload.complemento.strip()
-        release_rule_entries([rule.id], db)
-        for item in scoped_reconciliations(reconciliation, db):
-            if item.banco == reconciliation.banco:
-                apply_accounting_rules(item, db)
+        release_rule_entries([rule.id], db, reconciliation.id if rule.escopo == "periodo" else None)
+        targets = [item for item in scoped_reconciliations(reconciliation, db) if item.banco == reconciliation.banco] if rule.escopo == "global" else [reconciliation]
+        for item in targets:
+            apply_accounting_rules(item, db)
         db.commit()
     except Exception:
         db.rollback()
@@ -960,12 +1011,20 @@ def delete_accounting_rule_for_reconciliation(conciliacao_id: str, regra_id: str
     if not rule or rule.cliente_id != reconciliation.cliente_id or rule.banco != reconciliation.banco or not rule.ativo:
         raise HTTPException(404, "Regra não encontrada para este cliente e banco")
     try:
-        affected = delete_rule_globally(rule, db)
+        if rule.escopo == "periodo":
+            rule.ativo = False
+            db.query(RegraContabilExcecao).filter_by(regra_contabil_id=rule.id, conciliacao_id=reconciliation.id).delete(synchronize_session=False)
+            release_rule_entries([rule.id], db, reconciliation.id)
+            affected = 1
+            message = f"Regra excluída deste período ({reconciliation.data_inicio.strftime('%m/%Y')})."
+        else:
+            affected = delete_rule_globally(rule, db)
+            message = f"Regra excluída de {affected} período{'s' if affected != 1 else ''}."
         db.commit()
     except Exception:
         db.rollback()
         raise
-    return {"message": f"Regra excluída de {affected} período{'s' if affected != 1 else ''}.", "regras": accounting_rules(conciliacao_id, db), "periodos_afetados": affected}
+    return {"message": message, "regras": accounting_rules(conciliacao_id, db), "periodos_afetados": affected}
 
 
 @router.delete("/regras-contabeis/{regra_id}")
@@ -985,26 +1044,30 @@ def delete_accounting_rule(regra_id: str, db: Session = Depends(get_db)):
 @router.delete("/conciliacoes/{conciliacao_id}/regras-contabeis")
 def delete_all_accounting_rules(conciliacao_id: str, db: Session = Depends(get_db)):
     reconciliation = reconciliation_or_404(conciliacao_id, db)
-    # Include inactive rules as well: a previous interrupted cleanup may have
-    # deactivated rules but left their applied entries behind.
-    rules = db.query(RegraContabil).filter_by(cliente_id=reconciliation.cliente_id, banco=reconciliation.banco, tipo_fonte="extrato").all()
-    rule_ids = [rule.id for rule in rules]
-    for rule in rules:
-        rule.ativo = False
-    if rule_ids:
-        db.query(RegraContabilExcecao).filter(RegraContabilExcecao.regra_contabil_id.in_(rule_ids)).delete(synchronize_session=False)
-        release_rule_entries(rule_ids, db)
-        for match in db.query(Correspondencia).filter(Correspondencia.regra_contabil_id.in_(rule_ids)):
-            match.regra_contabil_id = None
     try:
-        for item in scoped_reconciliations(reconciliation, db):
-            if item.banco == reconciliation.banco:
-                apply_accounting_rules(item, db)
+        rules = [rule for rule in db.query(RegraContabil).filter_by(cliente_id=reconciliation.cliente_id, banco=reconciliation.banco, tipo_fonte="extrato").all() if rule.escopo == "global" or rule.conciliacao_id == reconciliation.id]
+        local_rules = [rule for rule in rules if rule.escopo == "periodo"]
+        global_rules = [rule for rule in rules if rule.escopo == "global" and rule.ativo]
+        inactive_rules = [rule for rule in rules if not rule.ativo]
+        for rule in local_rules:
+            rule.ativo = False
+        if local_rules:
+            release_rule_entries([rule.id for rule in local_rules], db, reconciliation.id)
+        if inactive_rules:
+            release_rule_entries([rule.id for rule in inactive_rules], db, reconciliation.id)
+        for rule in global_rules:
+            if not db.query(RegraContabilExcecao).filter_by(regra_contabil_id=rule.id, conciliacao_id=reconciliation.id).first():
+                db.add(RegraContabilExcecao(regra_contabil_id=rule.id, conciliacao_id=reconciliation.id))
+            release_rule_entries([rule.id], db, reconciliation.id)
+        for match in db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id):
+            if match.regra_contabil_id in {rule.id for rule in rules}:
+                match.regra_contabil_id = None
+        apply_accounting_rules(reconciliation, db)
         db.commit()
     except Exception:
         db.rollback()
         raise
-    return {"regras": accounting_rules(conciliacao_id, db)}
+    return {"message": "Regras removidas somente deste período.", "regras": accounting_rules(conciliacao_id, db)}
 
 
 def accounting_csv_response(conciliacao_id: str, db: Session):

@@ -202,6 +202,7 @@ class RegraContabil(Base):
     conta_credito: Mapped[str] = mapped_column(String(100), default="")
     historico: Mapped[str] = mapped_column(Text, default="")
     complemento: Mapped[str] = mapped_column(Text, default="")
+    escopo: Mapped[str] = mapped_column(String(20), default="global")
     ativo: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 

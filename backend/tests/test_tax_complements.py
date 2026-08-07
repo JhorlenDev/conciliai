@@ -47,8 +47,8 @@ def test_simples_nacional_gets_competence_complement_and_csv_value():
 
     csv = accounting_csv(reconciliation.id, session).body.decode("utf-8-sig")
 
-    assert entry.complemento == "SIMPLES NACIONAL - COMPETÊNCIA 01/2024"
-    assert csv.splitlines()[1].endswith("SIMPLES NACIONAL - COMPETÊNCIA 01/2024")
+    assert entry.complemento == "01/2024"
+    assert csv.splitlines()[1].endswith("01/2024")
 
 
 def test_irrf_and_inss_keep_individual_complements_from_same_receipt():
@@ -58,17 +58,28 @@ def test_irrf_and_inss_keep_individual_complements_from_same_receipt():
 
     entries = session.query(LancamentoContabil).order_by(LancamentoContabil.ordem).all()
 
-    assert [(entry.componente, entry.valor, entry.complemento) for entry in entries] == [("IRRF", Decimal("30.00"), "IRRF - COMPETÊNCIA 01/2024"), ("INSS", Decimal("70.00"), "INSS - COMPETÊNCIA 01/2024")]
+    assert [(entry.componente, entry.valor, entry.complemento) for entry in entries] == [("IRRF", Decimal("30.00"), "01/2024"), ("INSS", Decimal("70.00"), "01/2024")]
 
 
-def test_fgts_uses_competence_from_its_linked_bank_receipt():
+def test_fgts_uses_competence_from_its_linked_rfb_receipt():
+    session, reconciliation, file, match = tax_session()
+    receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, texto_original="FGTS\nPA: 012024")
+    session.add(receipt); session.flush()
+    match.comprovante_id = receipt.id
+    linked_rfb(session, reconciliation, file, match)
+    sync_document_items(match, [RuleLine("PRINCIPAL", Decimal("100.00"), descricao="FGTS", origem="comprovante")], session)
+
+    assert session.query(LancamentoContabil).one().complemento == "01/2024"
+
+
+def test_tax_does_not_use_competence_from_bank_receipt_without_rfb():
     session, reconciliation, file, match = tax_session()
     receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, texto_original="FGTS\nPA: 012024")
     session.add(receipt); session.flush()
     match.comprovante_id = receipt.id
     sync_document_items(match, [RuleLine("PRINCIPAL", Decimal("100.00"), descricao="FGTS", origem="comprovante")], session)
 
-    assert session.query(LancamentoContabil).one().complemento == "FGTS - COMPETÊNCIA 01/2024"
+    assert session.query(LancamentoContabil).one().complemento == ""
 
 
 def test_tax_without_competence_keeps_complement_empty_and_is_signaled():

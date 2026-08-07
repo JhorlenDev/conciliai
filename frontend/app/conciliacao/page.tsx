@@ -387,6 +387,7 @@ type SavedRule = {
   conta_credito: string;
   historico: string;
   complemento: string;
+  escopo?: "periodo" | "global";
   cobertos: number;
   movimentos?: { data: string; historico: string; texto_extrato?: string; texto_comprovante?: string; tem_comprovante?: boolean; valor: string; tipo_componente?: string; natureza: string; natureza_contabil: string }[];
 };
@@ -653,6 +654,7 @@ function AdvancedRulesPanel({
   const [pending, setPending] = useState<PendingRule[]>([]);
   const [saved, setSaved] = useState<SavedRule[]>([]);
   const [ignored, setIgnored] = useState<IgnoredRule[]>([]);
+  const [previews, setPreviews] = useState<Record<string, { quantidade: number; lancamentos: { fonte: string }[]; motivo: string }>>({});
   const [account, setAccount] = useState("Sem conta");
   const [drafts, setDrafts] = useState<Record<string, Record<string, string>>>(
     {},
@@ -713,8 +715,13 @@ function AdvancedRulesPanel({
   }, [reconciliationId, version]);
   const value = (id: string, name: string, fallback = "") =>
     drafts[id]?.[name] ?? fallback;
-  const change = (id: string, name: string, input: string) =>
+  const change = (id: string, name: string, input: string) => {
     setDrafts((items) => ({ ...items, [id]: { ...items[id], [name]: input } }));
+    setPreviews((items) => {
+      const { [id]: _, ...remaining } = items;
+      return remaining;
+    });
+  };
   const errorMessage = async (response: Response, fallback: string) => {
     try {
       const error = await response.json();
@@ -723,6 +730,36 @@ function AdvancedRulesPanel({
       return fallback;
     }
   };
+  const requestWithTimeout = async (url: string, init: RequestInit, action: string) => {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 30000);
+    try {
+      return await fetch(url, { ...init, signal: controller.signal });
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error(`${action} demorou mais de 30 segundos. Nenhuma confirmação foi recebida; tente novamente.`);
+      throw error;
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  };
+  async function previewRule(item: PendingRule | SavedRule) {
+    const fields = defaults(item);
+    const body = {
+      gatilho: value(item.id, "gatilho", fields.gatilho),
+      gatilho_comprovante: value(item.id, "gatilhoComprovante", fields.gatilhoComprovante),
+      natureza: item.natureza_contabil || item.natureza,
+      tipo_componente: item.tipo_componente || "",
+    };
+    if (!body.gatilho.trim() && !body.gatilho_comprovante.trim()) return setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Informe um gatilho para validar a regra." } }));
+    try {
+      const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/previa`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), cache: "no-store" });
+      if (!response.ok) return setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Não foi possível validar o gatilho." } }));
+      const result = await response.json();
+      setPreviews((current) => ({ ...current, [item.id]: result }));
+    } catch {
+      setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Não foi possível validar o gatilho." } }));
+    }
+  }
   const defaults = (item: PendingRule | SavedRule) =>
     "gatilho" in item
       ? {
@@ -765,6 +802,7 @@ function AdvancedRulesPanel({
       gatilho_comprovante: value(item.id, "gatilhoComprovante", fields.gatilhoComprovante),
       natureza: item.natureza_contabil || item.natureza,
       tipo_componente: item.tipo_componente || "",
+      escopo: existing && "gatilho" in item ? item.escopo || "global" : "periodo",
       conta_debito: value(item.id, "debito", fields.debito),
       conta_credito: value(item.id, "credito", fields.credito),
       historico: value(item.id, "historico", fields.historico),
@@ -807,9 +845,9 @@ function AdvancedRulesPanel({
       const path = scope === "periodo"
         ? `${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/${deleteTarget.id}/periodo`
         : `${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/${deleteTarget.id}`;
-      const response = await fetch(path, {
+      const response = await requestWithTimeout(path, {
         method: "DELETE",
-      });
+      }, "A exclusão da regra");
       if (!response.ok) return setMessage(await errorMessage(response, "Não foi possível excluir a regra."));
       const result = await response.json();
       if (result.regras) applyRulesSnapshot(result.regras);
@@ -817,8 +855,8 @@ function AdvancedRulesPanel({
       setDeleteTarget(null);
       setMessage(result.message ?? "Regra excluída.");
       onRulesChanged();
-    } catch {
-      setMessage("Não foi possível concluir a exclusão. Verifique a conexão e tente novamente.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Não foi possível concluir a exclusão. Verifique a conexão e tente novamente.");
     } finally {
       setBusyRuleId(null);
     }
@@ -827,14 +865,14 @@ function AdvancedRulesPanel({
     if (busyRuleId) return;
     setBusyRuleId(id);
     try {
-      const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/${id}/periodo/excecao`, { method: "DELETE" });
+      const response = await requestWithTimeout(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/${id}/periodo/excecao`, { method: "DELETE" }, "A restauração da regra");
       if (!response.ok) return setMessage(await errorMessage(response, "Não foi possível restaurar a regra."));
       const result = await response.json();
       if (result.regras) applyRulesSnapshot(result.regras);
       setMessage(result.message ?? "Regra restaurada neste período.");
       onRulesChanged();
-    } catch {
-      setMessage("Não foi possível restaurar a regra. Verifique a conexão e tente novamente.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Não foi possível restaurar a regra. Verifique a conexão e tente novamente.");
     } finally {
       setBusyRuleId(null);
     }
@@ -843,16 +881,16 @@ function AdvancedRulesPanel({
     if (busyRuleId) return;
     setBusyRuleId("all");
     try {
-      const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis`, { method: "DELETE" });
+      const response = await requestWithTimeout(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis`, { method: "DELETE" }, "A limpeza das regras");
       if (!response.ok) return setMessage(await errorMessage(response, "Não foi possível limpar as regras."));
       const result = await response.json();
       setConfirmClearAll(false);
-      setMessage("Todas as regras deste banco foram limpas e os lançamentos foram recalculados.");
+      setMessage(result.message ?? "Regras removidas somente deste período.");
       if (result.regras) applyRulesSnapshot(result.regras);
       else await load();
       onRulesChanged();
-    } catch {
-      setMessage("Não foi possível limpar as regras. Verifique a conexão e tente novamente.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Não foi possível limpar as regras. Verifique a conexão e tente novamente.");
     } finally {
       setBusyRuleId(null);
     }
@@ -1013,25 +1051,11 @@ function AdvancedRulesPanel({
     const words = pendingItem?.historico.match(/[\p{L}\p{N}]+/gu) ?? [];
     const keyword = value(item.id, "gatilho", fields.gatilho);
     const receiptKeyword = value(item.id, "gatilhoComprovante", fields.gatilhoComprovante);
-    const matchesKeyword = (source: string, trigger: string) =>
-      trigger
-        .trim()
-        .split(/\s+/)
-        .filter(Boolean)
-        .every((word) => source.toUpperCase().includes(word.toUpperCase()));
-    const componentKey = (component = "") => ["", "VALOR_COBRADO"].includes(component) ? "PRINCIPAL" : component;
+    const preview = previews[item.id];
     const coveredCount =
       "cobertos" in item && keyword === fields.gatilho && receiptKeyword === fields.gatilhoComprovante
         ? item.cobertos
-        : keyword || receiptKeyword
-          ? pending.filter(
-              (candidate) =>
-                (!keyword || matchesKeyword(candidate.historico, keyword)) &&
-                (!receiptKeyword || matchesKeyword([...(candidate.palavras_comprovante_banco ?? []), ...(candidate.palavras_comprovante_rfb ?? [])].join(" "), receiptKeyword)) &&
-                componentKey(candidate.tipo_componente) === componentKey(item.tipo_componente) &&
-                (candidate.natureza_contabil || candidate.natureza) === (item.natureza_contabil || item.natureza),
-            ).length
-          : 0;
+        : preview?.quantidade ?? 0;
     const canSave = existing || coveredCount > 0;
     return (
       <tr
@@ -1098,6 +1122,7 @@ function AdvancedRulesPanel({
                   {componentLabel(item.tipo_componente)}
                 </span>
               )}
+              {existing && "gatilho" in item && <span className={`ml-1 rounded px-1.5 py-0.5 text-[10px] font-semibold ${item.escopo === "periodo" ? "bg-violet-100 text-violet-800" : "bg-amber-100 text-amber-800"}`}>{item.escopo === "periodo" ? "Este período" : "Global"}</span>}
             </td>
             <td
               className={`${existing ? "w-[8%]" : ""} px-2 py-2 font-semibold whitespace-nowrap ${isDebit ? "text-blue-700" : "text-red-700"}`}
@@ -1116,6 +1141,7 @@ function AdvancedRulesPanel({
                 onChange={(event) =>
                   change(item.id, "gatilho", event.target.value)
                 }
+                onBlur={() => previewRule(item)}
               />
               {pendingItem && (
                 <>
@@ -1195,7 +1221,7 @@ function AdvancedRulesPanel({
             </div>
             {(pendingItem?.comprovante_arquivo_id || pendingItem?.comprovante_rfb_arquivo_id) && (
               <div className="mt-1 flex items-center gap-1">
-                <input className="w-20 rounded border border-violet-200 px-1.5 py-1" placeholder="comprovante..." value={receiptKeyword} onChange={(event) => change(item.id, "gatilhoComprovante", event.target.value)} />
+                <input className="w-20 rounded border border-violet-200 px-1.5 py-1" placeholder="comprovante..." value={receiptKeyword} onChange={(event) => change(item.id, "gatilhoComprovante", event.target.value)} onBlur={() => previewRule(item)} />
                 <button title="Usar comprovante completo" onClick={() => change(item.id, "gatilhoComprovante", (pendingItem.palavras_comprovante ?? []).join(" "))} className="rounded border border-violet-200 bg-violet-50 p-1 text-violet-700 hover:border-violet-500">
                   <Copy size={13} />
                 </button>
@@ -1212,16 +1238,12 @@ function AdvancedRulesPanel({
             )}
             {(keyword || receiptKeyword) && (
               <div className="mt-1 w-48 text-[10px] leading-4 text-emerald-700">
-                <span className="font-semibold">
-                  {keyword && keywordMode[item.id] === "full"
-                    ? "Histórico completo"
-                    : keyword
-                      ? "Palavras do extrato"
-                      : "Palavras do comprovante"}
-                </span>
-                <br /><span className={coveredCount ? "" : "text-red-700"}>{coveredCount ? "✓" : "!"} Este gatilho vai cobrir {coveredCount} lançamento(s)</span>
+                <span className="font-semibold">Texto usado pela regra</span>
+                <br /><span className={coveredCount ? "" : "text-red-700"}>{coveredCount ? "✓" : "!"} {preview ? `O backend confirmou ${coveredCount} lançamento(s)` : "Valide o gatilho para confirmar a cobertura"}</span>
                 <br />
                 <span className="text-slate-500">«{[keyword, receiptKeyword].filter(Boolean).join(" | ")}»</span>
+                {preview?.lancamentos[0]?.fonte && <><br /><span className="text-slate-500">Fonte: {preview.lancamentos.map((match) => match.fonte).filter((value, index, values) => values.indexOf(value) === index).join(", ")}</span></>}
+                {preview?.motivo && <><br /><span className="text-red-700">{preview.motivo}</span></>}
               </div>
             )}
           </div>
@@ -1501,7 +1523,7 @@ function AdvancedRulesPanel({
       {confirmClearAll && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
         <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl">
           <h3 className="text-sm font-semibold text-slate-900">Limpar todas as regras?</h3>
-          <p className="mt-2 text-xs leading-5 text-slate-600">As regras salvas deste banco serão desativadas e seus lançamentos aplicados serão removidos. Os movimentos e comprovantes não serão apagados; as sugestões voltarão para Regras a criar.</p>
+          <p className="mt-2 text-xs leading-5 text-slate-600">As regras deste período serão removidas. Regras globais serão apenas ignoradas neste período; meses anteriores não serão alterados.</p>
           <div className="mt-4 flex justify-end gap-2">
             <button disabled={busyRuleId === "all"} onClick={() => setConfirmClearAll(false)} className="rounded border px-3 py-1.5 text-xs font-semibold text-slate-700">Cancelar</button>
             <button disabled={busyRuleId === "all"} onClick={clearAllRules} className="rounded bg-red-700 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-60">{busyRuleId === "all" ? "Limpando..." : "Sim, limpar todas"}</button>
@@ -1510,11 +1532,10 @@ function AdvancedRulesPanel({
       </div>}
       {deleteTarget && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
         <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl">
-          <h3 className="text-sm font-semibold text-slate-900">Esta regra é global</h3>
-          <p className="mt-2 text-xs leading-5 text-slate-600">A regra <strong>{deleteTarget.gatilho || deleteTarget.historico}</strong> está disponível para todas as conciliações deste cliente e banco. Escolha onde ela deve ser removida.</p>
+          <h3 className="text-sm font-semibold text-slate-900">{deleteTarget.escopo === "periodo" ? "Excluir regra deste período?" : "Esta regra é global"}</h3>
+          <p className="mt-2 text-xs leading-5 text-slate-600">{deleteTarget.escopo === "periodo" ? <>A regra <strong>{deleteTarget.gatilho || deleteTarget.historico}</strong> vale somente para esta conciliação.</> : <>A regra <strong>{deleteTarget.gatilho || deleteTarget.historico}</strong> está disponível para todas as conciliações deste cliente e banco. Escolha onde ela deve ser removida.</>}</p>
           <div className="mt-4 space-y-2">
-            <button disabled={busyRuleId === deleteTarget.id} onClick={() => remove("periodo")} className="w-full rounded border border-violet-300 bg-violet-50 px-3 py-2 text-left text-xs font-semibold text-violet-900 disabled:opacity-60">{busyRuleId === deleteTarget.id ? "Removendo..." : "Remover somente deste período"}<span className="mt-0.5 block font-normal text-violet-700">Os demais meses continuam usando a regra.</span></button>
-            <button disabled={busyRuleId === deleteTarget.id} onClick={() => remove("global")} className="w-full rounded border border-red-200 bg-red-50 px-3 py-2 text-left text-xs font-semibold text-red-800 disabled:opacity-60">{busyRuleId === deleteTarget.id ? "Excluindo..." : "Excluir de todos os períodos"}<span className="mt-0.5 block font-normal text-red-700">A regra será desativada para este cliente e banco.</span></button>
+            {deleteTarget.escopo === "periodo" ? <button disabled={busyRuleId === deleteTarget.id} onClick={() => remove("global")} className="w-full rounded border border-red-200 bg-red-50 px-3 py-2 text-left text-xs font-semibold text-red-800 disabled:opacity-60">{busyRuleId === deleteTarget.id ? "Excluindo..." : "Excluir regra deste período"}</button> : <><button disabled={busyRuleId === deleteTarget.id} onClick={() => remove("periodo")} className="w-full rounded border border-violet-300 bg-violet-50 px-3 py-2 text-left text-xs font-semibold text-violet-900 disabled:opacity-60">{busyRuleId === deleteTarget.id ? "Removendo..." : "Remover somente deste período"}<span className="mt-0.5 block font-normal text-violet-700">Os demais meses continuam usando a regra.</span></button><button disabled={busyRuleId === deleteTarget.id} onClick={() => remove("global")} className="w-full rounded border border-red-200 bg-red-50 px-3 py-2 text-left text-xs font-semibold text-red-800 disabled:opacity-60">{busyRuleId === deleteTarget.id ? "Excluindo..." : "Excluir de todos os períodos"}<span className="mt-0.5 block font-normal text-red-700">A regra será desativada para este cliente e banco.</span></button></>}
           </div>
           <div className="mt-4 flex justify-end"><button disabled={busyRuleId === deleteTarget.id} onClick={() => setDeleteTarget(null)} className="rounded border px-3 py-1.5 text-xs font-semibold text-slate-700">Cancelar</button></div>
         </div>

@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.api.routes import ContaBancariaClienteInput, accounting_rules, client_bank_accounts, create_reconciliation_process, delete_client_bank_account, delete_reconciliation_process, reconcile, reprocess_document, result, resume_process_bank, save_client_bank_account
 from app.core.database import Base
-from app.models import Arquivo, Cliente, Comprovante, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, ProcessoConciliacao, RegraContabil
+from app.models import Arquivo, Cliente, Comprovante, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, ProcessoConciliacao, RegraContabil, RegraContabilExcecao
 from app.services.normalization import normalize_name
 from app.api.routes import ProcessoBancoInput, ProcessoConciliacaoInput
 
@@ -65,7 +65,16 @@ def test_delete_process_removes_its_reconciliations_and_files(tmp_path):
     file_path.write_text("conteúdo")
     file = Arquivo(conciliacao_id=reconciliation_id, tipo_documento="extrato", banco_selecionado="Santander", nome_original="extrato.pdf", caminho=str(file_path))
     session.add(file); session.flush()
-    session.add(MovimentoExtrato(conciliacao_id=reconciliation_id, arquivo_id=file.id, pagina_numero=1, historico="PIX", natureza="saída"))
+    movement = MovimentoExtrato(conciliacao_id=reconciliation_id, arquivo_id=file.id, pagina_numero=1, historico="PIX", natureza="saída")
+    global_rule = RegraContabil(cliente_id=client.id, conciliacao_id=reconciliation_id, banco="Santander", tipo_fonte="extrato", tipo_operacao="saída", favorecido_normalizado=normalize_name("PIX"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento", escopo="global")
+    local_rule = RegraContabil(cliente_id=client.id, conciliacao_id=reconciliation_id, banco="Santander", tipo_fonte="extrato", tipo_operacao="saída", favorecido_normalizado=normalize_name("TED"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento", escopo="periodo")
+    session.add_all([movement, global_rule, local_rule]); session.flush()
+    match = Correspondencia(conciliacao_id=reconciliation_id, movimento_extrato_id=movement.id, regra_contabil_id=local_rule.id)
+    session.add(match); session.flush()
+    session.add_all([
+        LancamentoContabil(correspondencia_id=match.id, regra_contabil_id=local_rule.id, componente="PRINCIPAL", valor=Decimal("10.00"), status="aplicado_por_regra"),
+        RegraContabilExcecao(regra_contabil_id=global_rule.id, conciliacao_id=reconciliation_id),
+    ])
     session.commit()
 
     delete_reconciliation_process(process["id"], session)
@@ -73,6 +82,11 @@ def test_delete_process_removes_its_reconciliations_and_files(tmp_path):
     assert session.get(ProcessoConciliacao, process["id"]) is None
     assert session.query(Conciliacao).filter_by(processo_id=process["id"]).count() == 0
     assert not file_path.exists()
+    assert session.get(RegraContabil, global_rule.id).ativo is True
+    assert session.get(RegraContabil, global_rule.id).conciliacao_id is None
+    assert session.get(RegraContabil, local_rule.id).ativo is False
+    assert session.get(RegraContabil, local_rule.id).conciliacao_id is None
+    assert session.query(RegraContabilExcecao).filter_by(conciliacao_id=reconciliation_id).count() == 0
 
 
 def test_reprocessing_statement_clears_previous_reconciliation_results(tmp_path):

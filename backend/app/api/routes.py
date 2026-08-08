@@ -393,6 +393,17 @@ def delete_reconciliation_process(processo_id: str, db: Session = Depends(get_db
         raise HTTPException(404, "Processo de conciliação não encontrado")
     reconciliations = db.query(Conciliacao).filter_by(processo_id=process.id).all()
     for reconciliation in reconciliations:
+        rules = db.query(RegraContabil).filter_by(conciliacao_id=reconciliation.id).all()
+        local_rule_ids = [rule.id for rule in rules if rule.escopo == "periodo"]
+        if local_rule_ids:
+            db.query(RegraContabilExcecao).filter(RegraContabilExcecao.regra_contabil_id.in_(local_rule_ids)).delete(synchronize_session=False)
+        for rule in rules:
+            if rule.escopo == "global":
+                rule.conciliacao_id = None
+            else:
+                rule.ativo = False
+                rule.conciliacao_id = None
+        db.query(RegraContabilExcecao).filter_by(conciliacao_id=reconciliation.id).delete(synchronize_session=False)
         matches = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id).all()
         for match in matches:
             db.query(LancamentoContabil).filter_by(correspondencia_id=match.id).delete()

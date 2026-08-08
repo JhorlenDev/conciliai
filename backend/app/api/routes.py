@@ -5,6 +5,7 @@ import re
 import textwrap
 import zipfile
 import logging
+from collections import defaultdict
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -98,7 +99,7 @@ class RegraContabilInput(BaseModel):
     historico: str
     complemento: str = ""
     tipo_componente: str = ""
-    escopo: str = "periodo"
+    escopo: str = "global"
 
 
 class RegraContabilPreviaInput(BaseModel):
@@ -106,6 +107,7 @@ class RegraContabilPreviaInput(BaseModel):
     gatilho_comprovante: str = ""
     natureza: str
     tipo_componente: str = ""
+    regra_id: str = ""
 
 
 class ContaBancariaInput(BaseModel):
@@ -443,6 +445,10 @@ def trigger_matches(source: str, trigger: str) -> bool:
         return True
     if normalized_trigger in normalized_source:
         return True
+    trigger_tokens = set(normalized_trigger.split())
+    source_tokens = set(normalized_source.split())
+    if trigger_tokens and trigger_tokens <= source_tokens:
+        return True
     trigger_digits = re.sub(r"\D", "", trigger)
     source_digits = re.sub(r"\D", "", source)
     return bool(trigger_digits and trigger_digits in source_digits)
@@ -543,6 +549,24 @@ def rule_component_key(component: str) -> str:
     return "PRINCIPAL" if component in {"", "PRINCIPAL", "VALOR_COBRADO"} else component
 
 
+def preferred_accounting_entry(existing: LancamentoContabil, candidate: LancamentoContabil) -> LancamentoContabil:
+    if rule_component_key(existing.componente) != "PRINCIPAL" or rule_component_key(candidate.componente) != "PRINCIPAL":
+        return existing
+    if candidate.origem == "comprovante" and existing.origem != "comprovante":
+        return candidate
+    if candidate.componente == "VALOR_COBRADO" and existing.componente == "PRINCIPAL":
+        return candidate
+    return existing
+
+
+def unique_accounting_entries(entries: list[LancamentoContabil]) -> list[LancamentoContabil]:
+    selected: dict[str, LancamentoContabil] = {}
+    for entry in sorted(entries, key=accounting_entry_order):
+        key = rule_component_key(entry.componente)
+        selected[key] = preferred_accounting_entry(selected[key], entry) if key in selected else entry
+    return sorted(selected.values(), key=accounting_entry_order)
+
+
 def rule_matches_movement(rule: RegraContabil, movement: MovimentoExtrato, receipt: Comprovante | None = None, component: str = "", rfb: ComprovanteRfb | None = None, rfb_items: list[ComprovanteRfbItem] | None = None) -> bool:
     trigger = rule.favorecido_normalizado
     history = rule_match_history(movement, receipt)
@@ -566,7 +590,12 @@ def receipt_matches_movement(movement_text: str, beneficiary: str) -> bool:
     if names_similar(movement_text, beneficiary, allow_truncated_terminal=True):
         return True
     # A statement history begins with the operation name, while the beneficiary appears later.
-    return len(beneficiary_tokens) >= 2 and all(any(token.startswith(candidate) or candidate.startswith(token) for token in text_tokens) for candidate in beneficiary_tokens)
+    compatible = lambda token, candidate: token.startswith(candidate) or candidate.startswith(token)
+    if len(beneficiary_tokens) >= 2 and all(any(compatible(token, candidate) for token in text_tokens) for candidate in beneficiary_tokens):
+        return True
+    matched_tokens = [candidate for candidate in beneficiary_tokens if any(compatible(token, candidate) for token in text_tokens)]
+    strong_matches = [candidate for candidate in matched_tokens if len(candidate) >= 4]
+    return len(matched_tokens) >= 2 and bool(strong_matches)
 
 
 def receipt_match_criterion(movement_text: str, receipt: Comprovante) -> str:
@@ -663,7 +692,8 @@ def accounting_integrity(reconciliation: Conciliacao, db: Session) -> dict:
     incomplete = []
     for match in matches:
         entries = entries_by_match[match.id]
-        completed = [entry for entry in entries if active_accounting_entry(entry, active_rule_ids) and complete_accounting_entry(entry)]
+        active_entries = [entry for entry in entries if active_accounting_entry(entry, active_rule_ids)]
+        completed = unique_accounting_entries([entry for entry in active_entries if complete_accounting_entry(entry)])
         invalid_applied = [entry for entry in entries if active_accounting_entry(entry, active_rule_ids) and entry.status in {"aplicado_por_regra", "editado_manual"} and not complete_accounting_entry(entry)]
         movement = movements.get(match.movimento_extrato_id)
         if invalid_applied or (match.regra_contabil_id in active_rule_ids and not any(entry.regra_contabil_id == match.regra_contabil_id for entry in completed)):
@@ -694,19 +724,35 @@ def apply_accounting_rules(reconciliation: Conciliacao, db: Session) -> int:
     rules = current_bank_rules(reconciliation, db)
     applied = 0
     movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=reconciliation.id, ativo=True) if in_reconciliation_period(reconciliation, item)]
+    correspondences = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id).all()
+    match_by_movement = {item.movimento_extrato_id: item for item in correspondences}
+    match_ids = [item.id for item in correspondences]
+    receipt_ids = [item.comprovante_id for item in correspondences if item.comprovante_id]
+    rfb_ids = [item.comprovante_rfb_id for item in correspondences if item.comprovante_rfb_id]
+    receipts = {item.id: item for item in db.query(Comprovante).filter(Comprovante.id.in_(receipt_ids)).all()} if receipt_ids else {}
+    rfb_receipts = {item.id: item for item in db.query(ComprovanteRfb).filter(ComprovanteRfb.id.in_(rfb_ids)).all()} if rfb_ids else {}
+    rfb_items_by_receipt: dict[str, list[ComprovanteRfbItem]] = defaultdict(list)
+    if rfb_ids:
+        for item in db.query(ComprovanteRfbItem).filter(ComprovanteRfbItem.comprovante_rfb_id.in_(rfb_ids)).all():
+            rfb_items_by_receipt[item.comprovante_rfb_id].append(item)
+    entries_by_match: dict[str, list[LancamentoContabil]] = defaultdict(list)
+    if match_ids:
+        for entry in db.query(LancamentoContabil).filter(LancamentoContabil.correspondencia_id.in_(match_ids)).order_by(LancamentoContabil.ordem, LancamentoContabil.id).all():
+            entries_by_match[entry.correspondencia_id].append(entry)
     for movement in movements:
-        match = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id).first()
-        receipt = db.get(Comprovante, match.comprovante_id) if match and match.comprovante_id else None
-        rfb = db.get(ComprovanteRfb, match.comprovante_rfb_id) if match and match.comprovante_rfb_id else None
-        rfb_items = db.query(ComprovanteRfbItem).filter_by(comprovante_rfb_id=rfb.id).all() if rfb else []
+        match = match_by_movement.get(movement.id)
+        receipt = receipts.get(match.comprovante_id) if match and match.comprovante_id else None
+        rfb = rfb_receipts.get(match.comprovante_rfb_id) if match and match.comprovante_rfb_id else None
+        rfb_items = rfb_items_by_receipt.get(rfb.id, []) if rfb else []
         if not match:
             match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id)
             db.add(match)
             db.flush()
-        entries = db.query(LancamentoContabil).filter_by(correspondencia_id=match.id).order_by(LancamentoContabil.ordem, LancamentoContabil.id).all()
+            match_by_movement[movement.id] = match
+        entries = unique_accounting_entries(entries_by_match.get(match.id, []))
         # A document can have distinct rules for principal, discount, and taxes.
         # Manual entries are deliberately never overwritten by a rule refresh.
-        source_entries = [entry for entry in entries if entry.status != "editado_manual"]
+        source_entries = unique_accounting_entries([entry for entry in entries if entry.status != "editado_manual"])
         if not source_entries:
             source_entries = [LancamentoContabil(correspondencia_id=match.id, componente="PRINCIPAL", categoria="PRINCIPAL", valor=movement.valor or 0, origem="extrato", ordem=1)]
             db.add(source_entries[0])
@@ -756,14 +802,33 @@ def save_bank_account(conciliacao_id: str, payload: ContaBancariaInput, db: Sess
 def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPIResponse = None):
     reconciliation = reconciliation_or_404(conciliacao_id, db)
     movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True).order_by(MovimentoExtrato.data, MovimentoExtrato.hora) if in_reconciliation_period(reconciliation, item)]
+    movement_by_id = {item.id: item for item in movements}
     if reconciliation.banco == "Banco do Brasil":
         for movement in movements:
             logger.info("Total do extrato BB: data=%s historico=%s valor=%s natureza=%s", movement.data, movement.historico, movement.valor, movement.natureza)
     rules = scoped_rules(reconciliation, db)
     same_bank_rules = current_bank_rules(reconciliation, db)
     matches = {item.movimento_extrato_id: item for item in db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id).all()}
-    receipts = {movement_id: db.get(Comprovante, match.comprovante_id) for movement_id, match in matches.items() if match.comprovante_id}
-    entries_by_movement = {movement_id: sorted(db.query(LancamentoContabil).filter_by(correspondencia_id=match.id).all(), key=accounting_entry_order) for movement_id, match in matches.items()}
+    match_ids = [item.id for item in matches.values()]
+    receipt_ids = [item.comprovante_id for item in matches.values() if item.comprovante_id]
+    rfb_ids = [item.comprovante_rfb_id for item in matches.values() if item.comprovante_rfb_id]
+    receipts_by_id = {item.id: item for item in db.query(Comprovante).filter(Comprovante.id.in_(receipt_ids)).all()} if receipt_ids else {}
+    rfb_by_id = {item.id: item for item in db.query(ComprovanteRfb).filter(ComprovanteRfb.id.in_(rfb_ids)).all()} if rfb_ids else {}
+    rfb_items_by_receipt: dict[str, list[ComprovanteRfbItem]] = defaultdict(list)
+    if rfb_ids:
+        for item in db.query(ComprovanteRfbItem).filter(ComprovanteRfbItem.comprovante_rfb_id.in_(rfb_ids)).all():
+            rfb_items_by_receipt[item.comprovante_rfb_id].append(item)
+    entries_by_match: dict[str, list[LancamentoContabil]] = defaultdict(list)
+    if match_ids:
+        for entry in db.query(LancamentoContabil).filter(LancamentoContabil.correspondencia_id.in_(match_ids)).all():
+            entries_by_match[entry.correspondencia_id].append(entry)
+    receipts = {movement_id: receipts_by_id[match.comprovante_id] for movement_id, match in matches.items() if match.comprovante_id in receipts_by_id}
+    entries_by_movement = {movement_id: unique_accounting_entries(entries_by_match.get(match.id, [])) for movement_id, match in matches.items()}
+    tariff_receipt_ids = {
+        match.comprovante_id
+        for match in matches.values()
+        if match.comprovante_id and (movement := movement_by_id.get(match.movimento_extrato_id)) and "TARIFA PIX" in normalize_name(movement.historico)
+    }
     covered_by_rule = {rule.id: [] for rule in same_bank_rules}
     covered_components = set()
     for movement in movements:
@@ -772,23 +837,23 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
         for entry in entries:
             if complete_accounting_entry(entry) and entry.regra_contabil_id in covered_by_rule:
                 covered_by_rule[entry.regra_contabil_id].append((movement_id, entry))
-                covered_components.add((movement_id, entry.componente))
+                covered_components.add((movement_id, rule_component_key(entry.componente)))
     integrity = accounting_integrity(reconciliation, db)
     def pending_payload(item: MovimentoExtrato, component: str = "PRINCIPAL", value: Decimal | None = None, document_components: list[str] | None = None, covered_document_components: list[dict] | None = None):
         match = matches.get(item.id)
-        receipt = db.get(Comprovante, match.comprovante_id) if match and match.comprovante_id else None
-        rfb = db.get(ComprovanteRfb, match.comprovante_rfb_id) if match and match.comprovante_rfb_id else None
-        rfb_items = db.query(ComprovanteRfbItem).filter_by(comprovante_rfb_id=rfb.id).all() if rfb else []
+        receipt = receipts_by_id.get(match.comprovante_id) if match and match.comprovante_id else None
+        rfb = rfb_by_id.get(match.comprovante_rfb_id) if match and match.comprovante_rfb_id else None
+        rfb_items = rfb_items_by_receipt.get(rfb.id, []) if rfb else []
         history = rule_match_history(item, receipt)
         shared_rule = next((rule for rule in rules if rule.banco != reconciliation.banco and rule_matches_movement(rule, item, receipt, component, rfb, rfb_items)), None)
-        tariff_in_statement = bool(receipt and receipt.valor_tarifa and "TARIFA PIX" not in normalize_name(item.historico) and any(other.comprovante_id == receipt.id and other.movimento_extrato_id != item.id and "TARIFA PIX" in normalize_name(db.get(MovimentoExtrato, other.movimento_extrato_id).historico) for other in matches.values()))
+        tariff_in_statement = bool(receipt and receipt.valor_tarifa and "TARIFA PIX" not in normalize_name(item.historico) and receipt.id in tariff_receipt_ids)
         tariff_reference = bool(receipt and "TARIFA PIX" in normalize_name(item.historico))
         bank_receipt_words = list(dict.fromkeys(([receipt.numero_documento] if receipt and receipt.numero_documento else []) + normalize_name(receipt_trigger_text(receipt)).split()))
         rfb_words = list(dict.fromkeys(normalize_name(receipt_trigger_text(None, rfb, rfb_items)).split()))
         receipt_words = list(dict.fromkeys([*bank_receipt_words, *rfb_words]))
         composition = ""
-        if rfb and (rfb.tipo.upper() == "DAS" or any("SIMPLES NACIONAL" in tax.descricao.upper() for tax in db.query(ComprovanteRfbItem).filter_by(comprovante_rfb_id=rfb.id))):
-            taxes = db.query(ComprovanteRfbItem).filter_by(comprovante_rfb_id=rfb.id).all()
+        if rfb and (rfb.tipo.upper() == "DAS" or any("SIMPLES NACIONAL" in tax.descricao.upper() for tax in rfb_items)):
+            taxes = rfb_items
             money = lambda amount: f"R$ {amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
             lines = [f"{tax.descricao.split(' - ')[0]}: {money(tax.valor_principal or 0)}" for tax in taxes if tax.valor_principal]
             if rfb.valor_multa: lines.append(f"Multa: {money(rfb.valor_multa)}")
@@ -806,20 +871,23 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
         pending.extend(
             pending_payload(movement, component, value, document_components, covered_document_components)
             for component, value in candidates
-            if (movement.id, component) not in covered_components
+            if (movement.id, rule_component_key(component)) not in covered_components
         )
     if response:
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     saved_payloads = [rule_payload(rule, movements, receipts, covered_by_rule[rule.id]) for rule in same_bank_rules]
     saved_payloads.sort(key=lambda item: min((accounting_entry_order(entry) for _, entry in covered_by_rule[item["id"]]), default=(10**9, 10**9, "")))
+    exceptions = db.query(RegraContabilExcecao).filter_by(conciliacao_id=reconciliation.id).all()
+    exception_rule_ids = [item.regra_contabil_id for item in exceptions]
+    rules_by_id = {item.id: item for item in db.query(RegraContabil).filter(RegraContabil.id.in_(exception_rule_ids)).all()} if exception_rule_ids else {}
     ignored = []
-    for exception in db.query(RegraContabilExcecao).filter_by(conciliacao_id=reconciliation.id):
-        rule = db.get(RegraContabil, exception.regra_contabil_id)
+    for exception in exceptions:
+        rule = rules_by_id.get(exception.regra_contabil_id)
         if rule and rule.ativo and rule.cliente_id == reconciliation.cliente_id and rule.banco == reconciliation.banco:
             ignored.append({"id": rule.id, "gatilho": rule.favorecido_normalizado, "gatilho_comprovante": rule.gatilho_comprovante_normalizado, "tipo_componente": rule.tipo_componente, "historico": rule.historico})
     return {
         "pendentes": pending,
-        "salvas": [item for item in saved_payloads if item["cobertos"] > 0],
+        "salvas": saved_payloads,
         "ignoradas": ignored,
         "resumo": {
             "extrato": {
@@ -835,7 +903,7 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
     }
 
 
-def rule_preview(rule: RegraContabil, reconciliation: Conciliacao, db: Session) -> list[dict]:
+def rule_preview(rule: RegraContabil, reconciliation: Conciliacao, db: Session, current_rule_id: str | None = None) -> list[dict]:
     matches = []
     movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=reconciliation.id, ativo=True) if in_reconciliation_period(reconciliation, item)]
     correspondences = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id).all()
@@ -849,6 +917,8 @@ def rule_preview(rule: RegraContabil, reconciliation: Conciliacao, db: Session) 
     if match_ids:
         for entry in db.query(LancamentoContabil).filter(LancamentoContabil.correspondencia_id.in_(match_ids)).all():
             entries_by_match[entry.correspondencia_id].append(entry)
+    has_complete_entries = any(complete_accounting_entry(entry) for entries in entries_by_match.values() for entry in entries)
+    active_rule_ids = {item.id for item in current_bank_rules(reconciliation, db)} if has_complete_entries else set()
     rfb_items_by_receipt: dict[str, list[ComprovanteRfbItem]] = {item_id: [] for item_id in rfb_ids}
     if rfb_ids:
         for item in db.query(ComprovanteRfbItem).filter(ComprovanteRfbItem.comprovante_rfb_id.in_(rfb_ids)).all():
@@ -862,7 +932,10 @@ def rule_preview(rule: RegraContabil, reconciliation: Conciliacao, db: Session) 
         candidates = entries or [SimpleNamespace(componente="PRINCIPAL", status="pendente", valor=Decimal("0"), conta_debito="", conta_credito="", historico="")]
         for entry in candidates:
             if complete_accounting_entry(entry):
-                continue
+                if entry.status == "editado_manual":
+                    continue
+                if entry.regra_contabil_id and entry.regra_contabil_id != current_rule_id and entry.regra_contabil_id in active_rule_ids:
+                    continue
             if rule_matches_movement(rule, movement, receipt, entry.componente, rfb, rfb_items):
                 original_history = " ".join(item for item in [movement.historico, movement.nome_encontrado] if item)
                 source = "Beneficiário final" if receipt and receipt.beneficiario_final and not trigger_matches(original_history, rule.favorecido_normalizado) else "Extrato"
@@ -877,8 +950,13 @@ def rule_has_eligible_movement(rule: RegraContabil, reconciliation: Conciliacao,
 @router.post("/conciliacoes/{conciliacao_id}/regras-contabeis/previa")
 def preview_accounting_rule(conciliacao_id: str, payload: RegraContabilPreviaInput, db: Session = Depends(get_db)):
     reconciliation = reconciliation_or_404(conciliacao_id, db)
+    current_rule_id = payload.regra_id.strip() or None
+    if current_rule_id:
+        current_rule = db.get(RegraContabil, current_rule_id)
+        if not current_rule or current_rule.cliente_id != reconciliation.cliente_id or current_rule.banco != reconciliation.banco or not current_rule.ativo:
+            raise HTTPException(404, "Regra não encontrada")
     rule = RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco=reconciliation.banco, tipo_fonte="extrato", tipo_operacao=payload.natureza, tipo_componente=payload.tipo_componente.strip().upper(), favorecido_normalizado=normalize_name(payload.gatilho), gatilho_comprovante_normalizado=normalize_name(payload.gatilho_comprovante))
-    matches = rule_preview(rule, reconciliation, db)
+    matches = rule_preview(rule, reconciliation, db, current_rule_id)
     return {"quantidade": len(matches), "lancamentos": matches, "motivo": "Nenhum lançamento elegível corresponde ao gatilho informado." if not matches else ""}
 
 
@@ -945,6 +1023,8 @@ def update_accounting_rule(conciliacao_id: str, regra_id: str, payload: RegraCon
         rule.historico = payload.historico.strip()
         rule.complemento = payload.complemento.strip()
         release_rule_entries([rule.id], db, reconciliation.id if rule.escopo == "periodo" else None)
+        if not rule_has_eligible_movement(rule, reconciliation, db):
+            raise HTTPException(422, "O gatilho não cobre nenhum lançamento elegível nesta conciliação")
         targets = [item for item in scoped_reconciliations(reconciliation, db) if item.banco == reconciliation.banco] if rule.escopo == "global" else [reconciliation]
         for item in targets:
             apply_accounting_rules(item, db)
@@ -1002,6 +1082,33 @@ def restore_rule_in_period(conciliacao_id: str, regra_id: str, db: Session = Dep
         db.rollback()
         raise
     return {"message": f"Regra restaurada neste período ({reconciliation.data_inicio.strftime('%m/%Y')}).", "regras": accounting_rules(conciliacao_id, db)}
+
+
+@router.delete("/conciliacoes/{conciliacao_id}/regras-contabeis/sem-cobertura")
+def delete_zero_covered_accounting_rules(conciliacao_id: str, db: Session = Depends(get_db)):
+    reconciliation = reconciliation_or_404(conciliacao_id, db)
+    try:
+        zero_rule_ids = [
+            item["id"]
+            for item in accounting_rules(conciliacao_id, db)["salvas"]
+            if item["cobertos"] == 0
+        ]
+        for rule_id in zero_rule_ids:
+            if not db.query(RegraContabilExcecao).filter_by(regra_contabil_id=rule_id, conciliacao_id=reconciliation.id).first():
+                db.add(RegraContabilExcecao(regra_contabil_id=rule_id, conciliacao_id=reconciliation.id))
+        if zero_rule_ids:
+            release_rule_entries(zero_rule_ids, db, reconciliation.id)
+            for match in db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id):
+                if match.regra_contabil_id in zero_rule_ids:
+                    match.regra_contabil_id = None
+            apply_accounting_rules(reconciliation, db)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    count = len(zero_rule_ids)
+    message = f"{count} regra(s) sem cobertura ocultada(s) somente deste período." if count else "Não havia regras sem cobertura neste período."
+    return {"message": message, "quantidade": count, "regras": accounting_rules(conciliacao_id, db)}
 
 
 @router.delete("/conciliacoes/{conciliacao_id}/regras-contabeis/{regra_id}")
@@ -1404,6 +1511,26 @@ def result(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPI
     if response:
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     matches = db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id).all()
+    matches_by_id = {item.id: item for item in matches}
+    match_ids = [item.id for item in matches]
+    movement_ids = [item.movimento_extrato_id for item in matches]
+    receipt_ids = [item.comprovante_id for item in matches if item.comprovante_id]
+    rfb_ids = [item.comprovante_rfb_id for item in matches if item.comprovante_rfb_id]
+    movements = {item.id: item for item in db.query(MovimentoExtrato).filter(MovimentoExtrato.id.in_(movement_ids)).all()} if movement_ids else {}
+    receipts = {item.id: item for item in db.query(Comprovante).filter(Comprovante.id.in_(receipt_ids)).all()} if receipt_ids else {}
+    rfb_receipts = {item.id: item for item in db.query(ComprovanteRfb).filter(ComprovanteRfb.id.in_(rfb_ids)).all()} if rfb_ids else {}
+    rfb_items_by_receipt: dict[str, list[ComprovanteRfbItem]] = defaultdict(list)
+    if rfb_ids:
+        for item in db.query(ComprovanteRfbItem).filter(ComprovanteRfbItem.comprovante_rfb_id.in_(rfb_ids)).all():
+            rfb_items_by_receipt[item.comprovante_rfb_id].append(item)
+    entries_by_match: dict[str, list[LancamentoContabil]] = defaultdict(list)
+    rule_ids = set()
+    if match_ids:
+        for entry in db.query(LancamentoContabil).filter(LancamentoContabil.correspondencia_id.in_(match_ids)).order_by(LancamentoContabil.ordem, LancamentoContabil.id).all():
+            entries_by_match[entry.correspondencia_id].append(entry)
+            if entry.regra_contabil_id:
+                rule_ids.add(entry.regra_contabil_id)
+    rules = {item.id: item for item in db.query(RegraContabil).filter(RegraContabil.id.in_(rule_ids)).all()} if rule_ids else {}
     rows = []
     def money(value):
         if value is None: return "—"
@@ -1421,9 +1548,33 @@ def result(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPI
         if "IMPOSTO" in text or "DAS" in text: return "Imposto"
         if "CARTÃO" in text: return "Cartão"
         return "Outro"
+    def tax_complement_cached(entry: LancamentoContabil, match: Correspondencia) -> tuple[str, str, str, str]:
+        rfb = rfb_receipts.get(match.comprovante_rfb_id) if match.comprovante_rfb_id else None
+        receipt = receipts.get(match.comprovante_id) if match.comprovante_id else None
+        movement = movements.get(match.movimento_extrato_id)
+        rfb_items = rfb_items_by_receipt.get(rfb.id, []) if rfb else []
+        rule = rules.get(entry.regra_contabil_id) if entry.regra_contabil_id else None
+        source = " ".join(str(value or "") for value in [entry.componente, entry.tributo, entry.codigo_receita, entry.descricao, entry.historico, movement.historico if movement else "", receipt.texto_original if receipt else "", rfb.tipo if rfb else "", rfb.razao_social if rfb else "", " ".join(f"{item.codigo} {item.descricao}" for item in rfb_items), rule.tipo_componente if rule else "", rule.historico if rule else ""])
+        normalized = normalize_name(source)
+        if "SIMPLES" in normalized:
+            tax = "SIMPLES NACIONAL"
+        elif entry.componente == "IRRF" or entry.codigo_receita.lstrip("0") in {"156", "561"} or "IRRF" in normalized:
+            tax = "IRRF"
+        elif entry.componente == "INSS" or "INSS" in normalized or "PREVIDENCI" in normalized:
+            tax = "INSS"
+        elif entry.componente == "FGTS" or "FGTS" in normalized:
+            tax = "FGTS"
+        else:
+            return "", "", "", ""
+        competence = extract_competence(rfb.texto_original, rfb.competencia, rfb.periodo_apuracao) if rfb else ""
+        origin = "Comprovante RFB" if rfb else "Comprovante bancário" if receipt else ""
+        return tax, competence, competence, origin
     for match in matches:
-        movement, receipt, rfb = db.get(MovimentoExtrato, match.movimento_extrato_id), db.get(Comprovante, match.comprovante_id) if match.comprovante_id else None, db.get(ComprovanteRfb, match.comprovante_rfb_id) if match.comprovante_rfb_id else None
-        total_lines = sum((line.valor for line in db.query(LancamentoContabil).filter_by(correspondencia_id=match.id)), 0)
+        movement, receipt, rfb = movements.get(match.movimento_extrato_id), receipts.get(match.comprovante_id) if match.comprovante_id else None, rfb_receipts.get(match.comprovante_rfb_id) if match.comprovante_rfb_id else None
+        if not movement:
+            continue
+        entries = unique_accounting_entries(entries_by_match.get(match.id, []))
+        total_lines = sum((statement_effect_value(line.valor, line.efeito_no_total) for line in entries), Decimal("0.00"))
         movement_date = movement.data.strftime("%d/%m/%Y")
         receipt_detail = "—" if not receipt else f"Data: {receipt.data.strftime('%d/%m/%Y')}\nTipo: {receipt.tipo_operacao or '—'}\nDocumento: {receipt.numero_documento or '—'}\nFavorecido: {receipt.favorecido}\nValor pago: {money(receipt.valor_pago)}"
         rfb_detail = "—" if not rfb else f"Data: {rfb.data_arrecadacao.strftime('%d/%m/%Y') if rfb.data_arrecadacao else '—'}\nTipo: {rfb.tipo}\nCompetência: {rfb.competencia or rfb.periodo_apuracao or '—'}\nBanco: {rfb.nome_banco}\nTotal: {money(rfb.valor_total)}"
@@ -1435,11 +1586,11 @@ def result(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPI
             receipt_composition = {"valor_documento": money(receipt.valor_original), "valor_cobrado": money(receipt.valor_pago), "desconto": money(discount), "juros": money(receipt.valor_juros), "multa": money(receipt.valor_multa), "encargos": money(receipt.valor_encargos), "valor_calculado": money(expected), "diferenca": money((receipt.valor_pago or 0) - expected), "confere": abs((receipt.valor_pago or 0) - expected) <= Decimal("0.01")}
         rows.append({"id": match.id, "data": movement_date, "tipo_pagamento": payment_type(movement.historico), "natureza": normalize_statement_nature(movement.natureza), "natureza_contabil": accounting_nature(movement.natureza), "extrato": f"Data: {movement_date}\nTexto: {' '.join(item for item in [movement.historico, movement.nome_encontrado] if item)}\nValor: {money(movement.valor)}", "comprovante_bancario": receipt_detail, "comprovante_rfb": rfb_detail, "comprovante_composicao": receipt_composition, "extrato_arquivo_id": movement.arquivo_id, "extrato_pagina": movement.pagina_numero, "comprovante_arquivo_id": receipt.arquivo_id if receipt else None, "comprovante_pagina": receipt.pagina_numero if receipt else None, "rfb_arquivo_id": rfb.arquivo_id if rfb else None, "rfb_pagina": rfb.pagina_numero if rfb else None, "valor": money(movement.valor), "fonte_regra": match.fonte_regra or "—", "total_lancamentos": money(total_lines), "diferenca": money(movement.valor - total_lines), "confianca": match.confianca, "situacao": match.status})
     for row in rows:
-        items = db.query(LancamentoContabil).filter_by(correspondencia_id=row["id"]).order_by(LancamentoContabil.ordem, LancamentoContabil.id).all()
-        match = db.get(Correspondencia, row["id"])
+        items = unique_accounting_entries(entries_by_match.get(row["id"], []))
+        match = matches_by_id[row["id"]]
         row["lancamentos"] = []
         for item in items:
-            tax, competence, _, source = tax_complement(item, match, db)
+            tax, competence, _, source = tax_complement_cached(item, match)
             row["lancamentos"].append({"id": item.id, "componente": item.componente, "categoria": item.categoria, "tributo": item.tributo, "codigo_receita": item.codigo_receita, "descricao": item.descricao, "efeito_no_total": item.efeito_no_total, "valor": money(item.valor), "conta_debito": item.conta_debito, "conta_credito": item.conta_credito, "historico": item.historico, "complemento": item.complemento, "imposto": tax, "competencia": competence, "competencia_nao_identificada": bool(tax and not competence), "comprovante_origem": source, "origem": item.origem, "status": item.status, "regra_contabil_id": item.regra_contabil_id})
     return rows
 

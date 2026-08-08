@@ -7,7 +7,7 @@ from fastapi import HTTPException, Response
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
-from app.api.routes import RegraContabilInput, RegraContabilPreviaInput, accounting_csv, accounting_integrity, accounting_pdf, accounting_rules, apply_accounting_rules, create_accounting_rule, delete_accounting_rule, delete_accounting_rule_for_reconciliation, delete_all_accounting_rules, ignore_rule_in_period, preview_accounting_rule, result, restore_rule_in_period, review, rule_matches_movement, unused_documents, update_accounting_rule
+from app.api.routes import RegraContabilInput, RegraContabilPreviaInput, accounting_csv, accounting_integrity, accounting_pdf, accounting_rules, apply_accounting_rules, create_accounting_rule, delete_accounting_rule, delete_accounting_rule_for_reconciliation, delete_all_accounting_rules, delete_zero_covered_accounting_rules, ignore_rule_in_period, preview_accounting_rule, result, restore_rule_in_period, review, rule_matches_movement, unused_documents, update_accounting_rule
 import app.api.routes as routes
 from app.core.database import Base
 from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, RegraContabil, RegraContabilExcecao
@@ -201,6 +201,20 @@ def test_saved_rule_disappears_from_pending_and_is_returned_as_saved_after_refre
     assert first_load["salvas"][0]["cobertos"] == 1
 
 
+def test_rule_keywords_match_statement_regardless_of_selected_word_order():
+    session, reconciliation, _ = rules_session("PIX FORNECEDOR")
+
+    preview = preview_accounting_rule(reconciliation.id, RegraContabilPreviaInput(gatilho="FORNECEDOR PIX", natureza="Crédito", tipo_componente="PRINCIPAL"), session)
+    created = create_accounting_rule(reconciliation.id, rule_input("FORNECEDOR PIX"), session)
+    data = accounting_rules(reconciliation.id, session)
+
+    assert preview["quantidade"] == 1
+    assert created["movimentos_aplicados"] == 1
+    assert data["pendentes"] == []
+    assert data["salvas"][0]["gatilho"] == "FORNECEDOR PIX"
+    assert data["salvas"][0]["cobertos"] == 1
+
+
 def test_rule_created_in_one_period_does_not_apply_to_another_period():
     session, reconciliation, _ = rules_session()
     next_period = Conciliacao(cliente_id=reconciliation.cliente_id, banco=reconciliation.banco, data_inicio=date(2024, 2, 1), data_fim=date(2024, 2, 29))
@@ -215,6 +229,34 @@ def test_rule_created_in_one_period_does_not_apply_to_another_period():
 
     assert len(data["pendentes"]) == 1
     assert data["salvas"] == []
+
+
+def test_global_rule_created_in_one_period_applies_to_next_period():
+    session, reconciliation, _ = rules_session()
+    next_period = Conciliacao(cliente_id=reconciliation.cliente_id, banco=reconciliation.banco, data_inicio=date(2024, 2, 1), data_fim=date(2024, 2, 29))
+    session.add(next_period); session.flush()
+    file = Arquivo(conciliacao_id=next_period.id, tipo_documento="extrato", banco_selecionado=next_period.banco, nome_original="fevereiro.pdf", caminho="/tmp/fevereiro.pdf")
+    session.add(file); session.flush()
+    session.add(MovimentoExtrato(conciliacao_id=next_period.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 2, 2), historico="PIX FORNECEDOR", valor=Decimal("20.00"), natureza="saída"))
+    session.commit()
+
+    create_accounting_rule(reconciliation.id, rule_input(scope="global"), session)
+    data = accounting_rules(next_period.id, session)
+
+    assert data["pendentes"] == []
+    assert len(data["salvas"]) == 1
+    assert data["salvas"][0]["escopo"] == "global"
+    assert data["salvas"][0]["cobertos"] == 1
+    assert data["salvas"][0]["movimentos"][0]["valor"] == "20.00"
+
+
+def test_accounting_rule_input_defaults_to_global_scope():
+    session, reconciliation, _ = rules_session()
+    payload = RegraContabilInput(gatilho="FORNECEDOR", natureza="Crédito", tipo_componente="PRINCIPAL", conta_debito="Despesa", conta_credito="Banco", historico="Pagamento")
+
+    created = create_accounting_rule(reconciliation.id, payload, session)
+
+    assert session.get(RegraContabil, created["id"]).escopo == "global"
 
 
 def test_backend_preview_and_save_match_beneficiary_final_trigger():
@@ -260,6 +302,92 @@ def test_rule_preview_uses_batched_queries_for_large_period():
     assert len(queries) <= 5
 
 
+def test_accounting_rules_load_uses_batched_queries_for_large_period():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Santander", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Santander", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    session.add(file); session.flush()
+    rule = RegraContabil(cliente_id=client.id, conciliacao_id=reconciliation.id, banco="Santander", tipo_fonte="extrato", tipo_operacao="Crédito", favorecido_normalizado=normalize_name("PIX FORNECEDOR"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento")
+    session.add(rule); session.flush()
+    for number in range(80):
+        movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 2), historico=f"PIX FORNECEDOR {number}", valor=Decimal("10.00"), natureza="saída")
+        session.add(movement); session.flush()
+        receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, favorecido=f"Fornecedor {number}")
+        session.add(receipt); session.flush()
+        match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id, comprovante_id=receipt.id)
+        session.add(match); session.flush()
+        session.add(LancamentoContabil(correspondencia_id=match.id, regra_contabil_id=rule.id, componente="PRINCIPAL", valor=movement.valor, conta_debito="Despesa", conta_credito="Banco", historico="Pagamento", status="aplicado_por_regra"))
+    session.commit()
+    queries = []
+    event.listen(engine, "before_cursor_execute", lambda *args: queries.append(1))
+
+    data = accounting_rules(reconciliation.id, session)
+
+    assert len(data["salvas"]) == 1
+    assert data["salvas"][0]["cobertos"] == 80
+    assert len(queries) <= 18
+
+
+def test_apply_accounting_rules_uses_batched_queries_for_large_period():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Santander", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Santander", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    session.add(file); session.flush()
+    session.add(RegraContabil(cliente_id=client.id, conciliacao_id=reconciliation.id, banco="Santander", tipo_fonte="extrato", tipo_operacao="Crédito", favorecido_normalizado=normalize_name("PIX FORNECEDOR"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento"))
+    for number in range(80):
+        movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 2), historico=f"PIX FORNECEDOR {number}", valor=Decimal("10.00"), natureza="saída")
+        session.add(movement); session.flush()
+        match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id)
+        session.add(match); session.flush()
+        session.add(LancamentoContabil(correspondencia_id=match.id, componente="PRINCIPAL", valor=movement.valor, status="pendente"))
+    session.commit()
+    queries = []
+    event.listen(engine, "before_cursor_execute", lambda *args: queries.append(1))
+
+    assert apply_accounting_rules(reconciliation, session) == 80
+    assert len(queries) <= 10
+
+
+def test_result_load_uses_batched_queries_for_large_period():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Santander", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Santander", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    session.add(file); session.flush()
+    rule = RegraContabil(cliente_id=client.id, conciliacao_id=reconciliation.id, banco="Santander", tipo_fonte="extrato", tipo_operacao="Crédito", favorecido_normalizado=normalize_name("PIX FORNECEDOR"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento")
+    session.add(rule); session.flush()
+    for number in range(80):
+        movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 2), historico=f"PIX FORNECEDOR {number}", valor=Decimal("10.00"), natureza="saída")
+        receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 2), favorecido=f"Fornecedor {number}", valor_pago=Decimal("10.00"), tipo_operacao="PIX")
+        session.add_all([movement, receipt]); session.flush()
+        match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id, comprovante_id=receipt.id, regra_contabil_id=rule.id, status="Conciliado")
+        session.add(match); session.flush()
+        session.add(LancamentoContabil(correspondencia_id=match.id, regra_contabil_id=rule.id, componente="PRINCIPAL", valor=movement.valor, conta_debito="Despesa", conta_credito="Banco", historico="Pagamento", status="aplicado_por_regra"))
+    session.commit()
+    queries = []
+    event.listen(engine, "before_cursor_execute", lambda *args: queries.append(1))
+
+    rows = result(reconciliation.id, session)
+
+    assert len(rows) == 80
+    assert rows[0]["lancamentos"][0]["historico"] == "Pagamento"
+    assert len(queries) <= 8
+
+
 def test_persisted_covered_entry_does_not_return_zero_eligible_suggestion():
     session, reconciliation, movement = rules_session("PIX ATUAL")
     legacy_rule = RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco="Santander", tipo_fonte="extrato", tipo_operacao="Crédito", favorecido_normalizado=normalize_name("FORNECEDOR ANTIGO"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento")
@@ -271,8 +399,34 @@ def test_persisted_covered_entry_does_not_return_zero_eligible_suggestion():
     data = accounting_rules(reconciliation.id, session)
 
     assert len(data["pendentes"]) == 1
-    assert data["salvas"] == []
+    assert len(data["salvas"]) == 1
+    assert data["salvas"][0]["cobertos"] == 0
     assert data["integridade"]["movimentos_incompletos"][0]["movimento_id"] == movement.id
+
+
+def test_saved_rule_preview_counts_its_currently_covered_entries_when_editing_trigger():
+    session, reconciliation, _ = rules_session("821 PIX RECEBIDO")
+    created = create_accounting_rule(reconciliation.id, rule_input("821 PIX RECEBIDO"), session)
+
+    preview = preview_accounting_rule(reconciliation.id, RegraContabilPreviaInput(gatilho="Pix", natureza="Crédito", tipo_componente="PRINCIPAL", regra_id=created["id"]), session)
+
+    assert preview["quantidade"] == 1
+    assert preview["motivo"] == ""
+
+
+def test_saved_rule_preview_can_recover_complete_entries_left_without_active_rule():
+    session, reconciliation, movement = rules_session("821 PIX RECEBIDO")
+    created = create_accounting_rule(reconciliation.id, rule_input("821 PIX RECEBIDO"), session)
+    match = session.query(Correspondencia).filter_by(movimento_extrato_id=movement.id).one()
+    entry = session.query(LancamentoContabil).filter_by(correspondencia_id=match.id).one()
+    entry.regra_contabil_id = None
+    match.regra_contabil_id = None
+    session.commit()
+
+    preview = preview_accounting_rule(reconciliation.id, RegraContabilPreviaInput(gatilho="Pix", natureza="Crédito", tipo_componente="PRINCIPAL", regra_id=created["id"]), session)
+
+    assert preview["quantidade"] == 1
+    assert preview["motivo"] == ""
 
 
 def test_deleting_saved_rule_recalculates_its_pending_suggestion():
@@ -510,6 +664,37 @@ def test_clearing_all_rules_removes_entries_left_by_inactive_rules():
     assert accounting_rules(reconciliation.id, session)["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
 
 
+def test_clearing_zero_covered_rules_hides_only_current_period_and_keeps_global_rule():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    january = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    february = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 2, 1), data_fim=date(2024, 2, 29))
+    session.add_all([january, february]); session.flush()
+    january_file = Arquivo(conciliacao_id=january.id, tipo_documento="extrato", banco_selecionado=january.banco, nome_original="jan.pdf", caminho="/tmp/jan.pdf")
+    february_file = Arquivo(conciliacao_id=february.id, tipo_documento="extrato", banco_selecionado=february.banco, nome_original="fev.pdf", caminho="/tmp/fev.pdf")
+    session.add_all([january_file, february_file]); session.flush()
+    session.add_all([
+        MovimentoExtrato(conciliacao_id=january.id, arquivo_id=january_file.id, pagina_numero=1, data=date(2024, 1, 5), historico="PIX FORNECEDOR", valor=Decimal("100.00"), natureza="saída"),
+        MovimentoExtrato(conciliacao_id=february.id, arquivo_id=february_file.id, pagina_numero=1, data=date(2024, 2, 5), historico="TED OUTRO", valor=Decimal("200.00"), natureza="saída"),
+    ])
+    session.commit()
+    created = create_accounting_rule(january.id, rule_input("PIX", scope="global"), session)
+
+    before = accounting_rules(february.id, session)
+    assert before["salvas"][0]["cobertos"] == 0
+
+    response = delete_zero_covered_accounting_rules(february.id, session)
+
+    assert response["quantidade"] == 1
+    assert response["regras"]["salvas"] == []
+    assert session.get(RegraContabil, created["id"]).ativo is True
+    assert session.query(RegraContabilExcecao).filter_by(regra_contabil_id=created["id"], conciliacao_id=february.id).count() == 1
+    assert accounting_rules(january.id, session)["salvas"][0]["cobertos"] == 1
+
+
 def test_deleting_a_rule_immediately_removes_its_value_from_reason():
     session, reconciliation, _ = rules_session()
     created = create_accounting_rule(reconciliation.id, rule_input(), session)
@@ -519,13 +704,18 @@ def test_deleting_a_rule_immediately_removes_its_value_from_reason():
     assert accounting_rules(reconciliation.id, session)["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
 
 
-def test_updating_a_rule_to_not_match_removes_its_value_from_reason():
+def test_updating_a_rule_to_zero_covered_is_rejected_and_keeps_previous_rule():
     session, reconciliation, _ = rules_session()
     created = create_accounting_rule(reconciliation.id, rule_input(), session)
 
-    update_accounting_rule(reconciliation.id, created["id"], rule_input("INEXISTENTE"), session)
+    with pytest.raises(HTTPException, match="não cobre nenhum lançamento"):
+        update_accounting_rule(reconciliation.id, created["id"], rule_input("INEXISTENTE"), session)
 
-    assert accounting_rules(reconciliation.id, session)["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
+    data = accounting_rules(reconciliation.id, session)
+    assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "12.50", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
+    assert len(data["salvas"]) == 1
+    assert data["salvas"][0]["gatilho"] == "FORNECEDOR"
+    assert data["salvas"][0]["cobertos"] == 1
 
 
 def test_inactive_rule_residue_is_excluded_from_reason_and_coverage():
@@ -538,6 +728,18 @@ def test_inactive_rule_residue_is_excluded_from_reason_and_coverage():
 
     assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "0.00", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
     assert len(data["pendentes"]) == 1
+
+
+def test_new_rule_preview_can_cover_entries_left_by_inactive_rule():
+    session, reconciliation, _ = rules_session("821 PIX RECEBIDO")
+    created = create_accounting_rule(reconciliation.id, rule_input("821 PIX RECEBIDO"), session)
+    session.get(RegraContabil, created["id"]).ativo = False
+    session.commit()
+
+    preview = preview_accounting_rule(reconciliation.id, RegraContabilPreviaInput(gatilho="Pix", natureza="Crédito", tipo_componente="PRINCIPAL"), session)
+
+    assert preview["quantidade"] == 1
+    assert preview["motivo"] == ""
 
 
 def test_other_bank_rule_never_enters_current_bank_reason():

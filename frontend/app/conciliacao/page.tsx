@@ -3,6 +3,7 @@
 import { ChangeEvent, Fragment, useEffect, useRef, useState } from "react";
 import {
   BookOpenCheck,
+  CalendarDays,
   CheckCircle2,
   Copy,
   Download,
@@ -21,6 +22,7 @@ import {
 import { ProcessTopBar } from "../components/process-top-bar";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const MESSAGE_TIMEOUT_MS = 6000;
 const banks = [
   "Banco do Brasil",
   "Santander",
@@ -264,7 +266,50 @@ function OtherSummary({ previous, debit, credit, total }: { previous: number; de
 }
 
 function LoadingValuesOverlay() {
-  return <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/15 p-4 backdrop-blur-sm"><div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white px-5 py-4 text-sm font-semibold text-slate-700 shadow-xl"><RefreshCw className="animate-spin text-teal-700" size={20} />Aguarde, carregando valores...</div></div>;
+  return <div className="fixed bottom-12 right-4 z-50 flex items-center gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 shadow-lg"><RefreshCw className="animate-spin text-teal-700" size={16} />Atualizando valores...</div>;
+}
+
+function showInputStart(input: HTMLInputElement) {
+  requestAnimationFrame(() => {
+    input.scrollLeft = 0;
+  });
+}
+
+function formatPeriodCard(start: string, end: string) {
+  const parse = (value: string) => {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value || "");
+    return match ? { year: match[1], month: match[2], day: match[3] } : null;
+  };
+  const startDate = parse(start);
+  const endDate = parse(end);
+  if (!startDate || !endDate) return "";
+  const months = [
+    "Janeiro",
+    "Fevereiro",
+    "Março",
+    "Abril",
+    "Maio",
+    "Junho",
+    "Julho",
+    "Agosto",
+    "Setembro",
+    "Outubro",
+    "Novembro",
+    "Dezembro",
+  ];
+  const monthName = months[Number(startDate.month) - 1] ?? startDate.month;
+  if (startDate.month === endDate.month && startDate.year === endDate.year) {
+    return `${monthName} ${startDate.year} (${startDate.day}-${endDate.day}/${startDate.month})`;
+  }
+  return `${monthName} ${startDate.year} (${startDate.day}/${startDate.month}-${endDate.day}/${endDate.month})`;
+}
+
+function useAutoDismissMessage(message: string, setMessage: (value: string) => void) {
+  useEffect(() => {
+    if (!message) return;
+    const timeout = window.setTimeout(() => setMessage(""), MESSAGE_TIMEOUT_MS);
+    return () => window.clearTimeout(timeout);
+  }, [message, setMessage]);
 }
 
 function AdvancedOverview({
@@ -405,6 +450,7 @@ function LegacyAdvancedRulesPanel({
     [filter, setFilter] = useState(""),
     [drafts, setDrafts] = useState<Record<string, Record<string, string>>>({}),
     [message, setMessage] = useState("");
+  useAutoDismissMessage(message, setMessage);
   async function loadRules() {
     const response = await fetch(
       `${API}/api/conciliacoes/${reconciliationId}/regras-contabeis`,
@@ -435,6 +481,7 @@ function LegacyAdvancedRulesPanel({
         body: JSON.stringify({
           gatilho: field(item, "gatilho", item.historico),
           natureza: item.natureza,
+          escopo: "global",
           conta_debito: field(item, "debito"),
           conta_credito: field(item, "credito"),
           historico: field(item, "historico", item.historico),
@@ -654,12 +701,12 @@ function AdvancedRulesPanel({
   const [pending, setPending] = useState<PendingRule[]>([]);
   const [saved, setSaved] = useState<SavedRule[]>([]);
   const [ignored, setIgnored] = useState<IgnoredRule[]>([]);
-  const [previews, setPreviews] = useState<Record<string, { quantidade: number; lancamentos: { fonte: string }[]; motivo: string }>>({});
+  const [previews, setPreviews] = useState<Record<string, { quantidade: number; lancamentos: { fonte: string }[]; motivo: string; gatilho?: string; gatilho_comprovante?: string }>>({});
   const [account, setAccount] = useState("Sem conta");
   const [drafts, setDrafts] = useState<Record<string, Record<string, string>>>(
     {},
   );
-  const [view, setView] = useState<"pending" | "saved">("pending");
+  const [view, setView] = useState<"pending" | "saved" | "hidden">("pending");
   const [filter, setFilter] = useState(""),
     [wordPicker, setWordPicker] = useState<string | null>(null),
     [receiptWordPicker, setReceiptWordPicker] = useState<string | null>(null),
@@ -672,6 +719,7 @@ function AdvancedRulesPanel({
       .replace(/\s+/g, " ")
       .trim();
   const [message, setMessage] = useState("");
+  useAutoDismissMessage(message, setMessage);
   const [busyRuleId, setBusyRuleId] = useState<string | null>(null);
   const [confirmClearAll, setConfirmClearAll] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<SavedRule | null>(null);
@@ -701,9 +749,23 @@ function AdvancedRulesPanel({
     const rules = await rulesResponse.json();
     const bankAccount = await accountResponse.json();
     if (request !== loadRequest.current) return null;
-    applyRulesSnapshot(rules);
+    let currentRules = rules;
+    const zeroCoveredCount = rules.salvas.filter((rule: SavedRule) => rule.cobertos === 0).length;
+    if (zeroCoveredCount) {
+      const cleanupResponse = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/sem-cobertura`, { method: "DELETE", cache: "no-store" });
+      if (request !== loadRequest.current) return null;
+      if (cleanupResponse.ok) {
+        const cleanup = await cleanupResponse.json();
+        currentRules = cleanup.regras ?? rules;
+        setMessage(cleanup.message ?? `${zeroCoveredCount} regra(s) sem cobertura movida(s) para regras ocultas.`);
+        onRulesChanged();
+      } else {
+        setMessage(await errorMessage(cleanupResponse, "Não foi possível ocultar automaticamente as regras sem cobertura."));
+      }
+    }
+    applyRulesSnapshot(currentRules);
     setAccount(bankAccount.conta_contabil || "Sem conta");
-    return rules;
+    return currentRules;
   }
   useEffect(() => {
     load();
@@ -749,15 +811,16 @@ function AdvancedRulesPanel({
       gatilho_comprovante: value(item.id, "gatilhoComprovante", fields.gatilhoComprovante),
       natureza: item.natureza_contabil || item.natureza,
       tipo_componente: item.tipo_componente || "",
+      regra_id: "gatilho" in item ? item.id : "",
     };
-    if (!body.gatilho.trim() && !body.gatilho_comprovante.trim()) return setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Informe um gatilho para validar a regra." } }));
+    if (!body.gatilho.trim() && !body.gatilho_comprovante.trim()) return setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Informe um gatilho para validar a regra.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } }));
     try {
       const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/previa`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), cache: "no-store" });
-      if (!response.ok) return setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Não foi possível validar o gatilho." } }));
+      if (!response.ok) return setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Não foi possível validar o gatilho.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } }));
       const result = await response.json();
-      setPreviews((current) => ({ ...current, [item.id]: result }));
+      setPreviews((current) => ({ ...current, [item.id]: { ...result, gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } }));
     } catch {
-      setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Não foi possível validar o gatilho." } }));
+      setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Não foi possível validar o gatilho.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } }));
     }
   }
   const defaults = (item: PendingRule | SavedRule) =>
@@ -802,7 +865,7 @@ function AdvancedRulesPanel({
       gatilho_comprovante: value(item.id, "gatilhoComprovante", fields.gatilhoComprovante),
       natureza: item.natureza_contabil || item.natureza,
       tipo_componente: item.tipo_componente || "",
-      escopo: existing && "gatilho" in item ? item.escopo || "global" : "periodo",
+      escopo: existing && "gatilho" in item ? item.escopo || "global" : "global",
       conta_debito: value(item.id, "debito", fields.debito),
       conta_credito: value(item.id, "credito", fields.credito),
       historico: value(item.id, "historico", fields.historico),
@@ -825,11 +888,12 @@ function AdvancedRulesPanel({
       setMessage(
         existing
           ? "Regra atualizada e reaplicada."
-          : "Regra salva e aplicada aos lançamentos compatíveis.",
+          : `Regra salva e aplicada a ${result.movimentos_aplicados ?? 0} lançamento(s) neste período.`,
       );
       setDrafts((items) => ({ ...items, [item.id]: {} }));
       if (result.regras) applyRulesSnapshot(result.regras);
       else await load();
+      if (!existing) setView("saved");
       onRulesChanged();
     } catch {
       setMessage("Não foi possível salvar a regra. Verifique a conexão e tente novamente.");
@@ -891,6 +955,24 @@ function AdvancedRulesPanel({
       onRulesChanged();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Não foi possível limpar as regras. Verifique a conexão e tente novamente.");
+    } finally {
+      setBusyRuleId(null);
+    }
+  }
+  async function clearZeroCoveredRules(openHidden = false) {
+    if (busyRuleId) return;
+    setBusyRuleId("zero-covered");
+    try {
+      const response = await requestWithTimeout(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/sem-cobertura`, { method: "DELETE" }, "A limpeza das regras sem cobertura");
+      if (!response.ok) return setMessage(await errorMessage(response, "Não foi possível limpar as regras sem cobertura."));
+      const result = await response.json();
+      setMessage(result.message ?? "Regras sem cobertura ocultadas somente deste período.");
+      if (result.regras) applyRulesSnapshot(result.regras);
+      else await load();
+      if (openHidden) setView("hidden");
+      onRulesChanged();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Não foi possível limpar as regras sem cobertura. Verifique a conexão e tente novamente.");
     } finally {
       setBusyRuleId(null);
     }
@@ -1051,12 +1133,23 @@ function AdvancedRulesPanel({
     const words = pendingItem?.historico.match(/[\p{L}\p{N}]+/gu) ?? [];
     const keyword = value(item.id, "gatilho", fields.gatilho);
     const receiptKeyword = value(item.id, "gatilhoComprovante", fields.gatilhoComprovante);
-    const preview = previews[item.id];
+    const storedPreview = previews[item.id];
+    const preview = storedPreview && storedPreview.gatilho === keyword && storedPreview.gatilho_comprovante === receiptKeyword ? storedPreview : undefined;
     const coveredCount =
       "cobertos" in item && keyword === fields.gatilho && receiptKeyword === fields.gatilhoComprovante
         ? item.cobertos
         : preview?.quantidade ?? 0;
     const canSave = existing || coveredCount > 0;
+    const coverageMessage = existing
+      ? coveredCount
+        ? `Cobrindo ${coveredCount} lançamento(s)`
+        : "Sem lançamentos cobertos neste período"
+      : preview
+        ? coveredCount
+          ? `Vai cobrir ${coveredCount} lançamento(s)`
+          : "Não cobre lançamentos elegíveis"
+        : "Clique em Ver cobertura para calcular";
+    const coverageClass = coveredCount ? "" : preview || existing ? "text-red-700" : "text-slate-500";
     return (
       <tr
         className={`border-t align-top ${compact ? "bg-inherit" : simple ? "border-y border-l-4 border-emerald-200 border-l-emerald-300 bg-emerald-50/70" : ""}`}
@@ -1112,17 +1205,19 @@ function AdvancedRulesPanel({
               )}
             </td>
             <td className={`${existing ? "w-[8%]" : ""} px-2 py-2`}>
-              <span
-                className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${isDebit ? "bg-blue-100 text-blue-800" : "bg-red-100 text-red-800"}`}
-              >
-                {isDebit ? "Débito" : "Crédito"}
-              </span>
-          {item.tipo_componente && !simple && (
-                <span className="ml-1 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700">
-                  {componentLabel(item.tipo_componente)}
+              <div className="flex flex-col items-start gap-1">
+                <span
+                  className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${isDebit ? "bg-blue-100 text-blue-800" : "bg-red-100 text-red-800"}`}
+                >
+                  {isDebit ? "Débito" : "Crédito"}
                 </span>
-              )}
-              {existing && "gatilho" in item && <span className={`ml-1 rounded px-1.5 py-0.5 text-[10px] font-semibold ${item.escopo === "periodo" ? "bg-violet-100 text-violet-800" : "bg-amber-100 text-amber-800"}`}>{item.escopo === "periodo" ? "Este período" : "Global"}</span>}
+                {item.tipo_componente && !simple && (
+                  <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700">
+                    {componentLabel(item.tipo_componente)}
+                  </span>
+                )}
+                {existing && "gatilho" in item && <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${item.escopo === "periodo" ? "bg-violet-100 text-violet-800" : "bg-amber-100 text-amber-800"}`}>{item.escopo === "periodo" ? "Este período" : "Global"}</span>}
+              </div>
             </td>
             <td
               className={`${existing ? "w-[8%]" : ""} px-2 py-2 font-semibold whitespace-nowrap ${isDebit ? "text-blue-700" : "text-red-700"}`}
@@ -1141,7 +1236,6 @@ function AdvancedRulesPanel({
                 onChange={(event) =>
                   change(item.id, "gatilho", event.target.value)
                 }
-                onBlur={() => previewRule(item)}
               />
               {pendingItem && (
                 <>
@@ -1221,7 +1315,7 @@ function AdvancedRulesPanel({
             </div>
             {(pendingItem?.comprovante_arquivo_id || pendingItem?.comprovante_rfb_arquivo_id) && (
               <div className="mt-1 flex items-center gap-1">
-                <input className="w-20 rounded border border-violet-200 px-1.5 py-1" placeholder="comprovante..." value={receiptKeyword} onChange={(event) => change(item.id, "gatilhoComprovante", event.target.value)} onBlur={() => previewRule(item)} />
+                <input className="w-20 rounded border border-violet-200 px-1.5 py-1" placeholder="comprovante..." value={receiptKeyword} onChange={(event) => change(item.id, "gatilhoComprovante", event.target.value)} />
                 <button title="Usar comprovante completo" onClick={() => change(item.id, "gatilhoComprovante", (pendingItem.palavras_comprovante ?? []).join(" "))} className="rounded border border-violet-200 bg-violet-50 p-1 text-violet-700 hover:border-violet-500">
                   <Copy size={13} />
                 </button>
@@ -1239,9 +1333,8 @@ function AdvancedRulesPanel({
             {(keyword || receiptKeyword) && (
               <div className="mt-1 w-48 text-[10px] leading-4 text-emerald-700">
                 <span className="font-semibold">Texto usado pela regra</span>
-                <br /><span className={coveredCount ? "" : "text-red-700"}>{coveredCount ? "✓" : "!"} {preview ? `O backend confirmou ${coveredCount} lançamento(s)` : "Valide o gatilho para confirmar a cobertura"}</span>
-                <br />
-                <span className="text-slate-500">«{[keyword, receiptKeyword].filter(Boolean).join(" | ")}»</span>
+                <br /><span className={coverageClass}>{coveredCount ? "✓" : preview || existing ? "!" : "•"} {coverageMessage}</span>
+                {(keyword || receiptKeyword) && <><br /><span className="text-slate-500">«{[keyword, receiptKeyword].filter(Boolean).join(" | ")}»</span></>}
                 {preview?.lancamentos[0]?.fonte && <><br /><span className="text-slate-500">Fonte: {preview.lancamentos.map((match) => match.fonte).filter((value, index, values) => values.indexOf(value) === index).join(", ")}</span></>}
                 {preview?.motivo && <><br /><span className="text-red-700">{preview.motivo}</span></>}
               </div>
@@ -1252,32 +1345,42 @@ function AdvancedRulesPanel({
           <input
             list="catalogo-contas"
             title={value(item.id, "debito", fields.debito)}
-            className={`${existing ? "w-full min-w-0" : "w-20"} rounded border px-1.5 py-1 pr-5 text-[10px]`}
+            className={`${existing ? "w-full min-w-0" : "w-20"} rounded border px-1.5 py-1 pr-5 text-left text-[10px]`}
             placeholder="Selecionar"
             value={value(item.id, "debito", fields.debito)}
-            onChange={(event) => change(item.id, "debito", event.target.value)}
+            onChange={(event) => {
+              change(item.id, "debito", event.target.value);
+              showInputStart(event.currentTarget);
+            }}
+            onBlur={(event) => showInputStart(event.currentTarget)}
           />
         </td>
         <td className={`${existing ? "w-[10%]" : ""} px-2 py-1`}>
           <input
             list="catalogo-contas"
             title={value(item.id, "credito", fields.credito)}
-            className={`${existing ? "w-full min-w-0" : "w-20"} rounded border px-1.5 py-1 pr-5 text-[10px]`}
+            className={`${existing ? "w-full min-w-0" : "w-20"} rounded border px-1.5 py-1 pr-5 text-left text-[10px]`}
             placeholder="Selecionar"
             value={value(item.id, "credito", fields.credito)}
-            onChange={(event) => change(item.id, "credito", event.target.value)}
+            onChange={(event) => {
+              change(item.id, "credito", event.target.value);
+              showInputStart(event.currentTarget);
+            }}
+            onBlur={(event) => showInputStart(event.currentTarget)}
           />
         </td>
         <td className={`${existing ? "w-[14%]" : ""} px-2 py-1`}>
           <input
             list="catalogo-historicos"
             title={value(item.id, "historico", fields.historico)}
-            className={`${existing ? "w-full min-w-0" : "w-28"} rounded border px-1.5 py-1 pr-5 text-[10px]`}
+            className={`${existing ? "w-full min-w-0" : "w-28"} rounded border px-1.5 py-1 pr-5 text-left text-[10px]`}
             placeholder="Selecionar"
             value={value(item.id, "historico", fields.historico)}
-            onChange={(event) =>
-              change(item.id, "historico", event.target.value)
-            }
+            onChange={(event) => {
+              change(item.id, "historico", event.target.value);
+              showInputStart(event.currentTarget);
+            }}
+            onBlur={(event) => showInputStart(event.currentTarget)}
           />
         </td>
         <td className={`${existing ? "w-[13%]" : ""} px-2 py-1`}>
@@ -1292,6 +1395,7 @@ function AdvancedRulesPanel({
         {showAction && <td className={`${existing ? "w-[6%]" : "w-px"} whitespace-nowrap px-2 py-1`}>
           {!pendingItem?.regra_compartilhada && (
             <>
+              {!existing && !canSave && <button title="Ver cobertura da regra" aria-label="Ver cobertura da regra" disabled={busyRuleId === item.id} onClick={() => previewRule(item)} className="rounded border border-teal-700 px-2 py-1 text-teal-800 disabled:cursor-wait disabled:opacity-60">Ver cobertura</button>}
               {canSave && <button title={existing ? "Atualizar regra" : "Salvar regra"} aria-label={existing ? "Atualizar regra" : "Salvar regra"} disabled={busyRuleId === item.id} onClick={() => saveRule(item, existing)} className="rounded bg-teal-700 px-2 py-1 text-white disabled:cursor-wait disabled:opacity-60">
                 {busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : existing ? <RefreshCw size={14} /> : <CheckCircle2 size={14} />}
               </button>}
@@ -1318,10 +1422,9 @@ function AdvancedRulesPanel({
       return groups;
     }, {}),
   );
-  const displayedItems = view === "pending" ? visible : visibleSaved;
-  const showActions = displayedItems.some(
-    (item) => !("data" in item && item.regra_compartilhada),
-  );
+  const displayedItems = view === "pending" ? visible : view === "saved" ? visibleSaved : [];
+  const zeroCoveredRulesCount = saved.filter((rule) => rule.cobertos === 0).length;
+  const showActions = true;
   return (
     <section className="space-y-2 rounded-xl border border-slate-200 bg-white p-2.5">
       <datalist id="catalogo-contas">
@@ -1372,6 +1475,13 @@ function AdvancedRulesPanel({
           className="w-32 rounded border px-2 py-1.5 text-xs"
           placeholder="Filtrar histórico"
         />
+        <button
+          disabled={busyRuleId === "zero-covered"}
+          onClick={() => zeroCoveredRulesCount ? clearZeroCoveredRules(true) : setView("hidden")}
+          className={`rounded-md px-3 py-1.5 text-xs font-semibold disabled:cursor-wait disabled:opacity-60 ${view === "hidden" ? "bg-violet-700 text-white" : "border border-violet-200 bg-violet-50 text-violet-800"}`}
+        >
+          {busyRuleId === "zero-covered" ? "Limpando..." : `Regras ocultas (${ignored.length}) · 0 cobertos (${zeroCoveredRulesCount})`}
+        </button>
         {saved.length > 0 && <button onClick={() => setConfirmClearAll(true)} className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-semibold text-red-700">Limpar todas</button>}
         <div className="ml-auto flex flex-wrap items-center gap-1.5 rounded-md bg-slate-50 p-1.5">
           <label className="flex items-center gap-1 text-[11px] font-medium text-slate-600">
@@ -1383,12 +1493,17 @@ function AdvancedRulesPanel({
         </div>
       </div>
       {message && <p className="text-xs text-teal-800">{message}</p>}
-      {ignored.length > 0 && <section className="rounded-md border border-violet-200 bg-violet-50 p-3 text-xs text-violet-950">
-        <div className="flex items-center justify-between gap-3"><div><strong>Regras ignoradas neste período</strong><p className="mt-0.5 text-violet-800">Elas continuam ativas nos demais períodos deste cliente e banco.</p></div><span className="rounded bg-violet-200 px-2 py-0.5 font-semibold">{ignored.length}</span></div>
-        <div className="mt-2 divide-y divide-violet-200">
-          {ignored.map((rule) => <div className="flex items-center justify-between gap-3 py-2" key={rule.id}><span className="min-w-0 truncate"><strong>{rule.gatilho || rule.historico}</strong>{rule.tipo_componente ? ` · ${rule.tipo_componente}` : ""}</span><button disabled={busyRuleId === rule.id} onClick={() => restore(rule.id)} className="shrink-0 rounded border border-violet-300 bg-white px-2 py-1 font-semibold text-violet-800 disabled:opacity-60">{busyRuleId === rule.id ? "Restaurando..." : "Restaurar regra"}</button></div>)}
+      {view === "hidden" ? (
+        <div className="max-h-[calc(100dvh-330px)] overflow-auto rounded border border-violet-200 bg-violet-50 p-3 text-xs text-violet-950 overscroll-contain">
+          {ignored.length ? (
+            <div className="divide-y divide-violet-200">
+              {ignored.map((rule) => <div className="flex items-center justify-between gap-3 py-2" key={rule.id}><span className="min-w-0 truncate"><strong>{rule.gatilho || rule.historico}</strong>{rule.tipo_componente ? ` · ${rule.tipo_componente}` : ""}</span><button disabled={busyRuleId === rule.id} onClick={() => restore(rule.id)} className="shrink-0 rounded border border-violet-300 bg-white px-2 py-1 font-semibold text-violet-800 disabled:opacity-60">{busyRuleId === rule.id ? "Restaurando..." : "Restaurar regra"}</button></div>)}
+            </div>
+          ) : (
+            <p className="py-6 text-center text-violet-800">Nenhuma regra oculta neste período.</p>
+          )}
         </div>
-      </section>}
+      ) : (
       <div className="max-h-[calc(100dvh-330px)] overflow-auto rounded border overscroll-contain">
         <table className={`w-full text-left text-xs ${view === "saved" ? "table-fixed" : ""}`}>
           <thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase text-slate-500 shadow-sm">
@@ -1481,10 +1596,17 @@ function AdvancedRulesPanel({
                             className="border-x-2 border-b-2 border-sky-200 px-3 pb-3 text-[10px] text-slate-500"
                           >
                             {(() => {
-                              const principal = movement.componentes_cobertos?.find((item) => ["PRINCIPAL", "VALOR_COBRADO"].includes(item.componente));
-                              const missing = items.reduce((total, item) => total + Number(item.valor || 0), 0);
+                              const principalComponents = ["PRINCIPAL", "VALOR_COBRADO"];
+                              const isPrincipal = (component = "") => principalComponents.includes(component);
+                              const principal = movement.componentes_cobertos?.find((item) => isPrincipal(item.componente));
+                              const missingPrincipal = items
+                                .filter((item) => isPrincipal(item.tipo_componente))
+                                .reduce((total, item) => total + Number(item.valor || 0), 0);
+                              const pendingAdjustments = items
+                                .filter((item) => !isPrincipal(item.tipo_componente))
+                                .reduce((total, item) => total + Number(item.valor || 0), 0);
                               const money = (value: string | number) => Number(value || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2 });
-                              return <span>Principal já lançado: R$ {money(principal?.valor || 0)} | Faltando: R$ {money(missing)} | Valor total do documento: R$ {money(movement.valor_documento || 0)}</span>;
+                              return <span>Principal já lançado: R$ {money(principal?.valor || 0)} | Principal faltando: R$ {money(missingPrincipal)}{pendingAdjustments ? ` | Ajustes pendentes: R$ ${money(pendingAdjustments)}` : ""} | Valor total do documento: R$ {money(movement.valor_documento || 0)}</span>;
                             })()}
                           </td>
                         </tr>
@@ -1520,6 +1642,7 @@ function AdvancedRulesPanel({
           </tbody>
         </table>
       </div>
+      )}
       {confirmClearAll && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
         <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl">
           <h3 className="text-sm font-semibold text-slate-900">Limpar todas as regras?</h3>
@@ -2142,15 +2265,17 @@ function EditableResultTable({
                                           item,
                                           "conta_debito",
                                         )}
-                                        onChange={(event) =>
+                                        onChange={(event) => {
                                           change(
                                             rowId,
                                             item,
                                             "conta_debito",
                                             event.target.value,
-                                          )
-                                        }
-                                        className="w-32 rounded border px-1.5 py-1"
+                                          );
+                                          showInputStart(event.currentTarget);
+                                        }}
+                                        onBlur={(event) => showInputStart(event.currentTarget)}
+                                        className="w-32 rounded border px-1.5 py-1 pr-5 text-left"
                                       />
                                     </td>
                                     <td className="px-3 py-1">
@@ -2161,30 +2286,34 @@ function EditableResultTable({
                                           item,
                                           "conta_credito",
                                         )}
-                                        onChange={(event) =>
+                                        onChange={(event) => {
                                           change(
                                             rowId,
                                             item,
                                             "conta_credito",
                                             event.target.value,
-                                          )
-                                        }
-                                        className="w-32 rounded border px-1.5 py-1"
+                                          );
+                                          showInputStart(event.currentTarget);
+                                        }}
+                                        onBlur={(event) => showInputStart(event.currentTarget)}
+                                        className="w-32 rounded border px-1.5 py-1 pr-5 text-left"
                                       />
                                     </td>
                                     <td className="px-3 py-1">
                                       <input
                                         list="catalogo-historicos"
                                         value={value(rowId, item, "historico")}
-                                        onChange={(event) =>
+                                        onChange={(event) => {
                                           change(
                                             rowId,
                                             item,
                                             "historico",
                                             event.target.value,
-                                          )
-                                        }
-                                        className="w-48 rounded border px-1.5 py-1"
+                                          );
+                                          showInputStart(event.currentTarget);
+                                        }}
+                                        onBlur={(event) => showInputStart(event.currentTarget)}
+                                        className="w-48 rounded border px-1.5 py-1 pr-5 text-left"
                                       />
                                     </td>
                                     <td className="px-3 py-1">
@@ -2275,17 +2404,20 @@ function ConciliacaoFlow({
       initialBank ||
       localStorage.getItem("conciliai_banco") ||
       banks[0];
+    const storedClientId = params.get("client") || initialClientId || localStorage.getItem("conciliai_cliente_id") || "";
     fetch(`${API}/api/clientes`)
       .then((r) => r.json())
-      .then(setClients)
-      .catch(() => setMessage("Backend indisponível."));
+      .then((loadedClients: Client[]) => {
+        setClients(loadedClients);
+        if (storedClientId && loadedClients.some((client) => client.id === storedClientId)) {
+          setClientId(storedClientId);
+          return;
+        }
+        if (storedClientId) localStorage.removeItem("conciliai_cliente_id");
+        setClientId("");
+      })
+      .catch(() => setMessage("Sistema indisponível no momento."));
     setBank(fallbackBank);
-    setClientId(
-      params.get("client") ||
-        initialClientId ||
-        localStorage.getItem("conciliai_cliente_id") ||
-        "",
-    );
     if (!requestedProcess) return;
     fetch(`${API}/api/processos-conciliacao/${requestedProcess}`)
       .then((response) => (response.ok ? response.json() : Promise.reject()))
@@ -2328,23 +2460,13 @@ function ConciliacaoFlow({
     return () => { cancelled = true; };
   }, [reconciliationId, reviewVersion]);
   useEffect(() => {
-    const refresh = () => {
-      if (document.visibilityState !== "visible") return;
-      setReviewVersion((version) => version + 1);
-      setRulesVersion((version) => version + 1);
-      setResultsVersion((version) => version + 1);
-    };
-    window.addEventListener("focus", refresh);
-    window.addEventListener("pageshow", refresh);
-    document.addEventListener("visibilitychange", refresh);
-    return () => {
-      window.removeEventListener("focus", refresh);
-      window.removeEventListener("pageshow", refresh);
-      document.removeEventListener("visibilitychange", refresh);
-    };
-  }, []);
-  useEffect(() => {
     if (!clientId) {
+      setSelectedBankAccount(null);
+      return;
+    }
+    if (clients.length && !clients.some((client) => client.id === clientId)) {
+      localStorage.removeItem("conciliai_cliente_id");
+      setClientId("");
       setSelectedBankAccount(null);
       return;
     }
@@ -2358,12 +2480,8 @@ function ConciliacaoFlow({
         if (!cancelled) setSelectedBankAccount(null);
       });
     return () => { cancelled = true; };
-  }, [clientId, bank]);
-  useEffect(() => {
-    if (!message) return;
-    const timeout = window.setTimeout(() => setMessage(""), 6000);
-    return () => window.clearTimeout(timeout);
-  }, [message]);
+  }, [clientId, bank, clients]);
+  useAutoDismissMessage(message, setMessage);
   useEffect(() => {
     if (
       !reconciliationId ||
@@ -2662,6 +2780,7 @@ function ConciliacaoFlow({
       `${API}/api/conciliacoes/${reconciliationId}/lancamentos-contabeis.csv`,
     );
   }
+  const periodCard = formatPeriodCard(start, end);
   return (
     <>
       <>
@@ -2677,28 +2796,36 @@ function ConciliacaoFlow({
       </>
       {(reviewLoading || resultsLoading) && <LoadingValuesOverlay />}
       <main className="workspace-main mx-auto max-w-[90rem] px-3 py-3 sm:px-4">
-        <div className="mb-5 flex justify-center overflow-x-auto border-b text-sm">
-          {[
-            "Início",
-            ...(review.arquivos.length
-              ? [
-                  "Extrato",
-                  "Comprovantes bancários",
-                  "Comprovantes RFB",
-                  "Conciliação",
-                  "Conciliação Avançada",
-                ]
-              : []),
-          ].map((item) => (
-            <button
-              onClick={() => setActiveTab(item)}
-              className={`flex shrink-0 items-center gap-1.5 border-b-2 px-4 py-2 ${activeTab === item ? `${theme} font-semibold` : "border-transparent text-slate-500"}`}
-              key={item}
-            >
-              {item === "Conciliação Avançada" && <WandSparkles size={15} />}{" "}
-              {item}
-            </button>
-          ))}
+        <div className="mb-5 flex items-center justify-center gap-2 overflow-x-auto border-b text-sm">
+          <div className="flex shrink-0">
+            {[
+              "Início",
+              ...(review.arquivos.length
+                ? [
+                    "Extrato",
+                    "Comprovantes bancários",
+                    "Comprovantes RFB",
+                    "Conciliação",
+                    "Conciliação Avançada",
+                  ]
+                : []),
+            ].map((item) => (
+              <button
+                onClick={() => setActiveTab(item)}
+                className={`flex shrink-0 items-center gap-1.5 border-b-2 px-4 py-2 ${activeTab === item ? `${theme} font-semibold` : "border-transparent text-slate-500"}`}
+                key={item}
+              >
+                {item === "Conciliação Avançada" && <WandSparkles size={15} />}{" "}
+                {item}
+              </button>
+            ))}
+          </div>
+          {periodCard && (
+            <div className="mb-1 inline-flex shrink-0 items-center gap-1 rounded-md border border-teal-200 bg-teal-50 px-2.5 py-1 text-[11px] font-semibold text-teal-800">
+              <CalendarDays size={12} />
+              {periodCard}
+            </div>
+          )}
         </div>
         {activeTab === "Início" && (
           <>

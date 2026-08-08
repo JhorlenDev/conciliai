@@ -14,3 +14,4 @@ DEFAULT_CORS_ORIGINS = {
 }
 configured_origins = {origin.strip() for origin in os.getenv("BACKEND_CORS_ORIGINS", "").split(",") if origin.strip()}
 CORS_ORIGINS = sorted(DEFAULT_CORS_ORIGINS | configured_origins)
+CORS_ORIGIN_REGEX = os.getenv("BACKEND_CORS_ORIGIN_REGEX", r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$")

@@ -9,6 +9,7 @@ import {
   Download,
   Eye,
   FileText,
+  Gauge,
   ListPlus,
   PenLine,
   Plus,
@@ -805,6 +806,7 @@ function AdvancedRulesPanel({
     }
   };
   async function previewRule(item: PendingRule | SavedRule) {
+    if (busyRuleId) return;
     const fields = defaults(item);
     const body = {
       gatilho: value(item.id, "gatilho", fields.gatilho),
@@ -813,14 +815,23 @@ function AdvancedRulesPanel({
       tipo_componente: item.tipo_componente || "",
       regra_id: "gatilho" in item ? item.id : "",
     };
-    if (!body.gatilho.trim() && !body.gatilho_comprovante.trim()) return setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Informe um gatilho para validar a regra.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } }));
+    if (!body.gatilho.trim() && !body.gatilho_comprovante.trim()) {
+      setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Informe um gatilho para validar a regra.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } }));
+      setMessage("Informe um gatilho para ver a cobertura da regra.");
+      return;
+    }
+    setBusyRuleId(item.id);
     try {
       const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/previa`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), cache: "no-store" });
       if (!response.ok) return setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Não foi possível validar o gatilho.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } }));
       const result = await response.json();
       setPreviews((current) => ({ ...current, [item.id]: { ...result, gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } }));
+      setMessage(result.quantidade ? `Cobertura calculada: vai cobrir ${result.quantidade} lançamento(s).` : result.motivo || "Nenhum lançamento elegível corresponde ao gatilho informado.");
     } catch {
       setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Não foi possível validar o gatilho.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } }));
+      setMessage("Não foi possível validar o gatilho.");
+    } finally {
+      setBusyRuleId(null);
     }
   }
   const defaults = (item: PendingRule | SavedRule) =>
@@ -1330,7 +1341,7 @@ function AdvancedRulesPanel({
                 )}
               </div>
             )}
-            {(keyword || receiptKeyword) && (
+            {(keyword || receiptKeyword || preview) && (
               <div className="mt-1 w-48 text-[10px] leading-4 text-emerald-700">
                 <span className="font-semibold">Texto usado pela regra</span>
                 <br /><span className={coverageClass}>{coveredCount ? "✓" : preview || existing ? "!" : "•"} {coverageMessage}</span>
@@ -1395,8 +1406,8 @@ function AdvancedRulesPanel({
         {showAction && <td className={`${existing ? "w-[6%]" : "w-px"} whitespace-nowrap px-2 py-1`}>
           {!pendingItem?.regra_compartilhada && (
             <>
-              {!existing && !canSave && <button title="Ver cobertura da regra" aria-label="Ver cobertura da regra" disabled={busyRuleId === item.id} onClick={() => previewRule(item)} className="rounded border border-teal-700 px-2 py-1 text-teal-800 disabled:cursor-wait disabled:opacity-60">Ver cobertura</button>}
-              {canSave && <button title={existing ? "Atualizar regra" : "Salvar regra"} aria-label={existing ? "Atualizar regra" : "Salvar regra"} disabled={busyRuleId === item.id} onClick={() => saveRule(item, existing)} className="rounded bg-teal-700 px-2 py-1 text-white disabled:cursor-wait disabled:opacity-60">
+              {!existing && <button title="Ver cobertura" aria-label="Ver cobertura" disabled={busyRuleId === item.id} onClick={() => previewRule(item)} className="inline-flex h-7 w-7 items-center justify-center rounded border border-teal-700 text-teal-800 hover:bg-teal-50 disabled:cursor-wait disabled:opacity-60">{busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : <Gauge size={14} />}</button>}
+              {canSave && <button title={existing ? "Atualizar regra" : "Salvar regra"} aria-label={existing ? "Atualizar regra" : "Salvar regra"} disabled={busyRuleId === item.id} onClick={() => saveRule(item, existing)} className="ml-1 inline-flex h-7 w-7 items-center justify-center rounded bg-teal-700 text-white disabled:cursor-wait disabled:opacity-60">
                 {busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : existing ? <RefreshCw size={14} /> : <CheckCircle2 size={14} />}
               </button>}
               {existing && <button title="Excluir regra" aria-label="Excluir regra" disabled={busyRuleId === item.id} onClick={() => setDeleteTarget(item as SavedRule)} className="ml-1 rounded border border-red-200 px-2 py-1 text-red-700 disabled:cursor-wait disabled:opacity-60">{busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : <Trash2 size={14} />}</button>}

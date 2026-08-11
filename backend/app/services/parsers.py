@@ -108,12 +108,22 @@ def parse_date_time(value: str) -> tuple[date | None, str | None]:
     return parsed_date, time_match.group(1) if time_match else None
 
 
+def receipt_label_value(text: str, *labels: str, value_prefix: str = r".") -> str | None:
+    """Read BB-style labels whose value can be on the same line or the next line."""
+    for label in labels:
+        pattern = rf"^\s*{re.escape(label)}(?:[ \t]*:[ \t]*|[ \t]+|[ \t]*\n[ \t]*)(?={value_prefix})([^\n]+)"
+        match = re.search(pattern, text, re.I | re.M)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
+    return None
+
+
 def extract_financial_values(text: str) -> FinancialValues:
     def amount_for(*labels: str) -> Decimal | None:
         for label in labels:
-            match = re.search(rf"^\s*{re.escape(label)}\s*:?[ \t]+([^\n]+)", text, re.I | re.M)
-            if match:
-                amount = parse_brl(match.group(1))
+            value = receipt_label_value(text, label, value_prefix=r"(?:R?\$?\s*[\d.,-])")
+            if value:
+                amount = parse_brl(value)
                 if amount is not None:
                     return amount
         return None
@@ -127,10 +137,16 @@ def extract_financial_values(text: str) -> FinancialValues:
         valor_multa=amount_for("MULTA/MORA", "MULTA"),
         valor_encargos=amount_for("ENCARGOS"),
         valor_tarifa=amount_for("TARIFA"),
-        valor_pago=amount_for("VALOR COBRADO", "VALOR PAGO", "VALOR TOTAL", "VALOR"),
+        valor_pago=amount_for("VALOR COBRADO", "VALOR PAGO", "VALOR RECEBIDO", "VALOR TRANSFERIDO", "VALOR DA TRANSFERENCIA", "VALOR DA TRANSFERÊNCIA", "VALOR TOTAL", "VALOR"),
     )
     if values.valor_original is None:
         values.valor_original = values.valor_pago
+    adjustments = [
+        values.valor_desconto, values.valor_abatimento, values.valor_desconto_abatimento,
+        values.valor_juros, values.valor_multa, values.valor_encargos,
+    ]
+    if values.valor_pago is None and values.valor_original is not None and not any(value is not None for value in adjustments):
+        values.valor_pago = values.valor_original
     for key in (
         "valor_original", "valor_desconto", "valor_abatimento", "valor_desconto_abatimento",
         "valor_juros", "valor_multa", "valor_encargos", "valor_tarifa", "valor_pago",
@@ -138,10 +154,6 @@ def extract_financial_values(text: str) -> FinancialValues:
         amount = getattr(values, key)
         if amount is not None:
             values.detalhes[key] = str(amount)
-    adjustments = [
-        values.valor_desconto, values.valor_abatimento, values.valor_desconto_abatimento,
-        values.valor_juros, values.valor_multa, values.valor_encargos,
-    ]
     if values.valor_original is not None and values.valor_pago is not None and any(value is not None for value in adjustments):
         expected = values.valor_original - (values.valor_desconto or Decimal()) - (values.valor_abatimento or Decimal()) - (values.valor_desconto_abatimento or Decimal()) + (values.valor_juros or Decimal()) + (values.valor_multa or Decimal()) + (values.valor_encargos or Decimal())
         values.composicao_divergente = abs(expected - values.valor_pago) > Decimal("0.01")
@@ -167,28 +179,58 @@ def find_receipt_name_with_origin(text: str) -> tuple[str, str] | None:
     return None
 
 
+def label_value_match(text: str, label: str) -> re.Match[str] | None:
+    suffix = r"(?!\s+FINAL\b)" if label in {"BENEFICIÁRIO", "BENEFICIARIO", "CNPJ BENEFICIÁRIO", "CNPJ BENEFICIARIO"} else ""
+    return re.search(rf"^\s*{re.escape(label)}{suffix}\s*:?[ \t]*(?:\n[ \t]*)?([^\n]+)", text, re.I | re.M)
+
+
+def cnpj_after_section(text: str, labels: tuple[str, ...]) -> str:
+    for label in labels:
+        suffix = r"(?!\s+FINAL\b)" if label in {"BENEFICIÁRIO", "BENEFICIARIO"} else ""
+        stop_labels = "BENEFICI[ÁA]RIO FINAL|PAGADOR|NR\\. DOCUMENTO|NOSSO NUMERO|CONVENIO|DATA DE VENCIMENTO|DATA DO PAGAMENTO|VALOR"
+        if "FINAL" in label:
+            stop_labels = "PAGADOR|NR\\. DOCUMENTO|NOSSO NUMERO|CONVENIO|DATA DE VENCIMENTO|DATA DO PAGAMENTO|VALOR"
+        section = re.search(rf"^\s*{re.escape(label)}{suffix}\s*:?[ \t]*(.*?)(?=^\s*(?:{stop_labels})\b|\Z)", text, re.I | re.M | re.S)
+        if not section:
+            continue
+        match = re.search(r"\bCNPJ\s*:?[ \t]*(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", section.group(1), re.I)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
 def receipt_participants(text: str) -> dict[str, str]:
-    labels = {"beneficiario": ("BENEFICIÁRIO", "BENEFICIARIO", "FAVORECIDO"), "beneficiario_final": ("BENEFICIÁRIO FINAL", "BENEFICIARIO FINAL"), "nome_fantasia": ("NOME FANTASIA",), "pagador": ("PAGADOR", "PAGO POR"), "cnpj_beneficiario": ("CNPJ BENEFICIÁRIO", "CNPJ BENEFICIARIO"), "cnpj_beneficiario_final": ("CNPJ BENEFICIÁRIO FINAL", "CNPJ BENEFICIARIO FINAL")}
+    labels = {"beneficiario_final": ("BENEFICIÁRIO FINAL", "BENEFICIARIO FINAL"), "beneficiario": ("BENEFICIÁRIO", "BENEFICIARIO", "FAVORECIDO"), "nome_fantasia": ("NOME FANTASIA",), "pagador": ("PAGADOR", "PAGO POR"), "cnpj_beneficiario_final": ("CNPJ BENEFICIÁRIO FINAL", "CNPJ BENEFICIARIO FINAL"), "cnpj_beneficiario": ("CNPJ BENEFICIÁRIO", "CNPJ BENEFICIARIO")}
     participants = {}
     for key, names in labels.items():
         for label in names:
-            match = re.search(rf"^\s*{re.escape(label)}\s*:?[ \t]*(?:\n[ \t]*)?([^\n]+)", text, re.I | re.M)
-            if match and match.group(1).strip() and not (key == "beneficiario" and match.group(1).strip().upper().startswith("FINAL")):
+            match = label_value_match(text, label)
+            if match and match.group(1).strip():
                 participants[key] = match.group(1).strip()
                 break
+    participants.setdefault("cnpj_beneficiario", cnpj_after_section(text, ("BENEFICIÁRIO", "BENEFICIARIO", "FAVORECIDO")))
+    participants.setdefault("cnpj_beneficiario_final", cnpj_after_section(text, ("BENEFICIÁRIO FINAL", "BENEFICIARIO FINAL")))
     return participants
 
 
 def receipt_document_number(text: str) -> str:
     """Reads the document identifier printed by bank receipt layouts."""
-    patterns = (
-        r"^\s*(?:N[ÚU]MERO|NUMERO|N[º°O])\s*(?:DO|DE)?\s*DOCUMENTO\s*:?[ \t]*([^\n]+)",
-        r"^\s*DOCUMENTO\s*:?[ \t]+([^\n]+)",
+    labels = (
+        "NR. DOCUMENTO",
+        "NR DOCUMENTO",
+        "Nº DOCUMENTO",
+        "N° DOCUMENTO",
+        "NO DOCUMENTO",
+        "NUMERO DOCUMENTO",
+        "NÚMERO DOCUMENTO",
+        "NUMERO DO DOCUMENTO",
+        "NÚMERO DO DOCUMENTO",
+        "DOCUMENTO",
     )
-    for pattern in patterns:
-        match = re.search(pattern, text, re.I | re.M)
-        if match:
-            value = " ".join(match.group(1).split())
+    for label in labels:
+        value = receipt_label_value(text, label)
+        if value:
+            value = " ".join(value.split())
             if value and value.upper() not in {"PIX", "TED", "DOCUMENTO"}:
                 return value
     return ""
@@ -220,16 +262,16 @@ def extract_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
         return banco_do_brasil
 
     # Payment receipts use a distinct layout, usually with one receipt per PDF page.
-    value_match = re.search(r"^\s*(?:VALOR DO DOCUMENTO|VALOR TOTAL|VALOR RECEBIDO|VALOR)\s*:?[ \t]+([^\n]+)", text, re.I | re.M)
+    value_match = receipt_label_value(text, "VALOR DO DOCUMENTO", "VALOR COBRADO", "VALOR PAGO", "VALOR TOTAL", "VALOR RECEBIDO", "VALOR TRANSFERIDO", "VALOR DA TRANSFERÊNCIA", "VALOR DA TRANSFERENCIA", "VALOR", value_prefix=r"(?:R?\$?\s*[\d.,-])")
     name_info = find_receipt_name_with_origin(text)
     name = name_info[0] if name_info else None
     if not name:
-        received_match = re.search(r"^\s*(?:RECEBIDO DE|RECEBIMENTO DE)\s*:?[ \t]+([^\n]+)", text, re.I | re.M)
-        name = received_match.group(1).strip() if received_match else None
+        name = receipt_label_value(text, "RECEBIDO DE", "RECEBIMENTO DE")
         name_info = (name, "RECEBIDO DE") if name else None
-    date_match = re.search(r"^\s*(?:DATA DO PAGAMENTO|DATA PAGAMENTO)\s*:?[ \t]+([^\n]+)", text, re.I | re.M) or re.search(r"^\s*(?:DATA|DATA DO RECEBIMENTO|DEBITO EM|DÉBITO EM)\s*:?[ \t]+([^\n]+)", text, re.I | re.M)
+    date_value = receipt_label_value(text, "DATA DO PAGAMENTO", "DATA PAGAMENTO", "DATA", "DATA DO RECEBIMENTO", "DEBITO EM", "DÉBITO EM", value_prefix=r"\d")
+    date_match = re.search(DATE_RE, date_value or "")
     if value_match and name and date_match:
-        parsed_date, parsed_time = parse_date_time(date_match.group(1))
+        parsed_date, parsed_time = parse_date_time(date_value or "")
         financial = extract_financial_values(text)
         amount = financial.valor_pago
         if parsed_date and amount is not None and name and name.upper() not in {"PIX", "TED", "DOCUMENTO"}:
@@ -241,21 +283,21 @@ def extract_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
 def _extract_banco_do_brasil_receipt(text: str, page_number: int) -> list[ParsedReceipt]:
     """Handles BB payment and account-transfer receipts with values on following lines."""
     participants = receipt_participants(text)
-    payment_name = participants.get("beneficiario") or participants.get("beneficiario_final")
-    payment_date = re.search(r"^\s*DATA DO PAGAMENTO\s+(\d{2}/\d{2}/\d{4})", text, re.I | re.M)
-    payment_value = re.search(r"^\s*VALOR DO DOCUMENTO\s+([^\n]+)", text, re.I | re.M)
+    payment_name = participants.get("beneficiario") or participants.get("beneficiario_final") or participants.get("nome_fantasia")
+    payment_date = receipt_label_value(text, "DATA DO PAGAMENTO", "DATA PAGAMENTO", "PAGAMENTO EFETUADO EM", value_prefix=r"\d")
+    payment_value = receipt_label_value(text, "VALOR DO DOCUMENTO", "VALOR COBRADO", "VALOR PAGO", "VALOR TOTAL", "VALOR RECEBIDO", value_prefix=r"(?:R?\$?\s*[\d.,-])")
     if payment_name and payment_date and payment_value:
-        parsed_date, _ = parse_date_time(payment_date.group(1))
+        parsed_date, _ = parse_date_time(payment_date)
         financial = extract_financial_values(text)
         amount = financial.valor_pago
         if parsed_date and amount is not None:
             return [ParsedReceipt(parsed_date, None, payment_name, amount, "PAGAMENTO", text.strip(), page_number, "BENEFICIARIO", financial, participants.get("beneficiario", payment_name), participants.get("nome_fantasia", ""), participants.get("beneficiario_final", ""), participants.get("pagador", ""), participants.get("cnpj_beneficiario", ""), participants.get("cnpj_beneficiario_final", ""), receipt_document_number(text))]
 
-    transfer_name = re.search(r"TRANSFERIDO PARA\s*:\s*\n\s*CLIENTE\s*:\s*([^\n]+)", text, re.I)
-    transfer_date = re.search(r"^\s*DATA DA TRANSFER[ÊE]NCIA\s+(\d{2}/\d{2}/\d{4})", text, re.I | re.M)
-    transfer_value = re.search(r"^\s*VALOR TOTAL\s+([^\n]+)", text, re.I | re.M)
+    transfer_name = re.search(r"TRANSFERIDO PARA\s*:\s*(?:\n|\s)+(?:CLIENTE|NOME|FAVORECIDO)\s*:?\s*([^\n]+)", text, re.I)
+    transfer_date = receipt_label_value(text, "DATA DA TRANSFERÊNCIA", "DATA DA TRANSFERENCIA", "DATA TRANSFERÊNCIA", "DATA TRANSFERENCIA", "DATA", value_prefix=r"\d")
+    transfer_value = receipt_label_value(text, "VALOR TOTAL", "VALOR TRANSFERIDO", "VALOR DA TRANSFERÊNCIA", "VALOR DA TRANSFERENCIA", "VALOR", value_prefix=r"(?:R?\$?\s*[\d.,-])")
     if transfer_name and transfer_date and transfer_value:
-        parsed_date, _ = parse_date_time(transfer_date.group(1))
+        parsed_date, _ = parse_date_time(transfer_date)
         financial = extract_financial_values(text)
         amount = financial.valor_pago
         if parsed_date and amount is not None:

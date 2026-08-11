@@ -475,6 +475,21 @@ def test_ignoring_global_rule_only_removes_it_from_current_period_and_can_restor
     assert len(accounting_rules(reconciliation.id, session)["salvas"]) == 1
 
 
+def test_creating_equivalent_hidden_rule_restores_existing_rule_instead_of_blocking():
+    session, reconciliation, _ = rules_session()
+    created = create_accounting_rule(reconciliation.id, rule_input(scope="global"), session)
+    ignore_rule_in_period(reconciliation.id, created["id"], session)
+
+    restored = create_accounting_rule(reconciliation.id, rule_input(scope="global"), session)
+
+    assert restored["id"] == created["id"]
+    assert restored["reativada"] is True
+    assert restored["movimentos_aplicados"] == 1
+    assert session.query(RegraContabil).filter_by(ativo=True).count() == 1
+    assert session.query(RegraContabilExcecao).filter_by(regra_contabil_id=created["id"], conciliacao_id=reconciliation.id).count() == 0
+    assert len(accounting_rules(reconciliation.id, session)["salvas"]) == 1
+
+
 def test_global_deletion_returns_affected_periods_and_removes_period_exceptions():
     session, reconciliation, _ = rules_session()
     created = create_accounting_rule(reconciliation.id, rule_input(scope="global"), session)

@@ -692,6 +692,65 @@ VALOR DO DOCUMENTO                    680,49
     assert record.numero_documento == "13.101"
 
 
+def test_banco_do_brasil_payment_receipt_reads_charged_value_without_document_value():
+    text = """COMPROVANTE DE PAGAMENTO DE TITULOS
+BENEFICIARIO:
+FORNECEDOR TESTE LTDA
+CNPJ: 11.111.111/0001-11
+BENEFICIARIO FINAL:
+CLIENTE FINAL TESTE
+CNPJ: 22.222.222/0001-22
+DATA DO PAGAMENTO                     30/01/2024
+VALOR COBRADO                           497,00
+"""
+
+    record = extract_receipts(text, 1)[0]
+
+    assert record.favorecido == "FORNECEDOR TESTE LTDA"
+    assert record.beneficiario_final == "CLIENTE FINAL TESTE"
+    assert record.cnpj_beneficiario == "11.111.111/0001-11"
+    assert record.cnpj_beneficiario_final == "22.222.222/0001-22"
+    assert record.valor == Decimal("497.00")
+
+
+def test_banco_do_brasil_payment_receipt_reads_values_on_next_lines():
+    text = """22/02/2024
+COMPROVANTE DE PAGAMENTO DE TITULOS
+BENEFICIARIO:
+BAMBUNO TECNOLOGIA LTDA
+NOME FANTASIA:
+BAMBUNO TECNOLOGIA - EIRELI
+CNPJ: 27.012.243/0001-04
+BENEFICIARIO FINAL:
+SUCESSODONTO CURSOS E TREINAMENTOS
+CNPJ: 24.416.738/0001-00
+PAGADOR:
+Renata kamile de Sousa FigueirO
+NR. DOCUMENTO
+13.002
+DATA DE VENCIMENTO
+31/01/2024
+DATA DO PAGAMENTO
+30/01/2024
+VALOR DO DOCUMENTO
+1.000,00
+VALOR COBRADO
+1.000,00
+"""
+
+    record = extract_receipts(text, 1)[0]
+
+    assert record.data == date(2024, 1, 30)
+    assert record.favorecido == "BAMBUNO TECNOLOGIA LTDA"
+    assert record.nome_fantasia == "BAMBUNO TECNOLOGIA - EIRELI"
+    assert record.cnpj_beneficiario == "27.012.243/0001-04"
+    assert record.beneficiario_final == "SUCESSODONTO CURSOS E TREINAMENTOS"
+    assert record.cnpj_beneficiario_final == "24.416.738/0001-00"
+    assert record.pagador == "Renata kamile de Sousa FigueirO"
+    assert record.numero_documento == "13.002"
+    assert record.valor == Decimal("1000.00")
+
+
 def test_receipt_document_number_matches_the_banco_do_brasil_statement_history():
     receipt = Comprovante(numero_documento="13.101", beneficiario="Outro favorecido")
 
@@ -705,6 +764,20 @@ VALOR TOTAL                             6.000,00
 CLIENTE: LEANDRO BARBOSA FIGUEIRO
 """
     record = extract_receipts(text, 1)[0]
+    assert record.favorecido == "LEANDRO BARBOSA FIGUEIRO"
+    assert record.valor == Decimal("6000.00")
+    assert record.tipo_operacao == "TRANSFERÊNCIA"
+
+
+def test_banco_do_brasil_transfer_receipt_reads_transferred_name_label():
+    text = """DATA TRANSFERENCIA                    16/01/2024
+VALOR TRANSFERIDO                    6.000,00
+TRANSFERIDO PARA:
+NOME: LEANDRO BARBOSA FIGUEIRO
+"""
+
+    record = extract_receipts(text, 1)[0]
+
     assert record.favorecido == "LEANDRO BARBOSA FIGUEIRO"
     assert record.valor == Decimal("6000.00")
     assert record.tipo_operacao == "TRANSFERÊNCIA"

@@ -718,6 +718,10 @@ def current_bank_rules(reconciliation: Conciliacao, db: Session) -> list[RegraCo
     return [rule for rule in scoped_rules(reconciliation, db) if rule.banco == reconciliation.banco and rule.id not in ignored_rule_ids]
 
 
+def rule_period_exception(rule_id: str, reconciliation: Conciliacao, db: Session) -> RegraContabilExcecao | None:
+    return db.query(RegraContabilExcecao).filter_by(regra_contabil_id=rule_id, conciliacao_id=reconciliation.id).first()
+
+
 def complete_accounting_entry(entry: LancamentoContabil) -> bool:
     return bool(entry.status in {"aplicado_por_regra", "editado_manual"} and entry.valor and entry.valor > 0 and entry.conta_debito.strip() and entry.conta_credito.strip() and entry.historico.strip())
 
@@ -1047,7 +1051,18 @@ def create_accounting_rule(conciliacao_id: str, payload: RegraContabilInput, db:
     candidate_identity = rule_identity(reconciliation.cliente_id, reconciliation.banco, payload.natureza, payload.tipo_componente, payload.gatilho, payload.gatilho_comprovante, payload.conta_debito, payload.conta_credito, payload.historico, payload.complemento)
     existing_rule = next((item for item in scoped_rules(reconciliation, db) if saved_rule_identity(item) == candidate_identity), None)
     if existing_rule:
-        raise HTTPException(409, "Já existe uma regra equivalente neste banco")
+        exception = rule_period_exception(existing_rule.id, reconciliation, db)
+        if not exception:
+            raise HTTPException(409, "Já existe uma regra equivalente neste banco")
+        try:
+            db.delete(exception)
+            targets = [item for item in scoped_reconciliations(reconciliation, db) if item.banco == reconciliation.banco] if existing_rule.escopo == "global" else [reconciliation]
+            applied = sum(apply_accounting_rules(item, db) for item in targets)
+            db.commit(); db.refresh(existing_rule)
+        except Exception:
+            db.rollback()
+            raise
+        return {"id": existing_rule.id, "movimentos_aplicados": applied, "reativada": True, "regras": accounting_rules(conciliacao_id, db)}
     shared_rule = next((item for item in scoped_rules(reconciliation, db) if item.banco != reconciliation.banco and item.tipo_operacao == payload.natureza and item.tipo_componente == payload.tipo_componente.strip().upper() and normalize_name(item.favorecido_normalizado) == normalize_name(payload.gatilho) and normalize_name(item.gatilho_comprovante_normalizado) == normalize_name(payload.gatilho_comprovante)), None)
     if shared_rule:
         raise HTTPException(409, f"Já existe uma regra deste cliente criada no banco {shared_rule.banco}")

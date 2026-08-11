@@ -730,6 +730,7 @@ function AdvancedRulesPanel({
     historicos: string[];
   }>({ contas: [], historicos: [] });
   const loadRequest = useRef(0);
+  const skipNextAutoHide = useRef(false);
   function applyRulesSnapshot(rules: { pendentes: PendingRule[]; salvas: SavedRule[]; ignoradas?: IgnoredRule[]; integridade?: { csv_permitido?: boolean } }) {
     loadRequest.current += 1;
     setPending(rules.pendentes.map((item) => ({ ...item, historico: cleanHistory(item.historico) })));
@@ -752,7 +753,9 @@ function AdvancedRulesPanel({
     if (request !== loadRequest.current) return null;
     let currentRules = rules;
     const zeroCoveredCount = rules.salvas.filter((rule: SavedRule) => rule.cobertos === 0).length;
-    if (zeroCoveredCount) {
+    const skipAutoHide = skipNextAutoHide.current;
+    skipNextAutoHide.current = false;
+    if (zeroCoveredCount && !skipAutoHide) {
       const cleanupResponse = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/sem-cobertura`, { method: "DELETE", cache: "no-store" });
       if (request !== loadRequest.current) return null;
       if (cleanupResponse.ok) {
@@ -899,7 +902,9 @@ function AdvancedRulesPanel({
       setMessage(
         existing
           ? "Regra atualizada e reaplicada."
-          : `Regra salva e aplicada a ${result.movimentos_aplicados ?? 0} lançamento(s) neste período.`,
+          : result.reativada
+            ? `Regra oculta restaurada e aplicada a ${result.movimentos_aplicados ?? 0} lançamento(s) neste período.`
+            : `Regra salva e aplicada a ${result.movimentos_aplicados ?? 0} lançamento(s) neste período.`,
       );
       setDrafts((items) => ({ ...items, [item.id]: {} }));
       if (result.regras) applyRulesSnapshot(result.regras);
@@ -944,6 +949,8 @@ function AdvancedRulesPanel({
       if (!response.ok) return setMessage(await errorMessage(response, "Não foi possível restaurar a regra."));
       const result = await response.json();
       if (result.regras) applyRulesSnapshot(result.regras);
+      skipNextAutoHide.current = true;
+      setView("saved");
       setMessage(result.message ?? "Regra restaurada neste período.");
       onRulesChanged();
     } catch (error) {

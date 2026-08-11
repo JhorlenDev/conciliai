@@ -4,7 +4,7 @@ from decimal import Decimal
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.api.routes import ContaBancariaClienteInput, accounting_rules, client_bank_accounts, create_reconciliation_process, delete_client_bank_account, delete_reconciliation_process, reconcile, reprocess_document, result, resume_process_bank, save_client_bank_account
+from app.api.routes import ContaBancariaClienteInput, accounting_rules, apply_accounting_rules, client_bank_accounts, create_reconciliation_process, delete_client_bank_account, delete_reconciliation_process, reconcile, reprocess_document, result, resume_process_bank, save_client_bank_account
 from app.core.database import Base
 from app.models import Arquivo, Cliente, Comprovante, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, ProcessoConciliacao, RegraContabil, RegraContabilExcecao
 from app.services.normalization import normalize_name
@@ -160,12 +160,41 @@ def test_accounting_rules_do_not_show_stale_principal_duplicate_for_discounted_b
     session.add(LancamentoContabil(correspondencia_id=match.id, componente="PRINCIPAL", categoria="PRINCIPAL", valor=Decimal("493.14"), origem="extrato", ordem=1, status="pendente_regra"))
     session.commit()
 
-    data = accounting_rules(reconciliation.id, session)
+    rule = RegraContabil(cliente_id=client.id, conciliacao_id=reconciliation.id, banco=reconciliation.banco, tipo_fonte="extrato", tipo_operacao="Crédito", tipo_componente="VALOR_COBRADO", favorecido_normalizado=normalize_name("CONSELHO FEDERAL"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento")
+    session.add(rule); session.commit()
 
-    assert [(item["tipo_componente"], Decimal(item["valor"])) for item in data["pendentes"]] == [("VALOR_COBRADO", Decimal("493.14")), ("DESCONTO_ABATIMENTO", Decimal("54.79"))]
+    apply_accounting_rules(reconciliation, session)
+    data = accounting_rules(reconciliation.id, session)
+    stored_components = [item.componente for item in session.query(LancamentoContabil).filter_by(correspondencia_id=match.id).order_by(LancamentoContabil.ordem, LancamentoContabil.id)]
+
+    assert [(item["tipo_componente"], Decimal(item["valor"])) for item in data["pendentes"]] == [("DESCONTO_ABATIMENTO", Decimal("54.79"))]
     assert data["pendentes"][0]["componentes_documento"] == ["VALOR_COBRADO", "DESCONTO_ABATIMENTO"]
+    assert data["pendentes"][0]["componentes_cobertos"] == [{"componente": "VALOR_COBRADO", "valor": "493.14"}]
+    assert stored_components == ["VALOR_COBRADO", "DESCONTO_ABATIMENTO"]
     row = result(reconciliation.id, session)[0]
     assert (row["total_lancamentos"], row["diferenca"]) == ("R$ 493,14", "R$ 0,00")
+
+
+def test_result_shows_final_beneficiary_for_bambuno_receipt():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    statement_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Banco do Brasil", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    receipt_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="comprovante", banco_selecionado="Banco do Brasil", nome_original="boleto.pdf", caminho="/tmp/boleto.pdf")
+    session.add_all([statement_file, receipt_file]); session.flush()
+    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=statement_file.id, pagina_numero=1, data=date(2024, 1, 30), historico="Pagamento de Boleto", nome_encontrado="BAMBUNO TECNOLOGIA LTDA", valor=Decimal("497.00"), natureza="saída")
+    receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=receipt_file.id, pagina_numero=1, data=date(2024, 1, 30), favorecido="BAMBUNO TECNOLOGIA LTDA", beneficiario="BAMBUNO TECNOLOGIA LTDA", beneficiario_final="SUCESSODONTO CURSOS E TREINAMENTOS", nome_fantasia="BAMBUNO TECNOLOGIA - EIRELI", valor_pago=Decimal("497.00"))
+    session.add_all([movement, receipt]); session.commit()
+
+    reconcile(reconciliation.id, session)
+    row = result(reconciliation.id, session)[0]
+
+    assert "Beneficiário: BAMBUNO TECNOLOGIA LTDA" in row["comprovante_bancario"]
+    assert "Beneficiário final: SUCESSODONTO CURSOS E TREINAMENTOS" in row["comprovante_bancario"]
 
 
 def test_reconciliation_refresh_preserves_manual_component_edits():

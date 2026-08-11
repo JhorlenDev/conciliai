@@ -153,6 +153,21 @@ def test_legacy_rule_without_receipt_trigger_can_match_its_receipt_party():
     assert rule_matches_movement(rule, movement, receipt, "VALOR_COBRADO")
 
 
+def test_rule_does_not_match_receipt_payer_as_counterparty():
+    movement = MovimentoExtrato(historico="13105 109 Pagamento de Boleto", nome_encontrado="QUANTITY SERVICOS E COMERCIO", natureza="Débito")
+    receipt = Comprovante(favorecido="Quantity Servicos", beneficiario="Quantity Servicos", pagador="Leandro Barbosa Figueiro")
+    rule = RegraContabil(tipo_fonte="extrato", tipo_operacao="Crédito", tipo_componente="VALOR_COBRADO", favorecido_normalizado=normalize_name("Leandro Barbosa Figueiro"))
+
+    assert not rule_matches_movement(rule, movement, receipt, "VALOR_COBRADO")
+
+
+def test_mixed_text_and_number_trigger_does_not_match_only_by_digits():
+    movement = MovimentoExtrato(historico="99021 470 Transferência enviada", nome_encontrado="AIRTON MONTEIRO", natureza="Débito")
+    rule = RegraContabil(tipo_fonte="extrato", tipo_operacao="Crédito", tipo_componente="PRINCIPAL", favorecido_normalizado=normalize_name("99021 470 Transferencia enviada Leandro Barbosa Figueiro"))
+
+    assert not rule_matches_movement(rule, movement, None, "PRINCIPAL")
+
+
 def rules_session(history="PIX FORNECEDOR"):
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)

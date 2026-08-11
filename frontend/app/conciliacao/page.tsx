@@ -2444,8 +2444,11 @@ function ConciliacaoFlow({
               item.id === params.get("reconciliation") ||
               item.banco === requestedBank,
           ) || process.bancos[0];
-        if (!reconciliation)
-          return setMessage("Este processo não possui bancos vinculados.");
+        if (!reconciliation) {
+          setReconciliationId("");
+          window.history.replaceState(null, "", `/conciliacao?process=${process.id}`);
+          return;
+        }
         setBank(reconciliation.banco);
         setReconciliationId(reconciliation.id);
         window.history.replaceState(
@@ -2535,6 +2538,10 @@ function ConciliacaoFlow({
     setNewClient("");
   }
   async function createReconciliation() {
+    if (processId && !reconciliationId) {
+      await selectProcessBank(bank);
+      return;
+    }
     if (reconciliationId)
       return setMessage(
         "Esta conciliação já está em andamento. Envie os documentos ou acesse a aba Conciliação.",
@@ -2565,7 +2572,7 @@ function ConciliacaoFlow({
     setMessage("Conciliação criada. Envie os documentos.");
   }
   async function selectProcessBank(selectedBank: string) {
-    if (!processId || selectedBank === bank || isSwitchingBank) return;
+    if (!processId || (selectedBank === bank && reconciliationId) || isSwitchingBank) return;
     setIsSwitchingBank(true);
     try {
       let reconciliation = processBanks.find(

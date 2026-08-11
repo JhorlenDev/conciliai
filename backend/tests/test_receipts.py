@@ -1,9 +1,11 @@
 from datetime import date
 from decimal import Decimal
 
+import pytest
+
 from app.services.normalization import accounting_nature, names_similar, normalize_statement_nature
 from app.services.matching import invoice_is_candidate
-from app.services.parsers import deduplicate_statement_records, extract_financial_values, extract_receipts, extract_statement, parse_brl, parse_date_time
+from app.services.parsers import ParsedStatement, _validate_santander_expected_statement, deduplicate_statement_records, extract_financial_values, extract_receipts, extract_santander_words_statement, extract_statement, extract_statement_pages, parse_brl, parse_date_time
 from app.api.routes import receipt_match_criterion
 from app.models import Comprovante
 
@@ -99,6 +101,421 @@ def test_banco_do_brasil_parser_is_not_used_for_other_banks():
 02/01 09:40 Lia Da Silva Alexandre
 """
     assert extract_statement(text, 1, "Santander") == []
+
+
+def test_santander_extracts_single_date_column_statement_without_bb_rules():
+    text = """Resumo - janeiro/2024
+Conta Corrente
+Movimentação
+Data
+Descrição
+Nº Documento
+SALDO EM 31/12
+02/01
+TARIFA MENSALIDADE PACOTE SERVICOS
+DEZEMBRO / 2023
+TED RECEBIDA
+TRANSFERENCIA ENTRE CONTA
+PAGAMENTO CARTAO DE DEBITO
+GETNET-VISA ELECTR
+PAGAMENTO CARTAO DE DEBITO
+GETNET-ELO DEBITO
+DEBITO AUT. FAT.CARTAO MASTER CARD
+FINAL 4202
+JUROS SALDO UTILIZ ATE LIMITE
+PERIODO: 01/12 A 31/12/23
+IOF IMPOSTO OPERACOES FINANCEIRAS
+PERIODO: 01/12 A 31/12/23
+IOF ADICIONAL - AUTOMATICO
+PERIODO: 01/12 A 31/12/23
+Movimentos (R$)
+Créditos
+Débitos
+-
+Saldo (R$)
+0,00
+106,50-
+-2.300,00
+289884217,80
+289884257,40
+-2.320,83-
+-5,58-
+-0,08-
+-2,71-
+Extrato_PJ_A4_Inteligente 1.0
+"""
+
+    records = extract_statement(text, 1, "Santander")
+
+    assert [(item.data, item.historico, item.valor, item.natureza) for item in records] == [
+        (date(2024, 1, 2), "TARIFA MENSALIDADE PACOTE SERVICOS DEZEMBRO / 2023", Decimal("106.50"), "Débito"),
+        (date(2024, 1, 2), "TED RECEBIDA TRANSFERENCIA ENTRE CONTA", Decimal("2300.00"), "Crédito"),
+        (date(2024, 1, 2), "PAGAMENTO CARTAO DE DEBITO GETNET-VISA ELECTR", Decimal("217.80"), "Crédito"),
+        (date(2024, 1, 2), "PAGAMENTO CARTAO DE DEBITO GETNET-ELO DEBITO", Decimal("257.40"), "Crédito"),
+        (date(2024, 1, 2), "DEBITO AUT. FAT.CARTAO MASTER CARD FINAL 4202", Decimal("2320.83"), "Débito"),
+        (date(2024, 1, 2), "JUROS SALDO UTILIZ ATE LIMITE PERIODO: 01/12 A 31/12/23", Decimal("5.58"), "Débito"),
+        (date(2024, 1, 2), "IOF IMPOSTO OPERACOES FINANCEIRAS PERIODO: 01/12 A 31/12/23", Decimal("0.08"), "Débito"),
+        (date(2024, 1, 2), "IOF ADICIONAL - AUTOMATICO PERIODO: 01/12 A 31/12/23", Decimal("2.71"), "Débito"),
+    ]
+
+
+def test_santander_does_not_guess_dates_when_column_text_loses_row_alignment():
+    text = """Pagina:2/10EXTRATO CONSOLIDADO INTELIGENTE
+janeiro/2024
+Data
+03/01
+04/01
+Descrição
+APLICACAO CONTAMAX
+ANTECIPACAO GETNET
+Nº Documento
+Movimentos (R$)
+Créditos
+DébitosSaldo (R$)
+339,50-0,00
+205,21-0,00
+"""
+
+    assert extract_statement(text, 2, "Santander") == []
+
+
+def test_santander_does_not_shift_values_when_description_count_differs():
+    text = """Resumo - janeiro/2024
+Conta Corrente
+Movimentação
+Data
+Descrição
+Nº Documento
+SALDO EM 31/12
+02/01
+PAGAMENTO CARTAO DE DEBITO
+GETNET-ELO DEBITO
+DEBITO AUT. FAT.CARTAO MASTER CARD
+FINAL 4202
+Movimentos (R$)
+Créditos
+Débitos
+Saldo (R$)
+0,00
+-2.320,83-
+Extrato_PJ_A4_Inteligente 1.0
+"""
+
+    records = extract_statement(text, 1, "Santander")
+
+    assert [(item.historico, item.valor, item.natureza) for item in records] == [
+        ("DEBITO AUT. FAT.CARTAO MASTER CARD FINAL 4202", Decimal("2320.83"), "Débito")
+    ]
+
+
+def test_santander_pdfplumber_layout_extracts_rows_dates_documents_and_totals():
+    text = """EXTRATO CONSOLIDADO INTELIGENTE
+Santander
+janeiro/2024
+Conta Corrente
+Movimentação
+Data Descrição Nº Documento Movimentos (R$) Créditos Débitos Saldo (R$)
+SALDO EM 31/12 0,00
+02/01 TARIFA MENSALIDADE PACOTE SERVICOS 106,50- 0,00
+DEZEMBRO / 2023
+02/01 TED RECEBIDA 2.300,00 2.300,00
+TRANSFERENCIA ENTRE CONTA
+03/01 PAGAMENTO CARTAO DE DEBITO 2898841.234,56 3.534,56
+GETNET-VISA ELECTR
+PAGAMENTO DE BOLETO OUTROS BANCOS 123456 1.000,00- 2.534,56
+Pagina:2/10EXTRATO CONSOLIDADO INTELIGENTE
+janeiro/2024
+Data Descrição Nº Documento Movimentos (R$) Créditos Débitos Saldo (R$)
+04/01 ANTECIPACAO GETNET 834435 43.690,17 46.224,73
+PAGAMENTO DARF EM CANAIS 000015 46.011,73- 106,50
+INTERNET DOCUMENTO DE ARR
+31/01 IOF ADICIONAL - AUTOMATICO 106,50- 0,00
+SALDO EM 31/01 0,00
+Extrato_PJ_A4_Inteligente 1.0
+"""
+
+    records = extract_statement(text, 1, "Santander")
+
+    assert [item.pagina_numero for item in records] == [1, 1, 1, 1, 2, 2, 2]
+    assert records[0].historico == "TARIFA MENSALIDADE PACOTE SERVICOS DEZEMBRO / 2023"
+    assert records[1].historico == "TED RECEBIDA TRANSFERENCIA ENTRE CONTA"
+    assert records[3].data == date(2024, 1, 3)
+    assert records[3].numero_documento == "123456"
+    assert records[4].numero_documento == "834435"
+    assert records[5].historico == "PAGAMENTO DARF EM CANAIS INTERNET DOCUMENTO DE ARR"
+    assert records[5].valor == Decimal("46011.73")
+    assert sum(item.valor for item in records if item.natureza == "Crédito") == Decimal("47224.73")
+    assert sum(item.valor for item in records if item.natureza == "Débito") == Decimal("47224.73")
+
+
+def test_santander_starts_new_movement_when_value_has_no_date_and_keeps_multiline_description():
+    text = """EXTRATO CONSOLIDADO INTELIGENTE
+Santander
+janeiro/2024
+Data Descrição Nº Documento Movimentos (R$) Créditos Débitos Saldo (R$)
+04/01 PAGAMENTO CARTAO DE DEBITO 118,80 118,80
+GETNET-ELO DEBITO
+PAGAMENTO CARTAO DE DEBITO 257,27 376,07
+GETNET-MAESTRO
+"""
+
+    records = extract_statement(text, 1, "Santander")
+
+    assert [(item.data, item.historico, item.valor, item.natureza) for item in records] == [
+        (date(2024, 1, 4), "PAGAMENTO CARTAO DE DEBITO GETNET-ELO DEBITO", Decimal("118.80"), "Crédito"),
+        (date(2024, 1, 4), "PAGAMENTO CARTAO DE DEBITO GETNET-MAESTRO", Decimal("257.27"), "Crédito"),
+    ]
+
+
+def test_santander_inherits_current_date_across_pages():
+    text = """EXTRATO CONSOLIDADO INTELIGENTE
+Santander
+janeiro/2024
+Data Descrição Nº Documento Movimentos (R$) Créditos Débitos Saldo (R$)
+04/01 PAGAMENTO CARTAO DE DEBITO 118,80 118,80
+GETNET-ELO DEBITO
+Pagina:2/10EXTRATO CONSOLIDADO INTELIGENTE
+janeiro/2024
+Data Descrição Nº Documento Movimentos (R$) Créditos Débitos Saldo (R$)
+PAGAMENTO CARTAO DE DEBITO 257,27 376,07
+GETNET-MAESTRO
+05/01 TARIFA MENSALIDADE 106,50- 269,57
+"""
+
+    records = extract_statement(text, 1, "Santander")
+
+    assert [(item.pagina_numero, item.data, item.historico, item.valor) for item in records] == [
+        (1, date(2024, 1, 4), "PAGAMENTO CARTAO DE DEBITO GETNET-ELO DEBITO", Decimal("118.80")),
+        (2, date(2024, 1, 4), "PAGAMENTO CARTAO DE DEBITO GETNET-MAESTRO", Decimal("257.27")),
+        (2, date(2024, 1, 5), "TARIFA MENSALIDADE", Decimal("106.50")),
+    ]
+
+
+def test_santander_page_list_extracts_initial_column_page_and_keeps_date_between_pages():
+    first_page = """Resumo - janeiro/2024
+Movimentação
+Data
+Descrição
+Nº Documento
+SALDO EM 31/12
+02/01
+TARIFA MENSALIDADE PACOTE SERVICOS
+DEZEMBRO / 2023
+TED RECEBIDA
+TRANSFERENCIA ENTRE CONTA
+PAGAMENTO CARTAO DE DEBITO
+GETNET-VISA ELECTR
+PAGAMENTO CARTAO DE DEBITO
+GETNET-ELO DEBITO
+DEBITO AUT. FAT.CARTAO MASTER CARD
+FINAL 4202
+JUROS SALDO UTILIZ ATE LIMITE
+PERIODO: 01/12 A 31/12/23
+IOF IMPOSTO OPERACOES FINANCEIRAS
+PERIODO: 01/12 A 31/12/23
+IOF ADICIONAL - AUTOMATICO
+PERIODO: 01/12 A 31/12/23
+Movimentos (R$)
+Créditos
+Débitos
+-
+Saldo (R$)
+0,00
+106,50-
+-2.300,00
+289884217,80
+289884257,40
+-2.320,83-
+-5,58-
+-0,08-
+-2,71-
+"""
+    second_page = """EXTRATO CONSOLIDADO INTELIGENTE
+janeiro/2024
+Data Descrição Nº Documento Movimentos (R$) Créditos Débitos Saldo (R$)
+PAGAMENTO CARTAO DE DEBITO 118,80 118,80
+GETNET-ELO DEBITO
+"""
+
+    records = extract_statement_pages([first_page, second_page], "Santander")
+
+    assert len(records) == 9
+    assert records[0].historico == "TARIFA MENSALIDADE PACOTE SERVICOS DEZEMBRO / 2023"
+    assert records[1].historico == "TED RECEBIDA TRANSFERENCIA ENTRE CONTA"
+    assert records[7].historico == "IOF ADICIONAL - AUTOMATICO PERIODO: 01/12 A 31/12/23"
+    assert records[8].pagina_numero == 2
+    assert records[8].data == date(2024, 1, 2)
+    assert records[8].historico == "PAGAMENTO CARTAO DE DEBITO GETNET-ELO DEBITO"
+    assert records[8].valor == Decimal("118.80")
+
+
+def word(text: str, x0: float, top: float) -> dict[str, object]:
+    return {"text": text, "x0": x0, "x1": x0 + max(8, len(text) * 4), "top": top, "bottom": top + 5}
+
+
+def word_line(top: float, items: list[tuple[str, float]]) -> list[dict[str, object]]:
+    words = []
+    for text, x0 in items:
+        cursor = x0
+        for part in text.split():
+            words.append(word(part, cursor, top))
+            cursor += max(16, len(part) * 5)
+    return words
+
+
+def santander_header(top: float = 20) -> list[dict[str, object]]:
+    return word_line(top, [
+        ("Data", 20),
+        ("Descrição", 80),
+        ("Nº Documento", 320),
+        ("Créditos", 430),
+        ("Débitos", 520),
+        ("Saldo", 610),
+    ])
+
+
+def santander_split_header(top: float = 20) -> list[dict[str, object]]:
+    return [
+        *word_line(top, [
+            ("Data", 34),
+            ("Descrição", 65),
+            ("Nº Documento", 296),
+            ("Movimentos (R$)", 387),
+            ("Saldo (R$)", 508),
+        ]),
+        *word_line(top + 10, [
+            ("Créditos", 384),
+            ("Débitos", 435),
+        ]),
+    ]
+
+
+def test_santander_words_ignore_summary_before_table_and_read_split_header():
+    pages_words = [[
+        *word_line(10, [("Resumo - janeiro/2024", 40)]),
+        *word_line(20, [("Agência Conta Corrente", 40)]),
+        *word_line(30, [("Saldo de Investimentos com Resgate Automático", 40), ("3.864,50", 508)]),
+        *word_line(40, [("Conta Corrente", 40)]),
+        *word_line(50, [("Movimentação", 40)]),
+        *santander_split_header(60),
+        *word_line(80, [("SALDO EM 31/12", 34), ("0,00", 508)]),
+        *word_line(90, [("02/01", 34), ("IOF ADICIONAL - AUTOMATICO", 65), ("2,71-", 435)]),
+        *word_line(100, [("PERIODO: 01/12 A 31/12/23", 65)]),
+        *word_line(110, [("Extrato_PJ_A4_Inteligente 1.0", 65)]),
+        *word_line(120, [("SALDO EM 31/01", 34), ("0,00", 508)]),
+    ]]
+    pages_text = ["EXTRATO CONSOLIDADO INTELIGENTE\nSantander\njaneiro/2024\nConta Corrente\nMovimentação\nMovimentos (R$)"]
+
+    records = extract_santander_words_statement(pages_words, pages_text)
+
+    assert [(item.data, item.historico, item.valor, item.natureza) for item in records] == [
+        (date(2024, 1, 2), "IOF ADICIONAL AUTOMATICO PERIODO: 01/12 A 31/12/23", Decimal("2.71"), "Débito")
+    ]
+
+
+def test_santander_words_keep_first_description_word_with_float_coordinate_noise():
+    pages_words = [[
+        *word_line(10, [("Conta Corrente", 40)]),
+        *word_line(20, [("Movimentação", 40)]),
+        *santander_split_header(30),
+        word("04/01", 34, 50),
+        word("PAGAMENTO", 65.2, 50),
+        word("CARTAO", 109.15, 50),
+        word("DE", 138.48, 50),
+        word("DEBITO", 149.53, 50),
+        word("289884", 307.94, 50),
+        word("118,80", 385.24, 50),
+        word("GETNET-ELO", 65.2, 60),
+        word("DEBITO", 109.15, 60),
+        word("PAGAMENTO", 65.19999999999999, 70),
+        word("CARTAO", 109.15, 70),
+        word("DE", 138.48, 70),
+        word("DEBITO", 149.53, 70),
+        word("289884", 307.94, 70),
+        word("257,27", 385.24, 70),
+        word("GETNET-MAESTRO", 65.19999999999999, 80),
+    ]]
+    pages_text = ["EXTRATO CONSOLIDADO INTELIGENTE\nSantander\njaneiro/2024\nConta Corrente\nMovimentação\nMovimentos (R$)"]
+
+    records = extract_santander_words_statement(pages_words, pages_text)
+
+    assert [(item.historico, item.valor, item.numero_documento) for item in records] == [
+        ("PAGAMENTO CARTAO DE DEBITO GETNET-ELO DEBITO", Decimal("118.80"), "289884"),
+        ("PAGAMENTO CARTAO DE DEBITO GETNET-MAESTRO", Decimal("257.27"), "289884"),
+    ]
+
+
+def test_santander_words_use_columns_not_description_words_for_nature_and_ignore_informational_sections():
+    pages_words = [
+        [
+            *word_line(10, [("Conta Corrente", 40), ("Movimentação", 160)]),
+            *santander_header(),
+            *word_line(40, [("22/01", 20), ("PAGAMENTO CARTAO DE DEBITO", 80), ("574,20", 430), ("574,20", 610)]),
+            *word_line(50, [("GETNET-MAESTRO", 80)]),
+            *word_line(60, [("PAGAMENTO DE BOLETO OUTROS BANCOS", 80), ("123456", 320), ("100,00-", 520), ("474,20", 610)]),
+            *word_line(70, [("GETNET-MAESTRO", 80)]),
+            *word_line(80, [("GETNET-MAESTRO", 80)]),
+            *word_line(90, [("SALDO EM 31/01", 20), ("0,00", 610)]),
+        ],
+        [
+            *word_line(10, [("Transferências entre Contas, DOCs, TEDs e PIXs Enviados", 40)]),
+            *santander_header(),
+            *word_line(30, [("25/01", 20), ("TED", 80), ("RENATA FIGUEIRO", 140), ("0577", 320), ("6.000,00", 430)]),
+        ],
+    ]
+    pages_text = ["Santander\njaneiro/2024\nConta Corrente\nMovimentação", "Transferências entre Contas, DOCs, TEDs e PIXs Enviados"]
+
+    records = extract_santander_words_statement(pages_words, pages_text)
+
+    assert [(item.data, item.historico, item.valor, item.natureza, item.numero_documento) for item in records] == [
+        (date(2024, 1, 22), "PAGAMENTO CARTAO DE DEBITO GETNET-MAESTRO", Decimal("574.20"), "Crédito", ""),
+        (date(2024, 1, 22), "PAGAMENTO DE BOLETO OUTROS BANCOS GETNET-MAESTRO", Decimal("100.00"), "Débito", "123456"),
+    ]
+
+
+def test_santander_words_keep_current_date_across_pdf_pages():
+    pages_words = [
+        [
+            *word_line(10, [("Conta Corrente", 40), ("Movimentação", 160)]),
+            *santander_header(),
+            *word_line(40, [("02/01", 20), ("TED RECEBIDA", 80), ("2.300,00", 430), ("2.300,00", 610)]),
+        ],
+        [
+            *santander_header(),
+            *word_line(30, [("APLICACAO CONTAMAX", 80), ("339,50-", 520), ("1.960,50", 610)]),
+            *word_line(40, [("03/01", 20), ("ANTECIPACAO GETNET", 80), ("205,21", 430), ("2.165,71", 610)]),
+        ],
+        [
+            *santander_header(),
+            *word_line(30, [("17/01", 20), ("TED ENVIADA", 80), ("400,52-", 520), ("1.765,19", 610)]),
+        ],
+        [
+            *santander_header(),
+            *word_line(30, [("ANTECIPACAO GETNET", 80), ("114,44", 430), ("1.879,63", 610)]),
+            *word_line(40, [("APLICACAO CONTAMAX", 80), ("1.163,75-", 520), ("715,88", 610)]),
+        ],
+    ]
+    pages_text = ["Santander\njaneiro/2024\nConta Corrente\nMovimentação"] * 4
+
+    records = extract_santander_words_statement(pages_words, pages_text)
+
+    assert [(item.pagina_numero, item.data, item.historico, item.valor, item.natureza) for item in records] == [
+        (1, date(2024, 1, 2), "TED RECEBIDA", Decimal("2300.00"), "Crédito"),
+        (2, date(2024, 1, 2), "APLICACAO CONTAMAX", Decimal("339.50"), "Débito"),
+        (2, date(2024, 1, 3), "ANTECIPACAO GETNET", Decimal("205.21"), "Crédito"),
+        (3, date(2024, 1, 17), "TED ENVIADA", Decimal("400.52"), "Débito"),
+        (4, date(2024, 1, 17), "ANTECIPACAO GETNET", Decimal("114.44"), "Crédito"),
+        (4, date(2024, 1, 17), "APLICACAO CONTAMAX", Decimal("1163.75"), "Débito"),
+    ]
+
+
+def test_santander_expected_file_validation_fails_when_count_or_totals_do_not_match():
+    records = [
+        ParsedStatement(date(2024, 1, 2), None, "TED RECEBIDA", "", Decimal("2300.00"), "Crédito", "", 1),
+    ]
+
+    with pytest.raises(ValueError, match="Falha de validação do extrato Santander"):
+        _validate_santander_expected_statement(records, ["janeiro/2024\nTotal de Créditos 47.224,73\nSaldo de Conta Corrente em 31/12 0,00\nSaldo de Conta Corrente em 31/01 0,00"])
 
 
 def test_banco_do_brasil_uses_first_cd_value_and_ignores_balance_rows():

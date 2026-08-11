@@ -25,7 +25,7 @@ from app.core.database import get_db
 from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, ComprovanteRfbItem, Conciliacao, ContaBancaria, Correspondencia, DocumentoImportante, LancamentoContabil, MovimentoExtrato, NotaFiscal, ProcessoConciliacao, RegraContabil, RegraContabilExcecao
 from app.services.normalization import accounting_nature, is_statement_debit, normalize_name, normalize_rule_accounting_nature, normalize_statement_nature
 from app.services.matching import names_similar
-from app.services.parsers import deduplicate_statement_records, extract_receipts, extract_statement
+from app.services.parsers import deduplicate_statement_records, extract_receipts, extract_santander_pdfplumber_statement, extract_statement_pages
 from app.services.rfb import belongs_to_selected_bank, extract_competence, parse_rfb_page
 from app.services.rule_source import choose_rule_source
 
@@ -212,6 +212,46 @@ def extract_important_catalog(path: Path, extension: str, tipo: str) -> dict:
         values.append(text)
     key = "contas" if tipo == "plano_contas" else "historicos"
     return {key: list(dict.fromkeys(values)), "formato": "catalogo_v3"}
+
+
+def extract_pdf_pages(path: Path, bank: str, document_type: str) -> list[str]:
+    if document_type == "extrato" and bank == "Santander":
+        pages = extract_santander_pdfplumber_pages(path)
+        if pages:
+            return pages
+    with fitz.open(path) as document:
+        return [page.get_text() for page in document]
+
+
+def extract_santander_pdfplumber_pages(path: Path) -> list[str]:
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.warning("pdfplumber não instalado; usando PyMuPDF para extrato Santander")
+        return []
+
+    try:
+        with pdfplumber.open(path) as document:
+            pages = [
+                page.extract_text(x_tolerance=1, y_tolerance=3, layout=True) or ""
+                for page in document.pages
+            ]
+    except Exception as error:
+        logger.warning("Falha ao ler Santander com pdfplumber: %s", error)
+        return []
+
+    if any("EXTRATO CONSOLIDADO INTELIGENTE" in page and "Movimentos" in page for page in pages):
+        return pages
+    return []
+
+
+def extract_statement_document(path: Path, bank: str, document_type: str) -> tuple[list[str], list]:
+    if document_type == "extrato" and bank == "Santander":
+        santander = extract_santander_pdfplumber_statement(path)
+        if santander:
+            return santander.pages, santander.records
+    pages = extract_pdf_pages(path, bank, document_type)
+    return pages, extract_statement_pages(pages, bank)
 
 
 @router.get("/documentos-importantes")
@@ -462,11 +502,11 @@ def trigger_matches(source: str, trigger: str) -> bool:
         return True
     trigger_digits = re.sub(r"\D", "", trigger)
     source_digits = re.sub(r"\D", "", source)
-    return bool(trigger_digits and trigger_digits in source_digits)
+    return bool(trigger_digits and not re.search(r"[A-Z]", normalized_trigger) and trigger_digits in source_digits)
 
 
 def receipt_trigger_text(receipt: Comprovante | None, rfb: ComprovanteRfb | None = None, rfb_items: list[ComprovanteRfbItem] | None = None) -> str:
-    bank_text = " ".join(item for item in [receipt.favorecido, receipt.beneficiario, receipt.beneficiario_final, receipt.nome_fantasia, receipt.pagador, receipt.numero_documento] if item) if receipt else ""
+    bank_text = " ".join(item for item in [receipt.favorecido, receipt.beneficiario, receipt.beneficiario_final, receipt.nome_fantasia, receipt.numero_documento] if item) if receipt else ""
     rfb_text = " ".join(item for item in [rfb.tipo, rfb.razao_social, rfb.numero_documento, rfb.competencia, rfb.periodo_apuracao] if item) if rfb else ""
     item_text = " ".join(item for item in [f"{item.codigo} {item.descricao}" for item in (rfb_items or [])] if item)
     return " ".join(item for item in [bank_text, rfb_text, item_text] if item)
@@ -576,6 +616,20 @@ def unique_accounting_entries(entries: list[LancamentoContabil]) -> list[Lancame
         key = rule_component_key(entry.componente)
         selected[key] = preferred_accounting_entry(selected[key], entry) if key in selected else entry
     return sorted(selected.values(), key=accounting_entry_order)
+
+
+def prune_automatic_duplicate_components(entries: list[LancamentoContabil], db: Session) -> list[LancamentoContabil]:
+    """Remove stale automatic aliases like PRINCIPAL once VALOR_COBRADO exists."""
+    selected: dict[str, LancamentoContabil] = {}
+    automatic = [entry for entry in entries if entry.status != "editado_manual"]
+    for entry in sorted(automatic, key=accounting_entry_order):
+        key = rule_component_key(entry.componente)
+        selected[key] = preferred_accounting_entry(selected[key], entry) if key in selected else entry
+    keep_ids = {entry.id for entry in selected.values()}
+    for entry in automatic:
+        if entry.id not in keep_ids:
+            db.delete(entry)
+    return [entry for entry in entries if entry.status == "editado_manual" or entry.id in keep_ids]
 
 
 def rule_matches_movement(rule: RegraContabil, movement: MovimentoExtrato, receipt: Comprovante | None = None, component: str = "", rfb: ComprovanteRfb | None = None, rfb_items: list[ComprovanteRfbItem] | None = None) -> bool:
@@ -735,6 +789,7 @@ def apply_accounting_rules(reconciliation: Conciliacao, db: Session) -> int:
     rules = current_bank_rules(reconciliation, db)
     applied = 0
     movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=reconciliation.id, ativo=True) if in_reconciliation_period(reconciliation, item)]
+    movements.sort(key=movement_statement_order)
     correspondences = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id).all()
     match_by_movement = {item.movimento_extrato_id: item for item in correspondences}
     match_ids = [item.id for item in correspondences]
@@ -760,7 +815,8 @@ def apply_accounting_rules(reconciliation: Conciliacao, db: Session) -> int:
             db.add(match)
             db.flush()
             match_by_movement[movement.id] = match
-        entries = unique_accounting_entries(entries_by_match.get(match.id, []))
+        entries = prune_automatic_duplicate_components(entries_by_match.get(match.id, []), db)
+        entries = unique_accounting_entries(entries)
         # A document can have distinct rules for principal, discount, and taxes.
         # Manual entries are deliberately never overwritten by a rule refresh.
         source_entries = unique_accounting_entries([entry for entry in entries if entry.status != "editado_manual"])
@@ -790,6 +846,16 @@ def reconciliation_or_404(conciliacao_id: str, db: Session) -> Conciliacao:
     return reconciliation
 
 
+def movement_statement_order(item: MovimentoExtrato) -> tuple:
+    original = item.dados_originais if isinstance(item.dados_originais, dict) else {}
+    raw_order = original.get("ordem_extrato")
+    try:
+        statement_order = int(raw_order)
+    except (TypeError, ValueError):
+        statement_order = 10**9
+    return (item.data or date.max, item.hora or "", item.pagina_numero or 0, statement_order, item.id)
+
+
 @router.get("/conciliacoes/{conciliacao_id}/conta-bancaria")
 def bank_account(conciliacao_id: str, db: Session = Depends(get_db)):
     reconciliation = reconciliation_or_404(conciliacao_id, db)
@@ -812,7 +878,8 @@ def save_bank_account(conciliacao_id: str, payload: ContaBancariaInput, db: Sess
 @router.get("/conciliacoes/{conciliacao_id}/regras-contabeis")
 def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPIResponse = None):
     reconciliation = reconciliation_or_404(conciliacao_id, db)
-    movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True).order_by(MovimentoExtrato.data, MovimentoExtrato.hora) if in_reconciliation_period(reconciliation, item)]
+    movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True) if in_reconciliation_period(reconciliation, item)]
+    movements.sort(key=movement_statement_order)
     movement_by_id = {item.id: item for item in movements}
     if reconciliation.banco == "Banco do Brasil":
         for movement in movements:
@@ -917,6 +984,7 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
 def rule_preview(rule: RegraContabil, reconciliation: Conciliacao, db: Session, current_rule_id: str | None = None) -> list[dict]:
     matches = []
     movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=reconciliation.id, ativo=True) if in_reconciliation_period(reconciliation, item)]
+    movements.sort(key=movement_statement_order)
     correspondences = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id).all()
     match_by_movement = {item.movimento_extrato_id: item for item in correspondences}
     match_ids = [item.id for item in correspondences]
@@ -1348,23 +1416,27 @@ def upload(conciliacao_id: str, tipo_documento: str, file: UploadFile = File(...
     record = Arquivo(conciliacao_id=conciliacao_id, tipo_documento=tipo_documento, banco_selecionado=reconciliation.banco, nome_original=file.filename, caminho=str(path))
     db.add(record); db.commit(); db.refresh(record)
     try:
-        document = fitz.open(path)
-        pages = [page.get_text() for page in document]
+        pages, extracted = extract_statement_document(path, reconciliation.banco, tipo_documento) if tipo_documento == "extrato" else (extract_pdf_pages(path, reconciliation.banco, tipo_documento), [])
         record.texto_bruto = "\n\f\n".join(pages); record.paginas = len(pages)
-        extracted = []
         for number, page_text in enumerate(pages, 1):
             parsed_rfb = parse_rfb_page(page_text, number) if tipo_documento == "rfb" else None
-            extracted.extend([parsed_rfb] if parsed_rfb else [] if tipo_documento == "rfb" else extract_receipts(page_text, number) if tipo_documento == "comprovante" else extract_statement(page_text, number, reconciliation.banco))
+            if tipo_documento != "extrato":
+                extracted.extend([parsed_rfb] if parsed_rfb else [] if tipo_documento == "rfb" else extract_receipts(page_text, number))
         if tipo_documento == "extrato" and reconciliation.banco == "Banco do Brasil":
             extracted = deduplicate_statement_records(extracted)
-        for item in extracted:
+        for position, item in enumerate(extracted, 1):
             if tipo_documento == "rfb":
                 receipt = ComprovanteRfb(conciliacao_id=conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, tipo=item.tipo, cnpj=item.cnpj, razao_social=item.razao_social, competencia=item.competencia, periodo_apuracao=item.periodo_apuracao, data_vencimento=item.data_vencimento, data_arrecadacao=item.data_arrecadacao, numero_documento=item.numero_documento, codigo_banco=item.codigo_banco, nome_banco=item.nome_banco, agencia=item.agencia, valor_principal=item.valor_principal, valor_multa=item.valor_multa, valor_juros=item.valor_juros, valor_total=item.valor_total, texto_original=item.texto_original, status="composição divergente" if item.composicao_divergente else "pronto")
                 db.add(receipt); db.flush()
                 for tax in item.itens:
                     db.add(ComprovanteRfbItem(comprovante_rfb_id=receipt.id, codigo=tax.codigo, descricao=tax.descricao, valor_principal=tax.valor_principal, valor_multa=tax.valor_multa, valor_juros=tax.valor_juros, valor_total=tax.valor_total))
                 continue
-            common = dict(conciliacao_id=conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, texto_original=item.texto_original, dados_originais={"origem_nome": item.origem_nome} if tipo_documento == "comprovante" else {}, dados_normalizados={"nome": normalize_name(item.favorecido if tipo_documento == "comprovante" else item.nome)})
+            original_data = {"origem_nome": item.origem_nome} if tipo_documento == "comprovante" else {}
+            if tipo_documento == "extrato":
+                original_data["ordem_extrato"] = position
+                if getattr(item, "numero_documento", ""):
+                    original_data["numero_documento"] = item.numero_documento
+            common = dict(conciliacao_id=conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, texto_original=item.texto_original, dados_originais=original_data, dados_normalizados={"nome": normalize_name(item.favorecido if tipo_documento == "comprovante" else item.nome)})
             if tipo_documento == "comprovante":
                 common.update(beneficiario=item.beneficiario or item.favorecido, nome_fantasia=item.nome_fantasia, beneficiario_final=item.beneficiario_final, pagador=item.pagador, cnpj_beneficiario=item.cnpj_beneficiario, cnpj_beneficiario_final=item.cnpj_beneficiario_final, numero_documento=item.numero_documento)
             db.add(Comprovante(**common, data=item.data, hora=item.hora, favorecido=item.favorecido, valor=item.financeiros.valor_pago, valor_original=item.financeiros.valor_original, valor_desconto=item.financeiros.valor_desconto, valor_abatimento=item.financeiros.valor_abatimento, valor_desconto_abatimento=item.financeiros.valor_desconto_abatimento, valor_juros=item.financeiros.valor_juros, valor_multa=item.financeiros.valor_multa, valor_encargos=item.financeiros.valor_encargos, valor_tarifa=item.financeiros.valor_tarifa, valor_pago=item.financeiros.valor_pago, detalhes_financeiros=item.financeiros.detalhes, status_revisao="revisao" if item.financeiros.composicao_divergente else "valido", tipo_operacao=item.tipo_operacao) if tipo_documento == "comprovante" else MovimentoExtrato(**common, data=item.data, hora=item.hora, historico=item.historico, nome_encontrado=item.nome, valor=item.valor, natureza=item.natureza, data_origem=item.data_origem))
@@ -1439,20 +1511,46 @@ def reprocess_document(arquivo_id: str, db: Session = Depends(get_db)):
     reset_reconciliation(record.conciliacao_id, db)
     model = MovimentoExtrato if record.tipo_documento == "extrato" else Comprovante if record.tipo_documento == "comprovante" else ComprovanteRfb
     db.query(model).filter_by(arquivo_id=record.id).delete()
-    extracted = []
-    for number, page_text in enumerate((record.texto_bruto or "").split("\n\f\n"), 1):
+    pages = (record.texto_bruto or "").split("\n\f\n")
+    if Path(record.caminho).is_file():
+        try:
+            if record.tipo_documento == "extrato":
+                pages, extracted = extract_statement_document(Path(record.caminho), record.banco_selecionado, record.tipo_documento)
+            else:
+                pdf_pages = extract_pdf_pages(Path(record.caminho), record.banco_selecionado, record.tipo_documento)
+                if pdf_pages:
+                    pages = pdf_pages
+                extracted = []
+        except ValueError as error:
+            record.status_processamento = "erro"
+            record.mensagem_erro = str(error)
+            db.commit()
+            return {"registros_extraidos": 0, "status": record.status_processamento}
+        except Exception:
+            logger.warning("Falha ao reler PDF; usando texto bruto salvo para arquivo %s", record.id)
+            extracted = extract_statement_pages(pages, record.banco_selecionado) if record.tipo_documento == "extrato" else []
+    else:
+        extracted = extract_statement_pages(pages, record.banco_selecionado) if record.tipo_documento == "extrato" else []
+    record.texto_bruto = "\n\f\n".join(pages); record.paginas = len(pages)
+    for number, page_text in enumerate(pages, 1):
         parsed_rfb = parse_rfb_page(page_text, number) if record.tipo_documento == "rfb" else None
-        extracted.extend([parsed_rfb] if parsed_rfb else [] if record.tipo_documento == "rfb" else extract_statement(page_text, number, record.banco_selecionado) if record.tipo_documento == "extrato" else extract_receipts(page_text, number))
+        if record.tipo_documento != "extrato":
+            extracted.extend([parsed_rfb] if parsed_rfb else [] if record.tipo_documento == "rfb" else extract_receipts(page_text, number))
     if record.tipo_documento == "extrato" and record.banco_selecionado == "Banco do Brasil":
         extracted = deduplicate_statement_records(extracted)
-    for item in extracted:
+    for position, item in enumerate(extracted, 1):
         if record.tipo_documento == "rfb":
             receipt = ComprovanteRfb(conciliacao_id=record.conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, tipo=item.tipo, cnpj=item.cnpj, razao_social=item.razao_social, competencia=item.competencia, periodo_apuracao=item.periodo_apuracao, data_vencimento=item.data_vencimento, data_arrecadacao=item.data_arrecadacao, numero_documento=item.numero_documento, codigo_banco=item.codigo_banco, nome_banco=item.nome_banco, agencia=item.agencia, valor_principal=item.valor_principal, valor_multa=item.valor_multa, valor_juros=item.valor_juros, valor_total=item.valor_total, texto_original=item.texto_original, status="composição divergente" if item.composicao_divergente else "pronto")
             db.add(receipt); db.flush()
             for tax in item.itens:
                 db.add(ComprovanteRfbItem(comprovante_rfb_id=receipt.id, codigo=tax.codigo, descricao=tax.descricao, valor_principal=tax.valor_principal, valor_multa=tax.valor_multa, valor_juros=tax.valor_juros, valor_total=tax.valor_total))
             continue
-        common = dict(conciliacao_id=record.conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, texto_original=item.texto_original, dados_originais={"origem_nome": item.origem_nome} if record.tipo_documento == "comprovante" else {}, dados_normalizados={"nome": normalize_name(item.nome if record.tipo_documento == "extrato" else item.favorecido)})
+        original_data = {"origem_nome": item.origem_nome} if record.tipo_documento == "comprovante" else {}
+        if record.tipo_documento == "extrato":
+            original_data["ordem_extrato"] = position
+            if getattr(item, "numero_documento", ""):
+                original_data["numero_documento"] = item.numero_documento
+        common = dict(conciliacao_id=record.conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, texto_original=item.texto_original, dados_originais=original_data, dados_normalizados={"nome": normalize_name(item.nome if record.tipo_documento == "extrato" else item.favorecido)})
         if record.tipo_documento == "comprovante":
             common.update(beneficiario=item.beneficiario or item.favorecido, nome_fantasia=item.nome_fantasia, beneficiario_final=item.beneficiario_final, pagador=item.pagador, cnpj_beneficiario=item.cnpj_beneficiario, cnpj_beneficiario_final=item.cnpj_beneficiario_final, numero_documento=item.numero_documento)
         db.add(MovimentoExtrato(**common, data=item.data, hora=item.hora, historico=item.historico, nome_encontrado=item.nome, valor=item.valor, natureza=item.natureza, data_origem=item.data_origem) if record.tipo_documento == "extrato" else Comprovante(**common, data=item.data, hora=item.hora, favorecido=item.favorecido, valor=item.financeiros.valor_pago, valor_original=item.financeiros.valor_original, valor_desconto=item.financeiros.valor_desconto, valor_abatimento=item.financeiros.valor_abatimento, valor_desconto_abatimento=item.financeiros.valor_desconto_abatimento, valor_juros=item.financeiros.valor_juros, valor_multa=item.financeiros.valor_multa, valor_encargos=item.financeiros.valor_encargos, valor_tarifa=item.financeiros.valor_tarifa, valor_pago=item.financeiros.valor_pago, detalhes_financeiros=item.financeiros.detalhes, status_revisao="revisao" if item.financeiros.composicao_divergente else "valido", tipo_operacao=item.tipo_operacao))
@@ -1474,7 +1572,8 @@ def reconcile(conciliacao_id: str, db: Session = Depends(get_db)):
     rfb_receipts = [item for item in db.query(ComprovanteRfb).filter_by(conciliacao_id=conciliacao_id) if belongs_to_selected_bank(item, reconciliation.banco)]
     existing_matches = {item.movimento_extrato_id: item for item in db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id).all()}
     used_receipts, used_rfb = set(), set()
-    movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True).order_by(MovimentoExtrato.data, MovimentoExtrato.hora) if is_statement_debit(item.natureza) and in_reconciliation_period(reconciliation, item)]
+    movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True) if is_statement_debit(item.natureza) and in_reconciliation_period(reconciliation, item)]
+    movements.sort(key=movement_statement_order)
     for movement in movements:
         # The extracted counterparty is more precise than the operation history.
         movement_text = " ".join(item for item in [movement.historico, movement.nome_encontrado] if item)
@@ -1587,7 +1686,12 @@ def result(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPI
         entries = unique_accounting_entries(entries_by_match.get(match.id, []))
         total_lines = sum((statement_effect_value(line.valor, line.efeito_no_total) for line in entries), Decimal("0.00"))
         movement_date = movement.data.strftime("%d/%m/%Y")
-        receipt_detail = "—" if not receipt else f"Data: {receipt.data.strftime('%d/%m/%Y')}\nTipo: {receipt.tipo_operacao or '—'}\nDocumento: {receipt.numero_documento or '—'}\nFavorecido: {receipt.favorecido}\nValor pago: {money(receipt.valor_pago)}"
+        receipt_detail = "—"
+        if receipt:
+            beneficiary = receipt.beneficiario or receipt.favorecido
+            final_beneficiary = f"\nBeneficiário final: {receipt.beneficiario_final}" if receipt.beneficiario_final and receipt.beneficiario_final != beneficiary else ""
+            fantasy_name = f"\nNome fantasia: {receipt.nome_fantasia}" if receipt.nome_fantasia else ""
+            receipt_detail = f"Data: {receipt.data.strftime('%d/%m/%Y')}\nTipo: {receipt.tipo_operacao or '—'}\nDocumento: {receipt.numero_documento or '—'}\nBeneficiário: {beneficiary}{final_beneficiary}{fantasy_name}\nValor pago: {money(receipt.valor_pago)}"
         rfb_detail = "—" if not rfb else f"Data: {rfb.data_arrecadacao.strftime('%d/%m/%Y') if rfb.data_arrecadacao else '—'}\nTipo: {rfb.tipo}\nCompetência: {rfb.competencia or rfb.periodo_apuracao or '—'}\nBanco: {rfb.nome_banco}\nTotal: {money(rfb.valor_total)}"
         receipt_composition = None
         if receipt:
@@ -1693,8 +1797,11 @@ def review(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPI
     reconciliation = db.get(Conciliacao, conciliacao_id)
     rfb_records = [item for item in db.query(ComprovanteRfb).filter_by(conciliacao_id=conciliacao_id).order_by(ComprovanteRfb.data_arrecadacao.asc(), ComprovanteRfb.id.asc()) if reconciliation and belongs_to_selected_bank(item, reconciliation.banco)]
 
+    statement_records = db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True).all()
+    statement_records.sort(key=movement_statement_order)
+
     return {
-        "extratos": [base(x, {"data": display_date(x.data), "hora": x.hora, "historico": " ".join(item for item in [x.historico, x.nome_encontrado] if item), "valor": str(x.valor), "natureza": normalize_statement_nature(x.natureza), "natureza_contabil": accounting_nature(x.natureza)}) for x in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True).order_by(MovimentoExtrato.data.asc(), MovimentoExtrato.hora.asc().nulls_last(), MovimentoExtrato.id.asc())],
+        "extratos": [base(x, {"data": display_date(x.data), "hora": x.hora, "historico": " ".join(item for item in [x.historico, x.nome_encontrado] if item), "valor": str(x.valor), "natureza": normalize_statement_nature(x.natureza), "natureza_contabil": accounting_nature(x.natureza)}) for x in statement_records],
         "comprovantes": [base(x, {"data": display_date(x.data), "hora": x.hora, "documento": x.numero_documento, "favorecido": receipt_counterparty(x), "valor_original": money(x.valor_original), "ajustes": adjustments(x), "valor_pago": money(x.valor_pago), "tipo": x.tipo_operacao}) for x in db.query(Comprovante).filter_by(conciliacao_id=conciliacao_id, ativo=True).order_by(Comprovante.data.asc(), Comprovante.hora.asc().nulls_last(), Comprovante.id.asc())],
         "rfb": [base(x, {"tipo": x.tipo, "competencia_apuracao": x.competencia or x.periodo_apuracao or "—", "data_arrecadacao": display_date(x.data_arrecadacao), "documento": x.numero_documento, "banco": x.nome_banco, "principal": money(x.valor_principal), "multa_juros": "Sem acréscimos" if not ((x.valor_multa or 0) + (x.valor_juros or 0)) else f"Multa: {money(x.valor_multa)} + Juros: {money(x.valor_juros)}", "total": money(x.valor_total), "situacao": x.status}) for x in rfb_records],
         "arquivos": [{"id": x.id, "nome": x.nome_original, "tipo": x.tipo_documento, "status": x.status_processamento, "erro": x.mensagem_erro} for x in db.query(Arquivo).filter_by(conciliacao_id=conciliacao_id, ativo=True)],

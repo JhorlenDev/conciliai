@@ -1,8 +1,8 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { ArrowRight, Building2, Clock3, FileText, Plus, RefreshCw, Trash2, Users, X } from "lucide-react";
+import { ArrowRight, Building2, Clock3, FileText, ListFilter, Plus, RefreshCw, Trash2, Users, X } from "lucide-react";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 const banks = [
@@ -36,8 +36,9 @@ export default function EntryPage() {
   const [clientId, setClientId] = useState(""),
     [start, setStart] = useState(""),
     [end, setEnd] = useState(""),
-    [bank, setBank] = useState(banks[0]),
     [message, setMessage] = useState(""),
+    [processClientFilter, setProcessClientFilter] = useState(""),
+    [processBankFilter, setProcessBankFilter] = useState(""),
     [processToDelete, setProcessToDelete] = useState<Process | null>(null),
     [isDeleting, setIsDeleting] = useState(false),
     [now, setNow] = useState<Date | null>(null);
@@ -63,6 +64,21 @@ export default function EntryPage() {
     const timer = window.setInterval(update, 1_000);
     return () => window.clearInterval(timer);
   }, []);
+  const processBanks = useMemo(() => {
+    const scopedProcesses = processClientFilter
+      ? processes.filter((process) => process.cliente_id === processClientFilter)
+      : processes;
+    return banks.filter((item) =>
+      scopedProcesses.some((process) =>
+        process.bancos.some((reconciliation) => reconciliation.banco === item),
+      ),
+    );
+  }, [processClientFilter, processes]);
+  useEffect(() => {
+    if (processBankFilter && !processBanks.includes(processBankFilter)) {
+      setProcessBankFilter("");
+    }
+  }, [processBankFilter, processBanks]);
   async function create(event: FormEvent) {
     event.preventDefault();
     setMessage("");
@@ -73,7 +89,6 @@ export default function EntryPage() {
         cliente_id: clientId,
         data_inicio: start,
         data_fim: end,
-        banco: bank,
       }),
     });
     if (!response.ok)
@@ -108,7 +123,12 @@ export default function EntryPage() {
     const label = new Date(`${value}T00:00:00`).toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
     return label.charAt(0).toUpperCase() + label.slice(1);
   };
-  const orderedProcesses = [...processes].sort((left, right) =>
+  const filteredProcesses = processes.filter((process) => {
+    const matchesClient = !processClientFilter || process.cliente_id === processClientFilter;
+    const matchesBank = !processBankFilter || process.bancos.some((reconciliation) => reconciliation.banco === processBankFilter);
+    return matchesClient && matchesBank;
+  });
+  const orderedProcesses = [...filteredProcesses].sort((left, right) =>
     left.data_inicio.localeCompare(right.data_inicio),
   );
   const dateTime = (value: string) =>
@@ -142,7 +162,7 @@ export default function EntryPage() {
             Nova conciliação
           </h2>
           <p className="mt-1 text-sm text-slate-500">
-            Crie um processo e inicie pelo primeiro banco.
+            Crie um processo por cliente e período.
           </p>
           <label className="mt-4 block text-sm font-medium">
             Cliente
@@ -182,18 +202,6 @@ export default function EntryPage() {
               />
             </label>
           </div>
-          <label className="mt-3 block text-sm font-medium">
-            Primeiro banco
-            <select
-              value={bank}
-              onChange={(event) => setBank(event.target.value)}
-              className="mt-1 w-full rounded border p-2"
-            >
-              {banks.map((item) => (
-                <option key={item}>{item}</option>
-              ))}
-            </select>
-          </label>
           <button className="mt-5 w-full rounded bg-emerald-800 px-4 py-2 font-semibold text-white">
             Criar e continuar
           </button>
@@ -215,6 +223,58 @@ export default function EntryPage() {
               <RefreshCw size={16} />
             </button>
           </div>
+          <div className="mb-4 rounded-lg border bg-white p-3 shadow-sm">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-sm font-semibold text-slate-700">
+                <ListFilter size={16} />
+                Filtros
+              </div>
+              <span className="text-xs font-medium text-slate-500">
+                {orderedProcesses.length} de {processes.length}
+              </span>
+            </div>
+            <div className="grid gap-3 md:grid-cols-[1fr_220px_auto]">
+              <label className="min-w-0 text-sm font-medium">
+                Cliente
+                <select
+                  value={processClientFilter}
+                  onChange={(event) => setProcessClientFilter(event.target.value)}
+                  className="mt-1 w-full rounded border p-2"
+                >
+                  <option value="">Todos os clientes</option>
+                  {clients.map((client) => (
+                    <option value={client.id} key={client.id}>
+                      {client.nome}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="min-w-0 text-sm font-medium">
+                Banco
+                <select
+                  value={processBankFilter}
+                  onChange={(event) => setProcessBankFilter(event.target.value)}
+                  className="mt-1 w-full rounded border p-2"
+                >
+                  <option value="">Todos os bancos</option>
+                  {processBanks.map((item) => (
+                    <option key={item}>{item}</option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                onClick={() => {
+                  setProcessClientFilter("");
+                  setProcessBankFilter("");
+                }}
+                disabled={!processClientFilter && !processBankFilter}
+                className="self-end rounded border px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Limpar
+              </button>
+            </div>
+          </div>
            <div className="grid gap-2 md:grid-cols-2">
              {orderedProcesses.map((process) => (
                 <article className="flex min-w-0 items-center rounded-lg border bg-white shadow-sm transition hover:border-emerald-700 hover:shadow-md" key={process.id}>
@@ -235,6 +295,11 @@ export default function EntryPage() {
             {!processes.length && (
               <div className="rounded-xl border border-dashed bg-white p-10 text-center text-sm text-slate-500">
                 Nenhum processo ainda. Crie a primeira conciliação.
+              </div>
+            )}
+            {!!processes.length && !orderedProcesses.length && (
+              <div className="rounded-xl border border-dashed bg-white p-10 text-center text-sm text-slate-500">
+                Nenhum processo encontrado para os filtros selecionados.
               </div>
             )}
           </div>

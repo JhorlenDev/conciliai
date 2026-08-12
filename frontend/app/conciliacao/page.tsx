@@ -776,9 +776,46 @@ function AdvancedRulesPanel({
       setRecentRuleId((current) => (current === id ? null : current));
     }, 20000);
   }
+  function componentOrder(component = "") {
+    return ({
+      PRINCIPAL: 1,
+      VALOR_COBRADO: 1,
+      MULTA: 2,
+      JUROS: 3,
+      ENCARGOS: 4,
+      DESCONTO: 5,
+      ABATIMENTO: 6,
+      DESCONTO_ABATIMENTO: 7,
+    } as Record<string, number>)[component] ?? 99;
+  }
+  function savedCoverageSignature(rule: SavedRule) {
+    return (rule.movimentos ?? [])
+      .map((movement) =>
+        [
+          movement.data,
+          movement.texto_extrato || movement.historico,
+          movement.texto_comprovante || "",
+          movement.natureza_contabil,
+        ].join("|"),
+      )
+      .sort()
+      .join("||");
+  }
   function sortSavedRules(items: SavedRule[], topRuleId?: string | null) {
+    const topRule = topRuleId ? items.find((item) => item.id === topRuleId) : null;
+    const topSignature = topRule ? savedCoverageSignature(topRule) : "";
+    const topRuleIsCompositeMember = Boolean(
+      topRule &&
+        topSignature &&
+        items.some(
+          (item) =>
+            item.id !== topRule.id &&
+            savedCoverageSignature(item) === topSignature &&
+            componentOrder(item.tipo_componente) !== componentOrder(topRule.tipo_componente),
+        ),
+    );
     return [...items].sort((left, right) => {
-      if (topRuleId && left.id !== right.id) {
+      if (topRuleId && !topRuleIsCompositeMember && left.id !== right.id) {
         if (left.id === topRuleId) return -1;
         if (right.id === topRuleId) return 1;
       }
@@ -1607,29 +1644,6 @@ function AdvancedRulesPanel({
       return groups;
     }, {}),
   );
-  const componentOrder = (component = "") =>
-    ({
-      PRINCIPAL: 1,
-      VALOR_COBRADO: 1,
-      MULTA: 2,
-      JUROS: 3,
-      ENCARGOS: 4,
-      DESCONTO: 5,
-      ABATIMENTO: 6,
-      DESCONTO_ABATIMENTO: 7,
-    } as Record<string, number>)[component] ?? 99;
-  const savedCoverageSignature = (rule: SavedRule) =>
-    (rule.movimentos ?? [])
-      .map((movement) =>
-        [
-          movement.data,
-          movement.texto_extrato || movement.historico,
-          movement.texto_comprovante || "",
-          movement.natureza_contabil,
-        ].join("|"),
-      )
-      .sort()
-      .join("||");
   const savedGroups = Object.values(
     visibleSaved.reduce<Record<string, SavedRule[]>>((groups, rule) => {
       const signature = savedCoverageSignature(rule);
@@ -1644,7 +1658,11 @@ function AdvancedRulesPanel({
           componentOrder(right.tipo_componente) ||
         left.historico.localeCompare(right.historico),
     ),
-  );
+  ).sort((left, right) => {
+    const leftAnchor = left.find((item) => componentOrder(item.tipo_componente) === 1) ?? left[0];
+    const rightAnchor = right.find((item) => componentOrder(item.tipo_componente) === 1) ?? right[0];
+    return String(rightAnchor.criada_em || "").localeCompare(String(leftAnchor.criada_em || ""));
+  });
   const isSavedComposite = (group: SavedRule[]) =>
     group.length > 1 &&
     new Set(group.map((rule) => componentOrder(rule.tipo_componente))).size > 1;

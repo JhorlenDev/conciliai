@@ -701,7 +701,7 @@ def is_transfer_without_counterparty(movement: MovimentoExtrato) -> bool:
 def rule_payload(rule: RegraContabil, movements: list[MovimentoExtrato], receipts: dict[str, Comprovante], covered_entries: list[tuple[str, LancamentoContabil]]) -> dict:
     movement_by_id = {movement.id: movement for movement in movements}
     covered = [(movement_by_id[movement_id], entry) for movement_id, entry in covered_entries if movement_id in movement_by_id]
-    return {"id": rule.id, "gatilho": rule.favorecido_normalizado, "gatilho_comprovante": rule.gatilho_comprovante_normalizado, "natureza": normalize_rule_accounting_nature(rule.tipo_operacao), "tipo_componente": rule.tipo_componente, "conta_debito": rule.conta_debito, "conta_credito": rule.conta_credito, "historico": rule.historico, "complemento": rule.complemento, "escopo": rule.escopo, "banco_origem": rule.banco, "cobertos": len(covered), "movimentos": [{"data": movement.data.strftime("%d/%m/%Y") if movement.data else "—", "historico": " ".join(part for part in [movement.historico, movement.nome_encontrado] if part), "texto_extrato": " ".join(part for part in [movement.historico, movement.nome_encontrado] if part), "texto_comprovante": receipt_description(receipts.get(movement.id)), "tem_comprovante": bool(receipts.get(movement.id)), "valor": str(entry.valor or 0), "tipo_componente": entry.componente, "natureza": normalize_statement_nature(movement.natureza), "natureza_contabil": accounting_nature(movement.natureza)} for movement, entry in covered]}
+    return {"id": rule.id, "gatilho": rule.favorecido_normalizado, "gatilho_comprovante": rule.gatilho_comprovante_normalizado, "natureza": normalize_rule_accounting_nature(rule.tipo_operacao), "tipo_componente": rule.tipo_componente, "conta_debito": rule.conta_debito, "conta_credito": rule.conta_credito, "historico": rule.historico, "complemento": rule.complemento, "escopo": rule.escopo, "banco_origem": rule.banco, "criada_em": rule.created_at.isoformat() if rule.created_at else "", "cobertos": len(covered), "movimentos": [{"data": movement.data.strftime("%d/%m/%Y") if movement.data else "—", "historico": " ".join(part for part in [movement.historico, movement.nome_encontrado] if part), "texto_extrato": " ".join(part for part in [movement.historico, movement.nome_encontrado] if part), "texto_comprovante": receipt_description(receipts.get(movement.id)), "tem_comprovante": bool(receipts.get(movement.id)), "valor": str(entry.valor or 0), "tipo_componente": entry.componente, "natureza": normalize_statement_nature(movement.natureza), "natureza_contabil": accounting_nature(movement.natureza)} for movement, entry in covered]}
 
 
 def scoped_rules(reconciliation: Conciliacao, db: Session) -> list[RegraContabil]:
@@ -958,7 +958,10 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
     if response:
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     saved_payloads = [rule_payload(rule, movements, receipts, covered_by_rule[rule.id]) for rule in same_bank_rules]
-    saved_payloads.sort(key=lambda item: min((accounting_entry_order(entry) for _, entry in covered_by_rule[item["id"]]), default=(10**9, 10**9, "")))
+    def saved_rule_order(item: dict):
+        entry_order = min((accounting_entry_order(entry) for _, entry in covered_by_rule[item["id"]]), default=(10**9, 10**9, ""))
+        return ((item.get("criada_em") or "")[:19], -entry_order[0], -entry_order[1])
+    saved_payloads.sort(key=saved_rule_order, reverse=True)
     exceptions = db.query(RegraContabilExcecao).filter_by(conciliacao_id=reconciliation.id).all()
     exception_rule_ids = [item.regra_contabil_id for item in exceptions]
     rules_by_id = {item.id: item for item in db.query(RegraContabil).filter(RegraContabil.id.in_(exception_rule_ids)).all()} if exception_rule_ids else {}

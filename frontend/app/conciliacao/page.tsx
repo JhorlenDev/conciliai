@@ -434,11 +434,42 @@ type SavedRule = {
   historico: string;
   complemento: string;
   escopo?: "periodo" | "global";
+  criada_em?: string;
   cobertos: number;
   movimentos?: { data: string; historico: string; texto_extrato?: string; texto_comprovante?: string; tem_comprovante?: boolean; valor: string; tipo_componente?: string; natureza: string; natureza_contabil: string }[];
 };
 
 type IgnoredRule = Pick<SavedRule, "id" | "gatilho" | "gatilho_comprovante" | "tipo_componente" | "historico">;
+type RuleCoverageMatch = {
+  data: string;
+  historico: string;
+  componente?: string;
+  fonte: string;
+};
+type RulePreview = {
+  quantidade: number;
+  lancamentos: RuleCoverageMatch[];
+  motivo: string;
+  gatilho?: string;
+  gatilho_comprovante?: string;
+};
+type RuleSaveBody = {
+  gatilho: string;
+  gatilho_comprovante: string;
+  natureza: string;
+  tipo_componente: string;
+  escopo: string;
+  conta_debito: string;
+  conta_credito: string;
+  historico: string;
+  complemento: string;
+};
+type CoverageModal = {
+  item: PendingRule | SavedRule;
+  body: RuleSaveBody;
+  preview: RulePreview;
+  existing: boolean;
+};
 
 function LegacyAdvancedRulesPanel({
   reconciliationId,
@@ -702,7 +733,9 @@ function AdvancedRulesPanel({
   const [pending, setPending] = useState<PendingRule[]>([]);
   const [saved, setSaved] = useState<SavedRule[]>([]);
   const [ignored, setIgnored] = useState<IgnoredRule[]>([]);
-  const [previews, setPreviews] = useState<Record<string, { quantidade: number; lancamentos: { fonte: string }[]; motivo: string; gatilho?: string; gatilho_comprovante?: string }>>({});
+  const [previews, setPreviews] = useState<Record<string, RulePreview>>({});
+  const [coverageModal, setCoverageModal] = useState<CoverageModal | null>(null);
+  const [recentRuleId, setRecentRuleId] = useState<string | null>(null);
   const [account, setAccount] = useState("Sem conta");
   const [drafts, setDrafts] = useState<Record<string, Record<string, string>>>(
     {},
@@ -731,10 +764,30 @@ function AdvancedRulesPanel({
   }>({ contas: [], historicos: [] });
   const loadRequest = useRef(0);
   const skipNextAutoHide = useRef(false);
-  function applyRulesSnapshot(rules: { pendentes: PendingRule[]; salvas: SavedRule[]; ignoradas?: IgnoredRule[]; integridade?: { csv_permitido?: boolean } }) {
+  const recentRuleTimer = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (recentRuleTimer.current) window.clearTimeout(recentRuleTimer.current);
+  }, []);
+  function markRecentRule(id: string) {
+    setRecentRuleId(id);
+    if (recentRuleTimer.current) window.clearTimeout(recentRuleTimer.current);
+    recentRuleTimer.current = window.setTimeout(() => {
+      setRecentRuleId((current) => (current === id ? null : current));
+    }, 20000);
+  }
+  function sortSavedRules(items: SavedRule[], topRuleId?: string | null) {
+    return [...items].sort((left, right) => {
+      if (topRuleId && left.id !== right.id) {
+        if (left.id === topRuleId) return -1;
+        if (right.id === topRuleId) return 1;
+      }
+      return String(right.criada_em || "").localeCompare(String(left.criada_em || ""));
+    });
+  }
+  function applyRulesSnapshot(rules: { pendentes: PendingRule[]; salvas: SavedRule[]; ignoradas?: IgnoredRule[]; integridade?: { csv_permitido?: boolean } }, topRuleId?: string | null) {
     loadRequest.current += 1;
     setPending(rules.pendentes.map((item) => ({ ...item, historico: cleanHistory(item.historico) })));
-    setSaved(rules.salvas.map((item) => ({ ...item, historico: cleanHistory(item.historico) })));
+    setSaved(sortSavedRules(rules.salvas.map((item) => ({ ...item, historico: cleanHistory(item.historico) })), topRuleId ?? recentRuleId));
     setIgnored(rules.ignoradas ?? []);
     setCsvPermitted(rules.integridade?.csv_permitido !== false);
   }
@@ -870,11 +923,9 @@ function AdvancedRulesPanel({
         : "Não foi possível salvar a conta bancária.",
     );
   }
-  async function saveRule(item: PendingRule | SavedRule, existing = false) {
-    if (busyRuleId) return;
-    setBusyRuleId(item.id);
+  function buildRuleBody(item: PendingRule | SavedRule, existing = false): RuleSaveBody {
     const fields = defaults(item);
-    const body = {
+    return {
       gatilho: value(item.id, "gatilho", fields.gatilho),
       gatilho_comprovante: value(item.id, "gatilhoComprovante", fields.gatilhoComprovante),
       natureza: item.natureza_contabil || item.natureza,
@@ -885,6 +936,29 @@ function AdvancedRulesPanel({
       historico: value(item.id, "historico", fields.historico),
       complemento: value(item.id, "complemento", fields.complemento),
     };
+  }
+  async function loadRulePreview(item: PendingRule | SavedRule, body: RuleSaveBody, existing = false) {
+    const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/previa`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        gatilho: body.gatilho,
+        gatilho_comprovante: body.gatilho_comprovante,
+        natureza: body.natureza,
+        tipo_componente: body.tipo_componente,
+        regra_id: existing && "gatilho" in item ? item.id : "",
+      }),
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error(await errorMessage(response, "Não foi possível calcular a cobertura da regra."));
+    const result = await response.json();
+    const preview = { ...result, gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } as RulePreview;
+    setPreviews((current) => ({ ...current, [item.id]: preview }));
+    return preview;
+  }
+  async function submitRule(item: PendingRule | SavedRule, body: RuleSaveBody, existing = false) {
+    if (busyRuleId) return;
+    setBusyRuleId(item.id);
     const url = existing
       ? `${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/${item.id}`
       : `${API}/api/conciliacoes/${reconciliationId}/regras-contabeis`;
@@ -899,6 +973,8 @@ function AdvancedRulesPanel({
         return setMessage(error.detail ?? "Não foi possível salvar a regra.");
       }
       const result = await response.json();
+      const topRuleId = !existing ? String(result.id || "") : "";
+      if (topRuleId) markRecentRule(topRuleId);
       setMessage(
         existing
           ? "Regra atualizada e reaplicada."
@@ -906,13 +982,39 @@ function AdvancedRulesPanel({
             ? `Regra oculta restaurada e aplicada a ${result.movimentos_aplicados ?? 0} lançamento(s) neste período.`
             : `Regra salva e aplicada a ${result.movimentos_aplicados ?? 0} lançamento(s) neste período.`,
       );
+      setCoverageModal(null);
       setDrafts((items) => ({ ...items, [item.id]: {} }));
-      if (result.regras) applyRulesSnapshot(result.regras);
+      if (result.regras) applyRulesSnapshot(result.regras, topRuleId || undefined);
       else await load();
       if (!existing) setView("saved");
       onRulesChanged();
     } catch {
       setMessage("Não foi possível salvar a regra. Verifique a conexão e tente novamente.");
+    } finally {
+      setBusyRuleId(null);
+    }
+  }
+  async function saveRule(item: PendingRule | SavedRule, existing = false) {
+    if (busyRuleId) return;
+    const body = buildRuleBody(item, existing);
+    if (existing) return submitRule(item, body, true);
+    if (!body.gatilho.trim() && !body.gatilho_comprovante.trim()) {
+      setMessage("Informe um gatilho antes de salvar a regra.");
+      return;
+    }
+    setBusyRuleId(item.id);
+    try {
+      const storedPreview = previews[item.id];
+      const preview = storedPreview?.gatilho === body.gatilho && storedPreview.gatilho_comprovante === body.gatilho_comprovante
+        ? storedPreview
+        : await loadRulePreview(item, body, false);
+      if (!preview.quantidade) {
+        setMessage(preview.motivo || "Essa regra não cobre lançamentos elegíveis.");
+        return;
+      }
+      setCoverageModal({ item, body, preview, existing: false });
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Não foi possível calcular a cobertura da regra.");
     } finally {
       setBusyRuleId(null);
     }
@@ -1151,13 +1253,18 @@ function AdvancedRulesPanel({
     const words = pendingItem?.historico.match(/[\p{L}\p{N}]+/gu) ?? [];
     const keyword = value(item.id, "gatilho", fields.gatilho);
     const receiptKeyword = value(item.id, "gatilhoComprovante", fields.gatilhoComprovante);
+    const debitValue = value(item.id, "debito", fields.debito);
+    const creditValue = value(item.id, "credito", fields.credito);
+    const historyValue = value(item.id, "historico", fields.historico);
+    const complementValue = value(item.id, "complemento", fields.complemento);
     const storedPreview = previews[item.id];
     const preview = storedPreview && storedPreview.gatilho === keyword && storedPreview.gatilho_comprovante === receiptKeyword ? storedPreview : undefined;
     const coveredCount =
       "cobertos" in item && keyword === fields.gatilho && receiptKeyword === fields.gatilhoComprovante
         ? item.cobertos
         : preview?.quantidade ?? 0;
-    const canSave = existing || coveredCount > 0;
+    const canSave = existing || Boolean((keyword.trim() || receiptKeyword.trim()) && debitValue.trim() && creditValue.trim() && historyValue.trim());
+    const isRecent = "gatilho" in item && recentRuleId === item.id;
     const coverageMessage = existing
       ? coveredCount
         ? `Cobrindo ${coveredCount} lançamento(s)`
@@ -1170,7 +1277,7 @@ function AdvancedRulesPanel({
     const coverageClass = coveredCount ? "" : preview || existing ? "text-red-700" : "text-slate-500";
     return (
       <tr
-        className={`border-t align-top ${compact ? "bg-inherit" : simple ? "border-y border-l-4 border-emerald-200 border-l-emerald-300 bg-emerald-50/70" : ""}`}
+        className={`border-t align-top ${isRecent ? "bg-teal-50" : compact ? "bg-inherit" : simple ? "border-y border-l-4 border-emerald-200 border-l-emerald-300 bg-emerald-50/70" : ""}`}
         key={item.id}
       >
         {compact && pendingItem ? (
@@ -1188,7 +1295,7 @@ function AdvancedRulesPanel({
         ) : (
           <>
             <td className={`${existing ? "w-[8%]" : ""} px-2 py-2`}>
-              {"data" in item ? item.data : `${item.cobertos} cobertos`}
+              {"data" in item ? item.data : <><span>{item.cobertos} cobertos</span>{isRecent && <span className="mt-1 block rounded bg-teal-700 px-1.5 py-0.5 text-[10px] font-semibold text-white">Criada agora há pouco</span>}</>}
             </td>
             <td className={`${existing ? "w-[14%]" : "w-64 max-w-64"} px-2 py-2`}>
               <p className="line-clamp-2 break-words leading-4" title={"gatilho" in item ? item.gatilho : item.historico}>{"gatilho" in item ? item.gatilho : item.historico}</p>
@@ -1365,7 +1472,7 @@ function AdvancedRulesPanel({
             title={value(item.id, "debito", fields.debito)}
             className={`${existing ? "w-full min-w-0" : "w-20"} rounded border px-1.5 py-1 pr-5 text-left text-[10px]`}
             placeholder="Selecionar"
-            value={value(item.id, "debito", fields.debito)}
+            value={debitValue}
             onChange={(event) => {
               change(item.id, "debito", event.target.value);
               showInputStart(event.currentTarget);
@@ -1379,7 +1486,7 @@ function AdvancedRulesPanel({
             title={value(item.id, "credito", fields.credito)}
             className={`${existing ? "w-full min-w-0" : "w-20"} rounded border px-1.5 py-1 pr-5 text-left text-[10px]`}
             placeholder="Selecionar"
-            value={value(item.id, "credito", fields.credito)}
+            value={creditValue}
             onChange={(event) => {
               change(item.id, "credito", event.target.value);
               showInputStart(event.currentTarget);
@@ -1393,7 +1500,7 @@ function AdvancedRulesPanel({
             title={value(item.id, "historico", fields.historico)}
             className={`${existing ? "w-full min-w-0" : "w-28"} rounded border px-1.5 py-1 pr-5 text-left text-[10px]`}
             placeholder="Selecionar"
-            value={value(item.id, "historico", fields.historico)}
+            value={historyValue}
             onChange={(event) => {
               change(item.id, "historico", event.target.value);
               showInputStart(event.currentTarget);
@@ -1404,7 +1511,7 @@ function AdvancedRulesPanel({
         <td className={`${existing ? "w-[13%]" : ""} px-2 py-1`}>
           <input
             className={`${existing ? "w-full min-w-0" : "w-28"} rounded border px-1.5 py-1`}
-            value={value(item.id, "complemento", fields.complemento)}
+            value={complementValue}
             onChange={(event) =>
               change(item.id, "complemento", event.target.value)
             }
@@ -1661,6 +1768,69 @@ function AdvancedRulesPanel({
         </table>
       </div>
       )}
+      {coverageModal && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
+        <div className="w-full max-w-2xl rounded-xl bg-white p-5 shadow-xl">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-900">Confirmar regra</h3>
+              <p className="mt-1 text-xs leading-5 text-slate-600">
+                Esta regra vai cobrir {coverageModal.preview.quantidade} lançamento(s). Confira antes de salvar.
+              </p>
+            </div>
+            <button
+              aria-label="Fechar confirmação"
+              title="Fechar"
+              disabled={busyRuleId === coverageModal.item.id}
+              onClick={() => setCoverageModal(null)}
+              className="rounded border p-1 text-slate-600 disabled:opacity-60"
+            >
+              <X size={16} />
+            </button>
+          </div>
+          <div className="mt-3 rounded border border-slate-200 bg-slate-50 p-2 text-[11px] text-slate-700">
+            <div className="grid grid-cols-2 gap-2 max-sm:grid-cols-1">
+              <p><strong>Gatilho:</strong> {coverageModal.body.gatilho || "—"}</p>
+              <p><strong>Comprovante:</strong> {coverageModal.body.gatilho_comprovante || "—"}</p>
+              <p><strong>Débito:</strong> {coverageModal.body.conta_debito}</p>
+              <p><strong>Crédito:</strong> {coverageModal.body.conta_credito}</p>
+              <p className="col-span-2 max-sm:col-span-1"><strong>Histórico:</strong> {coverageModal.body.historico}</p>
+            </div>
+          </div>
+          <div className="mt-3 max-h-72 overflow-auto rounded border border-slate-200 text-xs">
+            <div className="sticky top-0 grid grid-cols-[86px_minmax(180px,1fr)_120px] gap-2 bg-white px-3 py-2 text-[10px] font-semibold uppercase text-slate-500 shadow-sm max-sm:grid-cols-1">
+              <span>Data</span>
+              <span>Lançamento</span>
+              <span>Fonte</span>
+            </div>
+            {coverageModal.preview.lancamentos.map((movement, index) => (
+              <div className="grid grid-cols-[86px_minmax(180px,1fr)_120px] gap-2 border-t px-3 py-2 max-sm:grid-cols-1" key={`${movement.data}-${movement.historico}-${index}`}>
+                <strong className="whitespace-nowrap text-slate-700">{movement.data}</strong>
+                <div className="min-w-0">
+                  <p className="break-words leading-4">{movement.historico}</p>
+                  {movement.componente && <span className="mt-1 inline-block rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600">{componentLabel(movement.componente)}</span>}
+                </div>
+                <span className="text-slate-600">{movement.fonte}</span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 flex justify-end gap-2">
+            <button
+              disabled={busyRuleId === coverageModal.item.id}
+              onClick={() => setCoverageModal(null)}
+              className="rounded border px-3 py-1.5 text-xs font-semibold text-slate-700 disabled:opacity-60"
+            >
+              Cancelar
+            </button>
+            <button
+              disabled={busyRuleId === coverageModal.item.id}
+              onClick={() => submitRule(coverageModal.item, coverageModal.body, coverageModal.existing)}
+              className="rounded bg-teal-700 px-3 py-1.5 text-xs font-semibold text-white disabled:cursor-wait disabled:opacity-60"
+            >
+              {busyRuleId === coverageModal.item.id ? "Salvando..." : "Salvar e ir para regras salvas"}
+            </button>
+          </div>
+        </div>
+      </div>}
       {confirmClearAll && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
         <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl">
           <h3 className="text-sm font-semibold text-slate-900">Limpar todas as regras?</h3>

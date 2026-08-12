@@ -261,8 +261,9 @@ function AdvancedSummary({
   );
 }
 
-function OtherSummary({ previous, debit, credit, total }: { previous: number; debit: number; credit: number; total: number }) {
+function OtherSummary({ previous, debit, credit }: { previous: number; debit: number; credit: number }) {
   const money = (value: number) => value.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const total = debit - credit;
   return <div className="flex items-center gap-3"><div className="w-12 shrink-0 text-xs font-semibold text-violet-700">Outros</div><div className="grid flex-1 grid-cols-2 gap-1 sm:grid-cols-4"><div className="flex items-baseline justify-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-center text-slate-700"><span className="text-[9px] uppercase text-slate-500">Anterior:</span><strong className="text-xs">{money(previous)}</strong></div><div className="flex items-baseline justify-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 px-2 py-1 text-center text-indigo-800"><span className="text-[9px] uppercase text-indigo-600">Débito:</span><strong className="text-xs">{money(debit)}</strong></div><div className="flex items-baseline justify-center gap-1 rounded-md border border-fuchsia-200 bg-fuchsia-50 px-2 py-1 text-center text-fuchsia-800"><span className="text-[9px] uppercase text-fuchsia-600">Crédito:</span><strong className="text-xs">{money(credit)}</strong></div><div className="flex items-baseline justify-center gap-1 rounded-md border border-violet-300 bg-violet-100 px-2 py-1 text-center text-violet-900"><span className="text-[9px] uppercase text-violet-700">Atual:</span><strong className="text-xs">{money(total)}</strong></div></div></div>;
 }
 
@@ -380,7 +381,7 @@ function AdvancedOverview({
             Number(summary?.razao.debito ?? 0)
           }
         />
-        <OtherSummary previous={0} debit={Number(summary?.razao.outros_debito ?? 0)} credit={Number(summary?.razao.outros_credito ?? 0)} total={Number(summary?.razao.outros ?? 0)} />
+        <OtherSummary previous={0} debit={Number(summary?.razao.outros_debito ?? 0)} credit={Number(summary?.razao.outros_credito ?? 0)} />
       </div>
       <div className="text-right text-[10px] text-slate-500">
         Gera o CSV pronto para importar no ERP.
@@ -1097,12 +1098,30 @@ function AdvancedRulesPanel({
       setBusyRuleId(null);
     }
   }
+  function componentTriggerLabel(component = "") {
+    return ({
+      DESCONTO_ABATIMENTO: "Desconto",
+      DESCONTO: "Desconto",
+      ABATIMENTO: "Abatimento",
+      JUROS: "Juros",
+      MULTA: "Multa",
+    } as Record<string, string>)[component.toUpperCase()] ?? "";
+  }
+  function keywordHasPart(keyword: string, part: string) {
+    return keyword.toUpperCase().split(/\s+/).includes(part.toUpperCase());
+  }
+  function toggleKeywordPart(keyword: string, part: string) {
+    return keywordHasPart(keyword, part)
+      ? keyword.split(/\s+/).filter((item) => item.toUpperCase() !== part.toUpperCase()).join(" ")
+      : [keyword, part].filter(Boolean).join(" ");
+  }
   function legacyEditor(item: PendingRule | SavedRule, existing = false) {
     const fields = defaults(item);
     const pendingItem = "data" in item ? item : null;
     const isDebit = (item.natureza_contabil || item.natureza) === "Débito";
     const words = pendingItem?.historico.match(/[\p{L}\p{N}]+/gu) ?? [];
     const keyword = value(item.id, "gatilho", fields.gatilho);
+    const componentTrigger = componentTriggerLabel(item.tipo_componente);
     const coveredCount =
       "cobertos" in item && keyword === fields.gatilho
         ? item.cobertos
@@ -1159,6 +1178,15 @@ function AdvancedRulesPanel({
                   Usar histórico completo
                 </button>
                 <div className="flex max-w-40 flex-wrap gap-1">
+                  {componentTrigger && (
+                    <button
+                      type="button"
+                      onClick={() => change(item.id, "gatilho", toggleKeywordPart(keyword, componentTrigger))}
+                      className={`rounded px-1 py-0.5 text-[9px] ${keywordHasPart(keyword, componentTrigger) ? "bg-teal-700 text-white" : "bg-amber-100 text-amber-800"}`}
+                    >
+                      {componentTrigger}
+                    </button>
+                  )}
                   {words.map((word, index) => (
                     <button
                       onClick={() =>
@@ -1253,6 +1281,7 @@ function AdvancedRulesPanel({
     const words = pendingItem?.historico.match(/[\p{L}\p{N}]+/gu) ?? [];
     const keyword = value(item.id, "gatilho", fields.gatilho);
     const receiptKeyword = value(item.id, "gatilhoComprovante", fields.gatilhoComprovante);
+    const componentTrigger = componentTriggerLabel(item.tipo_componente);
     const debitValue = value(item.id, "debito", fields.debito);
     const creditValue = value(item.id, "credito", fields.credito);
     const historyValue = value(item.id, "historico", fields.historico);
@@ -1397,6 +1426,24 @@ function AdvancedRulesPanel({
                           ✕
                         </button>
                       </div>
+                      {componentTrigger && (
+                        <div className="mb-2 border-b border-slate-100 pb-2">
+                          <p className="mb-1 text-[9px] font-semibold uppercase text-amber-600">Componente</p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              change(item.id, "gatilho", toggleKeywordPart(keyword, componentTrigger));
+                              setKeywordMode((items) => ({
+                                ...items,
+                                [item.id]: "words",
+                              }));
+                            }}
+                            className={`rounded px-1.5 py-0.5 text-[10px] ${keywordHasPart(keyword, componentTrigger) ? "bg-teal-700 text-white" : "bg-amber-100 text-amber-800 hover:bg-amber-200"}`}
+                          >
+                            {componentTrigger}
+                          </button>
+                        </div>
+                      )}
                       <div className="flex flex-wrap gap-1">
                         {words.map((word, index) => {
                           const selected = keyword
@@ -1438,6 +1485,18 @@ function AdvancedRulesPanel({
                 </>
               )}
             </div>
+            {componentTrigger && (
+              <button
+                type="button"
+                onClick={() => {
+                  change(item.id, "gatilho", toggleKeywordPart(keyword, componentTrigger));
+                  setKeywordMode((items) => ({ ...items, [item.id]: "words" }));
+                }}
+                className={`mt-1 rounded px-1.5 py-0.5 text-[10px] font-semibold ${keywordHasPart(keyword, componentTrigger) ? "bg-teal-700 text-white" : "bg-amber-100 text-amber-800 hover:bg-amber-200"}`}
+              >
+                {componentTrigger}
+              </button>
+            )}
             {(pendingItem?.comprovante_arquivo_id || pendingItem?.comprovante_rfb_arquivo_id) && (
               <div className="mt-1 flex items-center gap-1">
                 <input className="w-20 rounded border border-violet-200 px-1.5 py-1" placeholder="comprovante..." value={receiptKeyword} onChange={(event) => change(item.id, "gatilhoComprovante", event.target.value)} />

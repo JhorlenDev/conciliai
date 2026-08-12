@@ -600,6 +600,16 @@ def rule_component_key(component: str) -> str:
     return "PRINCIPAL" if component in {"", "PRINCIPAL", "VALOR_COBRADO"} else component
 
 
+def rule_component_trigger_label(component: str) -> str:
+    return {
+        "DESCONTO_ABATIMENTO": "Desconto",
+        "DESCONTO": "Desconto",
+        "ABATIMENTO": "Abatimento",
+        "JUROS": "Juros",
+        "MULTA": "Multa",
+    }.get((component or "").upper(), "")
+
+
 def preferred_accounting_entry(existing: LancamentoContabil, candidate: LancamentoContabil) -> LancamentoContabil:
     if rule_component_key(existing.componente) != "PRINCIPAL" or rule_component_key(candidate.componente) != "PRINCIPAL":
         return existing
@@ -636,10 +646,11 @@ def rule_matches_movement(rule: RegraContabil, movement: MovimentoExtrato, recei
     trigger = rule.favorecido_normalizado
     history = rule_match_history(movement, receipt)
     component_matches = not component or (rule_component_key(rule.tipo_componente) == rule_component_key(component) if rule.tipo_componente else rule_component_key(component) == "PRINCIPAL")
+    component_source = " ".join(item for item in [history, rule_component_trigger_label(component), component] if item)
     receipt_source = receipt_trigger_text(receipt, rfb, rfb_items)
     receipt_trigger = normalize_name(rule.gatilho_comprovante_normalizado or "")
     receipt_tokens_match = not receipt_trigger or receipt_trigger in normalize_name(receipt_source) or set(receipt_trigger.split()) <= set(normalize_name(receipt_source).split())
-    statement_matches = trigger_matches(history, trigger) or legacy_trigger_matches_receipt(rule, history, receipt, rfb, rfb_items)
+    statement_matches = trigger_matches(component_source, trigger) or legacy_trigger_matches_receipt(rule, history, receipt, rfb, rfb_items)
     return bool(statement_matches and receipt_tokens_match and (not rule.tipo_operacao or normalize_rule_accounting_nature(rule.tipo_operacao) == accounting_nature(movement.natureza)) and component_matches)
 
 
@@ -762,7 +773,6 @@ def accounting_integrity(reconciliation: Conciliacao, db: Session) -> dict:
     valid_entries = []
     bank_debit = Decimal("0.00")
     bank_credit = Decimal("0.00")
-    other = Decimal("0.00")
     other_debit = Decimal("0.00")
     other_credit = Decimal("0.00")
     incomplete = []
@@ -777,7 +787,6 @@ def accounting_integrity(reconciliation: Conciliacao, db: Session) -> dict:
         valid_entries.extend(completed)
         for entry in completed:
             if is_other_accounting_entry(entry):
-                other += entry.valor
                 if is_discount_component(entry.componente):
                     other_debit += entry.valor
                     other_credit += entry.valor
@@ -793,6 +802,7 @@ def accounting_integrity(reconciliation: Conciliacao, db: Session) -> dict:
     accounting_debit = sum((entry.valor for entry in valid_entries), Decimal("0.00"))
     accounting_credit = sum((entry.valor for entry in valid_entries), Decimal("0.00"))
     difference = accounting_debit - accounting_credit
+    other = other_debit - other_credit
     return {"debito": bank_debit, "credito": bank_credit, "outros": other, "outros_debito": other_debit, "outros_credito": other_credit, "diferenca": difference, "movimentos_incompletos": incomplete, "csv_permitido": not incomplete and abs(difference) <= Decimal("0.01"), "lancamentos_validos": valid_entries, "lancamentos_outros": other_entries}
 
 

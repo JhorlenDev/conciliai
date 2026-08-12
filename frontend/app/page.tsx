@@ -5,18 +5,6 @@ import Link from "next/link";
 import { ArrowRight, Building2, Clock3, FileText, ListFilter, Plus, RefreshCw, Trash2, Users, X } from "lucide-react";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-const banks = [
-  "Banco do Brasil",
-  "Santander",
-  "BASA",
-  "Bradesco",
-  "Caixa",
-  "Conta Caixa",
-  "Vendas com Cartão",
-  "Comissões Getnet",
-  "Apropriações",
-  "Empréstimos/Financeiro",
-];
 type Client = { id: string; nome: string };
 type BankReconciliation = { id: string; banco: string; status: string };
 type Process = {
@@ -30,6 +18,15 @@ type Process = {
   bancos: BankReconciliation[];
 };
 
+const yearFromDate = (value: string) => value.match(/\d{4}/)?.[0] ?? "";
+
+const periodTouchesYear = (process: Process, year: string) => {
+  const selectedYear = Number(year);
+  const startYear = Number(yearFromDate(process.data_inicio));
+  const endYear = Number(yearFromDate(process.data_fim) || yearFromDate(process.data_inicio));
+  return startYear <= selectedYear && selectedYear <= endYear;
+};
+
 export default function EntryPage() {
   const [clients, setClients] = useState<Client[]>([]),
     [processes, setProcesses] = useState<Process[]>([]);
@@ -38,7 +35,7 @@ export default function EntryPage() {
     [end, setEnd] = useState(""),
     [message, setMessage] = useState(""),
     [processClientFilter, setProcessClientFilter] = useState(""),
-    [processBankFilter, setProcessBankFilter] = useState(""),
+    [processYearFilter, setProcessYearFilter] = useState(""),
     [processToDelete, setProcessToDelete] = useState<Process | null>(null),
     [isDeleting, setIsDeleting] = useState(false),
     [now, setNow] = useState<Date | null>(null);
@@ -64,21 +61,18 @@ export default function EntryPage() {
     const timer = window.setInterval(update, 1_000);
     return () => window.clearInterval(timer);
   }, []);
-  const processBanks = useMemo(() => {
-    const scopedProcesses = processClientFilter
-      ? processes.filter((process) => process.cliente_id === processClientFilter)
-      : processes;
-    return banks.filter((item) =>
-      scopedProcesses.some((process) =>
-        process.bancos.some((reconciliation) => reconciliation.banco === item),
-      ),
-    );
-  }, [processClientFilter, processes]);
-  useEffect(() => {
-    if (processBankFilter && !processBanks.includes(processBankFilter)) {
-      setProcessBankFilter("");
-    }
-  }, [processBankFilter, processBanks]);
+  const processYears = useMemo(() => {
+    const years = new Set<string>();
+    processes.forEach((process) => {
+      const startYear = Number(yearFromDate(process.data_inicio));
+      const endYear = Number(yearFromDate(process.data_fim) || yearFromDate(process.data_inicio));
+      if (!startYear || !endYear) return;
+      for (let year = startYear; year <= endYear; year += 1) {
+        years.add(String(year));
+      }
+    });
+    return Array.from(years).sort((left, right) => Number(right) - Number(left));
+  }, [processes]);
   async function create(event: FormEvent) {
     event.preventDefault();
     setMessage("");
@@ -125,8 +119,8 @@ export default function EntryPage() {
   };
   const filteredProcesses = processes.filter((process) => {
     const matchesClient = !processClientFilter || process.cliente_id === processClientFilter;
-    const matchesBank = !processBankFilter || process.bancos.some((reconciliation) => reconciliation.banco === processBankFilter);
-    return matchesClient && matchesBank;
+    const matchesYear = !processYearFilter || periodTouchesYear(process, processYearFilter);
+    return matchesClient && matchesYear;
   });
   const orderedProcesses = [...filteredProcesses].sort((left, right) =>
     left.data_inicio.localeCompare(right.data_inicio),
@@ -233,7 +227,7 @@ export default function EntryPage() {
                 {orderedProcesses.length} de {processes.length}
               </span>
             </div>
-            <div className="grid gap-3 md:grid-cols-[1fr_220px_auto]">
+            <div className="grid gap-3 md:grid-cols-[1fr_160px_auto]">
               <label className="min-w-0 text-sm font-medium">
                 Cliente
                 <select
@@ -250,15 +244,15 @@ export default function EntryPage() {
                 </select>
               </label>
               <label className="min-w-0 text-sm font-medium">
-                Banco
+                Ano
                 <select
-                  value={processBankFilter}
-                  onChange={(event) => setProcessBankFilter(event.target.value)}
+                  value={processYearFilter}
+                  onChange={(event) => setProcessYearFilter(event.target.value)}
                   className="mt-1 w-full rounded border p-2"
                 >
-                  <option value="">Todos os bancos</option>
-                  {processBanks.map((item) => (
-                    <option key={item}>{item}</option>
+                  <option value="">Todos os anos</option>
+                  {processYears.map((year) => (
+                    <option key={year}>{year}</option>
                   ))}
                 </select>
               </label>
@@ -266,9 +260,9 @@ export default function EntryPage() {
                 type="button"
                 onClick={() => {
                   setProcessClientFilter("");
-                  setProcessBankFilter("");
+                  setProcessYearFilter("");
                 }}
-                disabled={!processClientFilter && !processBankFilter}
+                disabled={!processClientFilter && !processYearFilter}
                 className="self-end rounded border px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 Limpar

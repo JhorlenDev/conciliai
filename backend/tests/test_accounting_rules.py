@@ -578,7 +578,7 @@ def test_discount_is_accounted_as_other_and_exported_in_main_csv():
     integrity = accounting_integrity(reconciliation, session)
     csv = accounting_csv(reconciliation.id, session).body.decode("utf-8-sig")
 
-    assert (integrity["debito"], integrity["credito"], integrity["outros"], integrity["outros_debito"], integrity["outros_credito"]) == (Decimal("0.00"), Decimal("12.50"), Decimal("2.50"), Decimal("2.50"), Decimal("2.50"))
+    assert (integrity["debito"], integrity["credito"], integrity["outros"], integrity["outros_debito"], integrity["outros_credito"]) == (Decimal("0.00"), Decimal("12.50"), Decimal("0.00"), Decimal("2.50"), Decimal("2.50"))
     assert csv.splitlines() == ["Data;Debito;Credito;Historico;Valor;Complemento", "02/01/2024;Despesa;Banco;Pagamento;12.50;", "02/01/2024;Descontos;Despesa;Desconto obtido;2.50;"]
 
 
@@ -614,6 +614,21 @@ def test_saved_discount_rule_is_listed_after_being_applied_as_other():
     data = accounting_rules(reconciliation.id, session)
     assert data["pendentes"] == []
     assert [(rule["tipo_componente"], rule["cobertos"]) for rule in data["salvas"]] == [("DESCONTO", 1)]
+
+
+def test_component_trigger_can_be_combined_with_statement_keyword():
+    session, reconciliation, movement = rules_session()
+    match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id)
+    session.add(match); session.flush()
+    session.add(LancamentoContabil(correspondencia_id=match.id, componente="DESCONTO_ABATIMENTO", efeito_no_total="OUTROS", valor=Decimal("2.50"), origem="comprovante", status="pendente_regra"))
+    session.commit()
+
+    payload = RegraContabilInput(gatilho="FORNECEDOR Desconto", natureza="Crédito", tipo_componente="DESCONTO_ABATIMENTO", conta_debito="Descontos", conta_credito="Despesa", historico="Desconto obtido")
+    preview = preview_accounting_rule(reconciliation.id, RegraContabilPreviaInput(gatilho=payload.gatilho, natureza=payload.natureza, tipo_componente=payload.tipo_componente), session)
+    create_accounting_rule(reconciliation.id, payload, session)
+
+    assert preview["quantidade"] == 1
+    assert accounting_rules(reconciliation.id, session)["salvas"][0]["cobertos"] == 1
 
 
 def test_saved_rules_keep_each_component_value_in_document_order():

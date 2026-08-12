@@ -569,8 +569,8 @@ def test_discount_is_accounted_as_other_and_exported_in_main_csv():
     match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id)
     session.add(match); session.flush()
     session.add_all([
-        LancamentoContabil(correspondencia_id=match.id, componente="VALOR_COBRADO", valor=Decimal("12.50"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento", ordem=1, status="editado_manual"),
-        LancamentoContabil(correspondencia_id=match.id, componente="DESCONTO", efeito_no_total="SOMA", valor=Decimal("2.50"), conta_debito="Descontos", conta_credito="Despesa", historico="Desconto obtido", ordem=2, status="editado_manual"),
+        LancamentoContabil(correspondencia_id=match.id, componente="VALOR_COBRADO", valor=Decimal("12.50"), conta_debito="Despesa", conta_credito="Banco", historico="Pagamento", ordem=99, status="editado_manual"),
+        LancamentoContabil(correspondencia_id=match.id, componente="DESCONTO", efeito_no_total="SOMA", valor=Decimal("2.50"), conta_debito="Descontos", conta_credito="Despesa", historico="Desconto obtido", ordem=1, status="editado_manual"),
     ])
     session.add(ContaBancaria(cliente_id=reconciliation.cliente_id, banco=reconciliation.banco, conta_contabil="Banco"))
     session.commit()

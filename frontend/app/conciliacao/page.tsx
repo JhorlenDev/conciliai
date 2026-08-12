@@ -1274,6 +1274,7 @@ function AdvancedRulesPanel({
     compact = false,
     simple = false,
     showAction = true,
+    composite = false,
   ) {
     const fields = defaults(item);
     const pendingItem = "data" in item ? item : null;
@@ -1306,7 +1307,7 @@ function AdvancedRulesPanel({
     const coverageClass = coveredCount ? "" : preview || existing ? "text-red-700" : "text-slate-500";
     return (
       <tr
-        className={`border-t align-top ${isRecent ? "bg-teal-50" : compact ? "bg-inherit" : simple ? "border-y border-l-4 border-emerald-200 border-l-emerald-300 bg-emerald-50/70" : ""}`}
+        className={`border-t align-top ${composite ? "border-x-2 border-x-sky-200 bg-sky-50/50" : ""} ${isRecent ? "bg-teal-50" : compact ? "bg-inherit" : simple ? "border-y border-l-4 border-emerald-200 border-l-emerald-300 bg-emerald-50/70" : ""}`}
         key={item.id}
       >
         {compact && pendingItem ? (
@@ -1606,7 +1607,47 @@ function AdvancedRulesPanel({
       return groups;
     }, {}),
   );
-  const displayedItems = view === "pending" ? visible : view === "saved" ? visibleSaved : [];
+  const componentOrder = (component = "") =>
+    ({
+      PRINCIPAL: 1,
+      VALOR_COBRADO: 1,
+      MULTA: 2,
+      JUROS: 3,
+      ENCARGOS: 4,
+      DESCONTO: 5,
+      ABATIMENTO: 6,
+      DESCONTO_ABATIMENTO: 7,
+    } as Record<string, number>)[component] ?? 99;
+  const savedCoverageSignature = (rule: SavedRule) =>
+    (rule.movimentos ?? [])
+      .map((movement) =>
+        [
+          movement.data,
+          movement.texto_extrato || movement.historico,
+          movement.texto_comprovante || "",
+          movement.natureza_contabil,
+        ].join("|"),
+      )
+      .sort()
+      .join("||");
+  const savedGroups = Object.values(
+    visibleSaved.reduce<Record<string, SavedRule[]>>((groups, rule) => {
+      const signature = savedCoverageSignature(rule);
+      const key = signature || rule.id;
+      (groups[key] ??= []).push(rule);
+      return groups;
+    }, {}),
+  ).map((group) =>
+    group.sort(
+      (left, right) =>
+        componentOrder(left.tipo_componente) -
+          componentOrder(right.tipo_componente) ||
+        left.historico.localeCompare(right.historico),
+    ),
+  );
+  const isSavedComposite = (group: SavedRule[]) =>
+    group.length > 1 &&
+    new Set(group.map((rule) => componentOrder(rule.tipo_componente))).size > 1;
   const zeroCoveredRulesCount = saved.filter((rule) => rule.cobertos === 0).length;
   const showActions = true;
   return (
@@ -1798,31 +1839,50 @@ function AdvancedRulesPanel({
                     </Fragment>
                   );
                 })
-               : visibleSaved.map((item) => (
-                  <Fragment key={item.id}>
-                    {editor(item, true, false, false, showActions)}
-                    {item.movimentos?.length ? (
-                      <tr className="bg-slate-50">
-                        <td colSpan={showActions ? 10 : 9} className="px-3 pb-3 pt-1">
-                          <p className="mb-1 text-[10px] font-semibold uppercase text-slate-500">Lançamentos cobertos</p>
-                          <div className="divide-y divide-slate-200 border-y border-slate-200 text-[11px] leading-[1.25] text-slate-600">
-                            {item.movimentos.map((movement, index) => (
-                              <div className="grid grid-cols-[72px_minmax(220px,1fr)_max-content_64px] gap-x-3 gap-y-1 py-1.5 max-sm:grid-cols-1 max-sm:gap-y-1" key={`${movement.data}-${index}`}>
-                                <strong className="whitespace-nowrap text-slate-700">{movement.data}</strong>
-                                <div className="min-w-0 space-y-0.5 whitespace-normal break-words [overflow-wrap:anywhere]">
-                                  <p><span className="text-[10px] font-semibold text-slate-500">Texto Extrato: </span>{movement.texto_extrato || movement.historico}</p>
-                                  {movement.tem_comprovante && <p><span className="text-[10px] font-semibold text-slate-500">Texto Comprovante: </span>{movement.texto_comprovante || "Não identificado"}</p>}
+               : savedGroups.map((group) => {
+                  const composite = isSavedComposite(group);
+                  const components = group.map((item) => componentLabel(item.tipo_componente)).filter(Boolean);
+                  return (
+                    <Fragment key={group.map((item) => item.id).join(":")}>
+                      {composite && (
+                        <tr className="border-t-2 border-sky-300 bg-sky-50">
+                          <td colSpan={showActions ? 10 : 9} className="border-x-2 border-t-2 border-sky-200 px-3 py-2">
+                            <div className="flex flex-wrap items-center gap-2 text-[11px] text-sky-900">
+                              <strong className="rounded bg-sky-700 px-2 py-0.5 text-white">Regra composta</strong>
+                              <span>{components.join(" + ")}</span>
+                              <span className="text-sky-700">Componentes do mesmo lançamento ficam juntos aqui e no CSV.</span>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      {group.map((item, index) => (
+                        <Fragment key={item.id}>
+                          {editor(item, true, false, false, showActions, composite)}
+                          {item.movimentos?.length ? (
+                            <tr className={composite ? "bg-sky-50/60" : "bg-slate-50"}>
+                              <td colSpan={showActions ? 10 : 9} className={`${composite ? `border-x-2 border-sky-200 ${index === group.length - 1 ? "border-b-2" : ""}` : ""} px-3 pb-3 pt-1`}>
+                                <p className={`mb-1 text-[10px] font-semibold uppercase ${composite ? "text-sky-700" : "text-slate-500"}`}>Lançamentos cobertos</p>
+                                <div className={`divide-y text-[11px] leading-[1.25] text-slate-600 ${composite ? "divide-sky-200 border-y border-sky-200" : "divide-slate-200 border-y border-slate-200"}`}>
+                                  {item.movimentos.map((movement, index) => (
+                                    <div className="grid grid-cols-[72px_minmax(220px,1fr)_max-content_64px] gap-x-3 gap-y-1 py-1.5 max-sm:grid-cols-1 max-sm:gap-y-1" key={`${movement.data}-${index}`}>
+                                      <strong className="whitespace-nowrap text-slate-700">{movement.data}</strong>
+                                      <div className="min-w-0 space-y-0.5 whitespace-normal break-words [overflow-wrap:anywhere]">
+                                        <p><span className="text-[10px] font-semibold text-slate-500">Texto Extrato: </span>{movement.texto_extrato || movement.historico}</p>
+                                        {movement.tem_comprovante && <p><span className="text-[10px] font-semibold text-slate-500">Texto Comprovante: </span>{movement.texto_comprovante || "Não identificado"}</p>}
+                                      </div>
+                                      <span className="whitespace-nowrap text-slate-700">{movement.tipo_componente && `${componentLabel(movement.tipo_componente)} · `}R$ {Number(movement.valor).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}</span>
+                                      <span className="whitespace-nowrap text-slate-700">{movement.natureza_contabil}</span>
+                                    </div>
+                                  ))}
                                 </div>
-                                <span className="whitespace-nowrap text-slate-700">{movement.tipo_componente && `${componentLabel(movement.tipo_componente)} · `}R$ {Number(movement.valor).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}</span>
-                                <span className="whitespace-nowrap text-slate-700">{movement.natureza_contabil}</span>
-                              </div>
-                            ))}
-                          </div>
-                        </td>
-                      </tr>
-                    ) : null}
-                  </Fragment>
-                ))}
+                              </td>
+                            </tr>
+                          ) : null}
+                        </Fragment>
+                      ))}
+                    </Fragment>
+                  );
+                })}
           </tbody>
         </table>
       </div>

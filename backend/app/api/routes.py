@@ -754,6 +754,12 @@ def accounting_entry_order(entry: LancamentoContabil) -> tuple[int, int, str]:
     return (entry.ordem or fallback, fallback, entry.id)
 
 
+def accounting_export_order(entry: LancamentoContabil) -> tuple[int, int, str]:
+    component_order = {"PRINCIPAL": 1, "VALOR_COBRADO": 1, "MULTA": 2, "JUROS": 3, "ENCARGOS": 4, "DESCONTO": 5, "ABATIMENTO": 6, "DESCONTO_ABATIMENTO": 7}
+    fallback = component_order.get(entry.componente, 99)
+    return (fallback, entry.ordem or fallback, entry.id)
+
+
 def statement_effect_value(value: Decimal, effect: str) -> Decimal:
     return value if effect == "SOMA" else -value if effect == "SUBTRAI" else Decimal("0.00")
 
@@ -1313,8 +1319,8 @@ def accounting_csv_response(conciliacao_id: str, db: Session):
         match = db.get(Correspondencia, entry.correspondencia_id)
         movement = db.get(MovimentoExtrato, match.movimento_extrato_id) if match else None
         rule = db.get(RegraContabil, entry.regra_contabil_id) if entry.regra_contabil_id else None
-        rows.append((movement.data if movement and movement.data else date.max, entry.ordem, entry.id, movement, entry, rule))
-    for _, _, _, movement, entry, rule in sorted(rows):
+        rows.append((movement.data if movement and movement.data else date.max, accounting_export_order(entry), movement, entry, rule))
+    for _, _, movement, entry, rule in sorted(rows):
         writer.writerow([
             movement.data.strftime("%d/%m/%Y") if movement and movement.data else "",
             accounting_code(entry.conta_debito),
@@ -1355,7 +1361,7 @@ def accounting_pdf(conciliacao_id: str, db: Session = Depends(get_db)):
         movement = db.get(MovimentoExtrato, match.movimento_extrato_id) if match else None
         if movement and movement.data:
             rows.append((movement.data, entry))
-    rows.sort(key=lambda item: (item[0], item[1].ordem, item[1].id))
+    rows.sort(key=lambda item: (item[0], accounting_export_order(item[1])))
     document = fitz.open()
     page = document.new_page(width=842, height=595)
     y = 48

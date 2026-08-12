@@ -578,7 +578,7 @@ def test_discount_is_accounted_as_other_and_exported_in_main_csv():
     integrity = accounting_integrity(reconciliation, session)
     csv = accounting_csv(reconciliation.id, session).body.decode("utf-8-sig")
 
-    assert (integrity["debito"], integrity["credito"], integrity["outros"], integrity["outros_debito"], integrity["outros_credito"]) == (Decimal("0.00"), Decimal("12.50"), Decimal("2.50"), Decimal("2.50"), Decimal("0.00"))
+    assert (integrity["debito"], integrity["credito"], integrity["outros"], integrity["outros_debito"], integrity["outros_credito"]) == (Decimal("0.00"), Decimal("12.50"), Decimal("2.50"), Decimal("2.50"), Decimal("2.50"))
     assert csv.splitlines() == ["Data;Debito;Credito;Historico;Valor;Complemento", "02/01/2024;Despesa;Banco;Pagamento;12.50;", "02/01/2024;Descontos;Despesa;Desconto obtido;2.50;"]
 
 

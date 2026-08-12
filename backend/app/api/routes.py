@@ -726,8 +726,15 @@ def complete_accounting_entry(entry: LancamentoContabil) -> bool:
     return bool(entry.status in {"aplicado_por_regra", "editado_manual"} and entry.valor and entry.valor > 0 and entry.conta_debito.strip() and entry.conta_credito.strip() and entry.historico.strip())
 
 
+DISCOUNT_COMPONENTS = {"DESCONTO", "ABATIMENTO", "DESCONTO_ABATIMENTO"}
+
+
+def is_discount_component(component: str | None) -> bool:
+    return (component or "") in DISCOUNT_COMPONENTS
+
+
 def is_other_accounting_entry(entry: LancamentoContabil) -> bool:
-    return entry.efeito_no_total == "OUTROS" or entry.componente in {"DESCONTO", "ABATIMENTO", "DESCONTO_ABATIMENTO"}
+    return entry.efeito_no_total == "OUTROS" or is_discount_component(entry.componente)
 
 
 def accounting_entry_order(entry: LancamentoContabil) -> tuple[int, int, str]:
@@ -771,8 +778,9 @@ def accounting_integrity(reconciliation: Conciliacao, db: Session) -> dict:
         for entry in completed:
             if is_other_accounting_entry(entry):
                 other += entry.valor
-                if entry.componente in {"DESCONTO", "ABATIMENTO", "DESCONTO_ABATIMENTO"}:
+                if is_discount_component(entry.componente):
                     other_debit += entry.valor
+                    other_credit += entry.valor
                 elif accounting_nature(movement.natureza) == "Débito":
                     other_debit += entry.valor
                 else:

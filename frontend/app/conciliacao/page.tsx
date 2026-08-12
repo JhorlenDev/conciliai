@@ -1629,7 +1629,7 @@ function AdvancedRulesPanel({
           )}
         </div>
       ) : (
-      <div className="max-h-[calc(100dvh-330px)] overflow-auto rounded border overscroll-contain">
+      <div className="h-[calc(100dvh-330px)] min-h-96 overflow-auto rounded border overscroll-contain">
         <table className={`w-full text-left text-xs ${view === "saved" ? "table-fixed" : ""}`}>
           <thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase text-slate-500 shadow-sm">
             <tr>

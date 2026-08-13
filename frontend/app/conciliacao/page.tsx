@@ -764,7 +764,6 @@ function AdvancedRulesPanel({
     historicos: string[];
   }>({ contas: [], historicos: [] });
   const loadRequest = useRef(0);
-  const skipNextAutoHide = useRef(false);
   const recentRuleTimer = useRef<number | null>(null);
   useEffect(() => () => {
     if (recentRuleTimer.current) window.clearTimeout(recentRuleTimer.current);
@@ -788,7 +787,7 @@ function AdvancedRulesPanel({
       DESCONTO_ABATIMENTO: 7,
     } as Record<string, number>)[component] ?? 99;
   }
-  function savedCoverageSignature(rule: SavedRule) {
+  function savedMovementKeys(rule: SavedRule) {
     return (rule.movimentos ?? [])
       .map((movement) =>
         [
@@ -797,20 +796,20 @@ function AdvancedRulesPanel({
           movement.texto_comprovante || "",
           movement.natureza_contabil,
         ].join("|"),
-      )
-      .sort()
-      .join("||");
+      );
+  }
+  function savedRulesOverlap(left: SavedRule, right: SavedRule) {
+    const rightKeys = new Set(savedMovementKeys(right));
+    return savedMovementKeys(left).some((key) => rightKeys.has(key));
   }
   function sortSavedRules(items: SavedRule[], topRuleId?: string | null) {
     const topRule = topRuleId ? items.find((item) => item.id === topRuleId) : null;
-    const topSignature = topRule ? savedCoverageSignature(topRule) : "";
     const topRuleIsCompositeMember = Boolean(
       topRule &&
-        topSignature &&
         items.some(
           (item) =>
             item.id !== topRule.id &&
-            savedCoverageSignature(item) === topSignature &&
+            savedRulesOverlap(item, topRule) &&
             componentOrder(item.tipo_componente) !== componentOrder(topRule.tipo_componente),
         ),
     );
@@ -842,25 +841,9 @@ function AdvancedRulesPanel({
     const rules = await rulesResponse.json();
     const bankAccount = await accountResponse.json();
     if (request !== loadRequest.current) return null;
-    let currentRules = rules;
-    const zeroCoveredCount = rules.salvas.filter((rule: SavedRule) => rule.cobertos === 0).length;
-    const skipAutoHide = skipNextAutoHide.current;
-    skipNextAutoHide.current = false;
-    if (zeroCoveredCount && !skipAutoHide) {
-      const cleanupResponse = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/sem-cobertura`, { method: "DELETE", cache: "no-store" });
-      if (request !== loadRequest.current) return null;
-      if (cleanupResponse.ok) {
-        const cleanup = await cleanupResponse.json();
-        currentRules = cleanup.regras ?? rules;
-        setMessage(cleanup.message ?? `${zeroCoveredCount} regra(s) sem cobertura movida(s) para regras ocultas.`);
-        onRulesChanged();
-      } else {
-        setMessage(await errorMessage(cleanupResponse, "Não foi possível ocultar automaticamente as regras sem cobertura."));
-      }
-    }
-    applyRulesSnapshot(currentRules);
+    applyRulesSnapshot(rules);
     setAccount(bankAccount.conta_contabil || "Sem conta");
-    return currentRules;
+    return rules;
   }
   useEffect(() => {
     load();
@@ -1089,12 +1072,28 @@ function AdvancedRulesPanel({
       if (!response.ok) return setMessage(await errorMessage(response, "Não foi possível restaurar a regra."));
       const result = await response.json();
       if (result.regras) applyRulesSnapshot(result.regras);
-      skipNextAutoHide.current = true;
       setView("saved");
       setMessage(result.message ?? "Regra restaurada neste período.");
       onRulesChanged();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Não foi possível restaurar a regra. Verifique a conexão e tente novamente.");
+    } finally {
+      setBusyRuleId(null);
+    }
+  }
+  async function restoreCoveredHiddenRules() {
+    if (busyRuleId) return;
+    setBusyRuleId("restore-covered-hidden");
+    try {
+      const response = await requestWithTimeout(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/ocultas/restaurar-com-cobertura`, { method: "POST" }, "A busca de regras existentes");
+      if (!response.ok) return setMessage(await errorMessage(response, "Não foi possível buscar regras existentes."));
+      const result = await response.json();
+      if (result.regras) applyRulesSnapshot(result.regras);
+      setView(result.quantidade ? "saved" : "hidden");
+      setMessage(result.message ?? "Busca de regras existentes concluída.");
+      if (result.quantidade) onRulesChanged();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Não foi possível buscar regras existentes. Verifique a conexão e tente novamente.");
     } finally {
       setBusyRuleId(null);
     }
@@ -1644,14 +1643,25 @@ function AdvancedRulesPanel({
       return groups;
     }, {}),
   );
-  const savedGroups = Object.values(
-    visibleSaved.reduce<Record<string, SavedRule[]>>((groups, rule) => {
-      const signature = savedCoverageSignature(rule);
-      const key = signature || rule.id;
-      (groups[key] ??= []).push(rule);
-      return groups;
-    }, {}),
-  ).map((group) =>
+  const savedGroups = (() => {
+    const groups: SavedRule[][] = [];
+    visibleSaved.forEach((rule) => {
+      const matchingIndexes = groups
+        .map((group, index) => (group.some((item) => savedRulesOverlap(item, rule)) ? index : -1))
+        .filter((index) => index >= 0);
+      if (!matchingIndexes.length) {
+        groups.push([rule]);
+        return;
+      }
+      const [firstIndex, ...mergeIndexes] = matchingIndexes;
+      groups[firstIndex].push(rule);
+      mergeIndexes.reverse().forEach((index) => {
+        groups[firstIndex].push(...groups[index]);
+        groups.splice(index, 1);
+      });
+    });
+    return groups;
+  })().map((group) =>
     group.sort(
       (left, right) =>
         componentOrder(left.tipo_componente) -
@@ -1725,6 +1735,15 @@ function AdvancedRulesPanel({
         >
           {busyRuleId === "zero-covered" ? "Limpando..." : `Regras ocultas (${ignored.length}) · 0 cobertos (${zeroCoveredRulesCount})`}
         </button>
+        {ignored.length > 0 && (
+          <button
+            disabled={busyRuleId === "restore-covered-hidden"}
+            onClick={restoreCoveredHiddenRules}
+            className="rounded-md border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-800 disabled:cursor-wait disabled:opacity-60"
+          >
+            {busyRuleId === "restore-covered-hidden" ? "Buscando..." : `Buscar regras existentes (${ignored.length})`}
+          </button>
+        )}
         {saved.length > 0 && <button onClick={() => setConfirmClearAll(true)} className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-semibold text-red-700">Limpar todas</button>}
         <div className="ml-auto flex flex-wrap items-center gap-1.5 rounded-md bg-slate-50 p-1.5">
           <label className="flex items-center gap-1 text-[11px] font-medium text-slate-600">

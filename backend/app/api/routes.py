@@ -1205,6 +1205,32 @@ def restore_rule_in_period(conciliacao_id: str, regra_id: str, db: Session = Dep
     return {"message": f"Regra restaurada neste período ({reconciliation.data_inicio.strftime('%m/%Y')}).", "regras": accounting_rules(conciliacao_id, db)}
 
 
+@router.post("/conciliacoes/{conciliacao_id}/regras-contabeis/ocultas/restaurar-com-cobertura")
+def restore_covered_hidden_accounting_rules(conciliacao_id: str, db: Session = Depends(get_db)):
+    reconciliation = reconciliation_or_404(conciliacao_id, db)
+    exceptions = db.query(RegraContabilExcecao).filter_by(conciliacao_id=reconciliation.id).all()
+    rule_ids = [item.regra_contabil_id for item in exceptions]
+    rules_by_id = {item.id: item for item in db.query(RegraContabil).filter(RegraContabil.id.in_(rule_ids)).all()} if rule_ids else {}
+    restored = []
+    try:
+        for exception in exceptions:
+            rule = rules_by_id.get(exception.regra_contabil_id)
+            if not rule or not rule.ativo or rule.cliente_id != reconciliation.cliente_id or rule.banco != reconciliation.banco:
+                continue
+            if rule_preview(rule, reconciliation, db):
+                db.delete(exception)
+                restored.append(rule.id)
+        if restored:
+            apply_accounting_rules(reconciliation, db)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    count = len(restored)
+    message = f"{count} regra(s) existente(s) restaurada(s) e aplicada(s)." if count else "Nenhuma regra oculta com cobertura encontrada neste período."
+    return {"message": message, "quantidade": count, "regras": accounting_rules(conciliacao_id, db)}
+
+
 @router.delete("/conciliacoes/{conciliacao_id}/regras-contabeis/sem-cobertura")
 def delete_zero_covered_accounting_rules(conciliacao_id: str, db: Session = Depends(get_db)):
     reconciliation = reconciliation_or_404(conciliacao_id, db)

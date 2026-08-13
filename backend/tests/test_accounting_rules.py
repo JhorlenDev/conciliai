@@ -7,7 +7,7 @@ from fastapi import HTTPException, Response
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
-from app.api.routes import RegraContabilInput, RegraContabilPreviaInput, accounting_csv, accounting_integrity, accounting_pdf, accounting_rules, apply_accounting_rules, create_accounting_rule, delete_accounting_rule, delete_accounting_rule_for_reconciliation, delete_all_accounting_rules, delete_zero_covered_accounting_rules, ignore_rule_in_period, preview_accounting_rule, result, restore_rule_in_period, review, rule_matches_movement, unused_documents, update_accounting_rule
+from app.api.routes import RegraContabilInput, RegraContabilPreviaInput, accounting_csv, accounting_integrity, accounting_pdf, accounting_rules, apply_accounting_rules, create_accounting_rule, delete_accounting_rule, delete_accounting_rule_for_reconciliation, delete_all_accounting_rules, delete_zero_covered_accounting_rules, ignore_rule_in_period, preview_accounting_rule, result, restore_covered_hidden_accounting_rules, restore_rule_in_period, review, rule_matches_movement, unused_documents, update_accounting_rule
 import app.api.routes as routes
 from app.core.database import Base
 from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, RegraContabil, RegraContabilExcecao
@@ -738,6 +738,33 @@ def test_clearing_zero_covered_rules_hides_only_current_period_and_keeps_global_
     assert session.get(RegraContabil, created["id"]).ativo is True
     assert session.query(RegraContabilExcecao).filter_by(regra_contabil_id=created["id"], conciliacao_id=february.id).count() == 1
     assert accounting_rules(january.id, session)["salvas"][0]["cobertos"] == 1
+
+
+def test_hidden_rule_with_new_coverage_can_be_restored_in_bulk():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    january = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    march = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 3, 1), data_fim=date(2024, 3, 31))
+    session.add_all([january, march]); session.flush()
+    january_file = Arquivo(conciliacao_id=january.id, tipo_documento="extrato", banco_selecionado=january.banco, nome_original="jan.pdf", caminho="/tmp/jan.pdf")
+    march_file = Arquivo(conciliacao_id=march.id, tipo_documento="extrato", banco_selecionado=march.banco, nome_original="mar.pdf", caminho="/tmp/mar.pdf")
+    session.add_all([january_file, march_file]); session.flush()
+    session.add(MovimentoExtrato(conciliacao_id=january.id, arquivo_id=january_file.id, pagina_numero=1, data=date(2024, 1, 5), historico="PAGAMENTO DE SEGURO", valor=Decimal("100.00"), natureza="saída"))
+    session.commit()
+    created = create_accounting_rule(january.id, rule_input("PAGAMENTO SEGURO", scope="global"), session)
+    session.add(RegraContabilExcecao(regra_contabil_id=created["id"], conciliacao_id=march.id)); session.flush()
+    session.add(MovimentoExtrato(conciliacao_id=march.id, arquivo_id=march_file.id, pagina_numero=1, data=date(2024, 3, 5), historico="Pagamento de seguro", valor=Decimal("120.00"), natureza="saída"))
+    session.commit()
+
+    response = restore_covered_hidden_accounting_rules(march.id, session)
+
+    assert response["quantidade"] == 1
+    assert session.query(RegraContabilExcecao).filter_by(regra_contabil_id=created["id"], conciliacao_id=march.id).count() == 0
+    assert response["regras"]["pendentes"] == []
+    assert response["regras"]["salvas"][0]["cobertos"] == 1
 
 
 def test_deleting_a_rule_immediately_removes_its_value_from_reason():

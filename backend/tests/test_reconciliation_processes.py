@@ -306,7 +306,7 @@ def test_pix_agendamento_caixa_matches_cef_receipt_without_operation_type():
     file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Banco do Brasil", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
     receipt_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="comprovante", banco_selecionado="Banco do Brasil", nome_original="pix.pdf", caminho="/tmp/pix.pdf")
     session.add_all([file, receipt_file]); session.flush()
-    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 4, 4), historico="13105 144 Pix - Agendamento Caixa Economica Federal", valor=Decimal("89.57"), natureza="saída")
+    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 4, 4), hora="07:00", historico="13105 144 Pix - Agendamento Caixa Economica Federal", valor=Decimal("89.57"), natureza="saída")
     receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=receipt_file.id, pagina_numero=1, data=date(2024, 4, 4), hora="07:05:26", favorecido="Cef Matriz", valor=Decimal("89.57"), valor_pago=Decimal("89.57"), tipo_operacao="")
     session.add_all([movement, receipt]); session.commit()
 
@@ -329,8 +329,31 @@ def test_pix_agendamento_matches_abbreviated_person_name():
     file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Banco do Brasil", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
     receipt_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="comprovante", banco_selecionado="Banco do Brasil", nome_original="pix.pdf", caminho="/tmp/pix.pdf")
     session.add_all([file, receipt_file]); session.flush()
-    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 4, 5), historico="13105 144 Pix - Agendamento Adrielle Colares Frazao De", valor=Decimal("100.00"), natureza="saída")
+    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 4, 5), hora="07:00", historico="13105 144 Pix - Agendamento Adrielle Colares Frazao De", valor=Decimal("100.00"), natureza="saída")
     receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=receipt_file.id, pagina_numero=1, data=date(2024, 4, 5), hora="07:05:27", favorecido="Adrielle C F Queiroz", valor=Decimal("100.00"), valor_pago=Decimal("100.00"), tipo_operacao="PIX")
+    session.add_all([movement, receipt]); session.commit()
+
+    reconcile(reconciliation.id, session)
+
+    match = session.query(Correspondencia).filter_by(movimento_extrato_id=movement.id).one()
+    assert match.comprovante_id == receipt.id
+    assert match.criterio_correspondencia == "Correspondência pelo beneficiário"
+    assert unused_documents(reconciliation.id, session)["comprovantes"] == []
+
+
+def test_pix_agendamento_caixa_matches_receipt_with_small_statement_time_difference():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 4, 1), data_fim=date(2024, 4, 30))
+    session.add(reconciliation); session.flush()
+    file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Banco do Brasil", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    receipt_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="comprovante", banco_selecionado="Banco do Brasil", nome_original="pix.pdf", caminho="/tmp/pix.pdf")
+    session.add_all([file, receipt_file]); session.flush()
+    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=5, data=date(2024, 4, 19), hora="05:32", historico="13105 144 Pix - Agendamento Caixa Economica Federal", valor=Decimal("408.80"), natureza="saída")
+    receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=receipt_file.id, pagina_numero=5, data=date(2024, 4, 19), hora="05:33:26", favorecido="Cef Matriz", valor=Decimal("408.80"), valor_pago=Decimal("408.80"), tipo_operacao="PIX")
     session.add_all([movement, receipt]); session.commit()
 
     reconcile(reconciliation.id, session)

@@ -707,7 +707,16 @@ def receipt_operation_matches(movement: MovimentoExtrato, receipt: Comprovante) 
 
 
 def receipt_time_matches(movement: MovimentoExtrato, receipt: Comprovante) -> bool:
-    return not movement.hora or not receipt.hora or movement.hora[:5] == receipt.hora[:5]
+    if not movement.hora or not receipt.hora or movement.hora[:5] == receipt.hora[:5]:
+        return True
+    if "AGENDAMENTO" not in normalize_name(movement.historico):
+        return False
+    def minutes(value: str) -> int | None:
+        match = re.match(r"^(\d{2}):(\d{2})", value or "")
+        return int(match.group(1)) * 60 + int(match.group(2)) if match else None
+    movement_minutes = minutes(movement.hora)
+    receipt_minutes = minutes(receipt.hora)
+    return movement_minutes is not None and receipt_minutes is not None and abs(movement_minutes - receipt_minutes) <= 10
 
 
 def receipt_tariff_date_matches(movement: MovimentoExtrato, receipt: Comprovante) -> bool:

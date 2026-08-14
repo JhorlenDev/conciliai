@@ -58,6 +58,83 @@ def test_receipt_blocks_are_not_mixed_and_names_match_initials():
     assert names_similar("Raquel O Jesus", "Raquel Oliveira De Jesus")
 
 
+def test_banco_do_brasil_extracts_multiple_receipts_on_same_page_without_mixing_values():
+    text = """26/05/2026    -  BANCO  DO  BRASIL  -   10:55:20
+          COMPROVANTE DE TRANSFERENCIA
+DATA DA TRANSFERENCIA                 17/04/2024
+NR. DOCUMENTO                 32.600.000.023.452
+VALOR TOTAL                             1.700,00
+******  TRANSFERIDO PARA:
+CLIENTE: MARIA LUZIRDA C MIRANDA
+================================================
+SISBB  -  SISTEMA DE INFORMACOES BANCO DO BRASIL
+                Comprovante Pix
+PAGAMENTO VIA QR CODE
+VALOR:                                    408,80
+DATA:                      19/04/2024 - 05:33:26
+PAGO PARA:  Cef Matriz
+DOCUMENTO: 041901
+================================================
+22/04/2024    -  BANCO  DO  BRASIL  -   11:48:51
+          COMPROVANTE DE TRANSFERENCIA
+DATA DA TRANSFERENCIA                 22/04/2024
+NR. DOCUMENTO                610.577.000.025.632
+VALOR TOTAL                             8.000,00
+******  TRANSFERIDO PARA:
+CLIENTE: LEANDRO BARBOSA FIGUEIRO
+"""
+
+    records = extract_receipts(text, 5)
+
+    assert [(item.data, item.tipo_operacao, item.favorecido, item.valor, item.numero_documento) for item in records] == [
+        (date(2024, 4, 17), "TRANSFERÊNCIA", "MARIA LUZIRDA C MIRANDA", Decimal("1700.00"), "32.600.000.023.452"),
+        (date(2024, 4, 19), "PIX", "Cef Matriz", Decimal("408.80"), "041901"),
+        (date(2024, 4, 22), "TRANSFERÊNCIA", "LEANDRO BARBOSA FIGUEIRO", Decimal("8000.00"), "610.577.000.025.632"),
+    ]
+
+
+def test_banco_do_brasil_extracts_two_title_payment_receipts_on_same_page():
+    text = """26/05/2026    -  BANCO  DO  BRASIL  -   10:55:20
+     COMPROVANTE DE PAGAMENTO DE TITULOS
+BENEFICIARIO:
+MUNICIPIO DE TEFE
+NR. DOCUMENTO                             43.001
+DATA DO PAGAMENTO                     30/04/2024
+VALOR DO DOCUMENTO                        508,04
+VALOR COBRADO                             508,04
+================================================
+26/05/2026    -  BANCO  DO  BRASIL  -   10:55:20
+     COMPROVANTE DE PAGAMENTO DE TITULOS
+BENEFICIARIO:
+MUNICIPIO DE TEFE
+NR. DOCUMENTO                             43.002
+DATA DO PAGAMENTO                     30/04/2024
+VALOR DO DOCUMENTO                        401,25
+VALOR COBRADO                             401,25
+"""
+
+    records = extract_receipts(text, 7)
+
+    assert [(item.numero_documento, item.valor) for item in records] == [("43.001", Decimal("508.04")), ("43.002", Decimal("401.25"))]
+
+
+def test_banco_do_brasil_extracts_automatic_debit_receipt_with_dotted_date():
+    text = """SISBB  -  SISTEMA DE INFORMACOES BANCO DO BRASIL
+        COMPROVANTE DE DEBITO AUTOMATICO
+CONVENIO: 016551       BB SEGURO CRED PROT EMPR
+DATA DO DEBITO:                       01.04.2024
+VALOR DO DEBITO R$                        136,93
+HISTORICO LANCAMENTO:  PAGAMENTO SEGURO BB
+"""
+
+    record = extract_receipts(text, 1)[0]
+
+    assert record.data == date(2024, 4, 1)
+    assert record.tipo_operacao == "DÉBITO AUTOMÁTICO"
+    assert "BB SEGURO" in record.favorecido
+    assert record.valor == Decimal("136.93")
+
+
 def test_invoice_is_not_matched_by_value_only():
     assert not invoice_is_candidate(
         Decimal("520.52"), date(2024, 1, 2), "Fornecedor A",

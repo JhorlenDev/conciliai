@@ -658,11 +658,23 @@ def in_reconciliation_period(reconciliation: Conciliacao, movement: MovimentoExt
     return bool(movement.data and reconciliation.data_inicio <= movement.data <= reconciliation.data_fim)
 
 
+def cef_alias_matches(left: str, right: str) -> bool:
+    left_normalized = normalize_name(left)
+    right_normalized = normalize_name(right)
+    left_tokens = set(left_normalized.split())
+    right_tokens = set(right_normalized.split())
+    left_is_cef = "CEF" in left_tokens or {"CAIXA", "ECONOMICA", "FEDERAL"} <= left_tokens
+    right_is_cef = "CEF" in right_tokens or {"CAIXA", "ECONOMICA", "FEDERAL"} <= right_tokens
+    return left_is_cef and right_is_cef
+
+
 def receipt_matches_movement(movement_text: str, beneficiary: str) -> bool:
     text_tokens = normalize_name(movement_text).split()
     beneficiary_tokens = normalize_name(beneficiary).split()
     if not text_tokens or not beneficiary_tokens:
         return False
+    if cef_alias_matches(movement_text, beneficiary):
+        return True
     if names_similar(movement_text, beneficiary, allow_truncated_terminal=True):
         return True
     # A statement history begins with the operation name, while the beneficiary appears later.
@@ -685,6 +697,8 @@ def receipt_match_criterion(movement_text: str, receipt: Comprovante) -> str:
 
 def receipt_operation_matches(movement: MovimentoExtrato, receipt: Comprovante) -> bool:
     history, operation = normalize_name(movement.historico), normalize_name(receipt.tipo_operacao)
+    if not operation:
+        return True
     if "PIX" in history:
         return "PIX" in operation
     if any(term in history for term in ("TRANSFERENCIA", "TED", "DOC")):

@@ -4,7 +4,7 @@ from decimal import Decimal
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.api.routes import ContaBancariaClienteInput, accounting_rules, apply_accounting_rules, client_bank_accounts, create_reconciliation_process, delete_client_bank_account, delete_reconciliation_process, reconcile, reprocess_document, result, resume_process_bank, save_client_bank_account
+from app.api.routes import ContaBancariaClienteInput, accounting_rules, apply_accounting_rules, client_bank_accounts, create_reconciliation_process, delete_client_bank_account, delete_reconciliation_process, reconcile, reprocess_document, result, resume_process_bank, save_client_bank_account, unused_documents
 from app.core.database import Base
 from app.models import Arquivo, Cliente, Comprovante, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, ProcessoConciliacao, RegraContabil, RegraContabilExcecao
 from app.services.normalization import normalize_name
@@ -293,6 +293,75 @@ def test_transfer_without_counterparty_matches_unique_receipt_by_date_value_and_
     match = session.query(Correspondencia).filter_by(movimento_extrato_id=movement.id).one()
     assert match.comprovante_id == receipt.id
     assert match.criterio_correspondencia == "Correspondência pelo data, valor e tipo transferência"
+
+
+def test_pix_agendamento_caixa_matches_cef_receipt_without_operation_type():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 4, 1), data_fim=date(2024, 4, 30))
+    session.add(reconciliation); session.flush()
+    file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Banco do Brasil", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    receipt_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="comprovante", banco_selecionado="Banco do Brasil", nome_original="pix.pdf", caminho="/tmp/pix.pdf")
+    session.add_all([file, receipt_file]); session.flush()
+    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 4, 4), historico="13105 144 Pix - Agendamento Caixa Economica Federal", valor=Decimal("89.57"), natureza="saída")
+    receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=receipt_file.id, pagina_numero=1, data=date(2024, 4, 4), hora="07:05:26", favorecido="Cef Matriz", valor=Decimal("89.57"), valor_pago=Decimal("89.57"), tipo_operacao="")
+    session.add_all([movement, receipt]); session.commit()
+
+    reconcile(reconciliation.id, session)
+
+    match = session.query(Correspondencia).filter_by(movimento_extrato_id=movement.id).one()
+    assert match.comprovante_id == receipt.id
+    assert match.criterio_correspondencia == "Correspondência pelo beneficiário"
+    assert unused_documents(reconciliation.id, session)["comprovantes"] == []
+
+
+def test_pix_agendamento_matches_abbreviated_person_name():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 4, 1), data_fim=date(2024, 4, 30))
+    session.add(reconciliation); session.flush()
+    file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Banco do Brasil", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    receipt_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="comprovante", banco_selecionado="Banco do Brasil", nome_original="pix.pdf", caminho="/tmp/pix.pdf")
+    session.add_all([file, receipt_file]); session.flush()
+    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 4, 5), historico="13105 144 Pix - Agendamento Adrielle Colares Frazao De", valor=Decimal("100.00"), natureza="saída")
+    receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=receipt_file.id, pagina_numero=1, data=date(2024, 4, 5), hora="07:05:27", favorecido="Adrielle C F Queiroz", valor=Decimal("100.00"), valor_pago=Decimal("100.00"), tipo_operacao="PIX")
+    session.add_all([movement, receipt]); session.commit()
+
+    reconcile(reconciliation.id, session)
+
+    match = session.query(Correspondencia).filter_by(movimento_extrato_id=movement.id).one()
+    assert match.comprovante_id == receipt.id
+    assert match.criterio_correspondencia == "Correspondência pelo beneficiário"
+    assert unused_documents(reconciliation.id, session)["comprovantes"] == []
+
+
+def test_ted_caixa_matches_cef_receipt_with_document_number():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 4, 1), data_fim=date(2024, 4, 30))
+    session.add(reconciliation); session.flush()
+    file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Banco do Brasil", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    receipt_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="comprovante", banco_selecionado="Banco do Brasil", nome_original="ted.pdf", caminho="/tmp/ted.pdf")
+    session.add_all([file, receipt_file]); session.flush()
+    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 4, 19), historico="13105 438 TED Caixa Economica Federal", valor=Decimal("8000.00"), natureza="saída")
+    receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=receipt_file.id, pagina_numero=5, data=date(2024, 4, 19), hora="05:33:26", favorecido="610.577.000.025.632", beneficiario="Cef Matriz", numero_documento="610.577.000.025.632", valor=Decimal("8000.00"), valor_pago=Decimal("8000.00"), tipo_operacao="TED")
+    session.add_all([movement, receipt]); session.commit()
+
+    reconcile(reconciliation.id, session)
+
+    match = session.query(Correspondencia).filter_by(movimento_extrato_id=movement.id).one()
+    assert match.comprovante_id == receipt.id
+    assert match.criterio_correspondencia == "Correspondência pelo beneficiário"
+    assert unused_documents(reconciliation.id, session)["comprovantes"] == []
 
 
 def test_ted_matches_abbreviated_and_truncated_counterparty_name():

@@ -9,7 +9,7 @@ from app.services.normalization import normalize_name
 
 logger = logging.getLogger(__name__)
 
-DATE_RE = r"(\d{2}/\d{2}/\d{4})"
+DATE_RE = r"(\d{2}[/.]\d{2}[/.]\d{4})"
 TIME_RE = r"(\d{2}:\d{2}(?::\d{2})?)"
 NAME_LABELS = ("BENEFICIÁRIO", "BENEFICIARIO", "FAVORECIDO", "PAGO PARA", "BENEFICIÁRIO FINAL", "BENEFICIARIO FINAL", "CONVÊNIO", "CONVENIO")
 PT_MONTHS = {
@@ -104,7 +104,7 @@ def parse_brl(value: str) -> Decimal | None:
 def parse_date_time(value: str) -> tuple[date | None, str | None]:
     date_match = re.search(DATE_RE, value)
     time_match = re.search(TIME_RE, value)
-    parsed_date = date(*map(int, reversed(date_match.group(1).split("/")))) if date_match else None
+    parsed_date = date(*map(int, reversed(re.split(r"[/.]", date_match.group(1))))) if date_match else None
     return parsed_date, time_match.group(1) if time_match else None
 
 
@@ -137,7 +137,7 @@ def extract_financial_values(text: str) -> FinancialValues:
         valor_multa=amount_for("MULTA/MORA", "MULTA"),
         valor_encargos=amount_for("ENCARGOS"),
         valor_tarifa=amount_for("TARIFA"),
-        valor_pago=amount_for("VALOR COBRADO", "VALOR PAGO", "VALOR RECEBIDO", "VALOR TRANSFERIDO", "VALOR DA TRANSFERENCIA", "VALOR DA TRANSFERÊNCIA", "VALOR TOTAL", "VALOR"),
+        valor_pago=amount_for("VALOR COBRADO", "VALOR PAGO", "VALOR RECEBIDO", "VALOR TRANSFERIDO", "VALOR DA TRANSFERENCIA", "VALOR DA TRANSFERÊNCIA", "VALOR TOTAL", "VALOR DO DEBITO", "VALOR DO DÉBITO", "VALOR"),
     )
     if values.valor_original is None:
         values.valor_original = values.valor_pago
@@ -237,6 +237,37 @@ def receipt_document_number(text: str) -> str:
 
 
 def extract_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
+    page_blocks = split_banco_do_brasil_receipt_blocks(text)
+    if len(page_blocks) > 1:
+        results = []
+        for block in page_blocks:
+            results.extend(extract_receipt_block(block, page_number))
+        return results
+    return extract_receipt_block(text, page_number)
+
+
+def split_banco_do_brasil_receipt_blocks(text: str) -> list[str]:
+    pattern = r"(?m)^(?=(?:SISBB\s+-\s+SISTEMA|(?:\d{2}[/.]\d{2}[/.]\d{4})\s+-\s+BANCO\s+DO\s+BRASIL\b))"
+    blocks = [block.strip() for block in re.split(pattern, text) if block.strip()]
+    return blocks if len(blocks) > 1 else [text]
+
+
+def receipt_operation_from_text(text: str) -> str:
+    normalized = normalize_name(text)
+    if "PIX" in normalized or "QR CODE" in normalized:
+        return "PIX"
+    if "TED" in normalized:
+        return "TED"
+    if "TRANSFERENCIA" in normalized:
+        return "TRANSFERÊNCIA"
+    if "DEBITO AUTOMATICO" in normalized:
+        return "DÉBITO AUTOMÁTICO"
+    if "RECEB" in normalized:
+        return "RECEBIMENTO"
+    return "PAGAMENTO"
+
+
+def extract_receipt_block(text: str, page_number: int) -> list[ParsedReceipt]:
     """A record is emitted only from a self-contained block with required labels."""
     blocks = re.split(r"(?=^\s*VALOR\s*:)", text, flags=re.I | re.M)
     results = []
@@ -252,7 +283,9 @@ def extract_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
         amount = financial.valor_pago
         if not parsed_date or amount is None or not name:
             continue
-        operation = "PIX" if re.search(r"\bPIX\b", block, re.I) else "TED" if re.search(r"\bTED|TRANSFER[ÊE]NCIA\b", block, re.I) else ""
+        operation = receipt_operation_from_text(block)
+        if operation == "PAGAMENTO":
+            operation = receipt_operation_from_text(text)
         participants = receipt_participants(block); results.append(ParsedReceipt(parsed_date, parsed_time, name, amount, operation, block.strip(), page_number, name_info[1], financial, participants.get("beneficiario", name), participants.get("nome_fantasia", ""), participants.get("beneficiario_final", ""), participants.get("pagador", ""), participants.get("cnpj_beneficiario", ""), participants.get("cnpj_beneficiario_final", ""), receipt_document_number(block)))
     if results:
         return results
@@ -262,20 +295,20 @@ def extract_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
         return banco_do_brasil
 
     # Payment receipts use a distinct layout, usually with one receipt per PDF page.
-    value_match = receipt_label_value(text, "VALOR DO DOCUMENTO", "VALOR COBRADO", "VALOR PAGO", "VALOR TOTAL", "VALOR RECEBIDO", "VALOR TRANSFERIDO", "VALOR DA TRANSFERÊNCIA", "VALOR DA TRANSFERENCIA", "VALOR", value_prefix=r"(?:R?\$?\s*[\d.,-])")
+    value_match = receipt_label_value(text, "VALOR DO DOCUMENTO", "VALOR COBRADO", "VALOR PAGO", "VALOR TOTAL", "VALOR RECEBIDO", "VALOR TRANSFERIDO", "VALOR DA TRANSFERÊNCIA", "VALOR DA TRANSFERENCIA", "VALOR DO DEBITO", "VALOR DO DÉBITO", "VALOR", value_prefix=r"(?:R?\$?\s*[\d.,-])")
     name_info = find_receipt_name_with_origin(text)
     name = name_info[0] if name_info else None
     if not name:
         name = receipt_label_value(text, "RECEBIDO DE", "RECEBIMENTO DE")
         name_info = (name, "RECEBIDO DE") if name else None
-    date_value = receipt_label_value(text, "DATA DO PAGAMENTO", "DATA PAGAMENTO", "DATA", "DATA DO RECEBIMENTO", "DEBITO EM", "DÉBITO EM", value_prefix=r"\d")
+    date_value = receipt_label_value(text, "DATA DO PAGAMENTO", "DATA PAGAMENTO", "DATA DO DEBITO", "DATA DO DÉBITO", "DATA", "DATA DO RECEBIMENTO", "DEBITO EM", "DÉBITO EM", value_prefix=r"\d")
     date_match = re.search(DATE_RE, date_value or "")
     if value_match and name and date_match:
         parsed_date, parsed_time = parse_date_time(date_value or "")
         financial = extract_financial_values(text)
         amount = financial.valor_pago
         if parsed_date and amount is not None and name and name.upper() not in {"PIX", "TED", "DOCUMENTO"}:
-            operation = "PIX" if re.search(r"\bPIX\b", text, re.I) else "TED" if re.search(r"\bTED|TRANSFER[ÊE]NCIA\b", text, re.I) else "RECEBIMENTO" if re.search(r"RECEB", text, re.I) else "PAGAMENTO"
+            operation = receipt_operation_from_text(text)
             participants = receipt_participants(text); return [ParsedReceipt(parsed_date, parsed_time, name, amount, operation, text.strip(), page_number, name_info[1], financial, participants.get("beneficiario", name), participants.get("nome_fantasia", ""), participants.get("beneficiario_final", ""), participants.get("pagador", ""), participants.get("cnpj_beneficiario", ""), participants.get("cnpj_beneficiario_final", ""), receipt_document_number(text))]
     return results
 
@@ -284,14 +317,19 @@ def _extract_banco_do_brasil_receipt(text: str, page_number: int) -> list[Parsed
     """Handles BB payment and account-transfer receipts with values on following lines."""
     participants = receipt_participants(text)
     payment_name = participants.get("beneficiario") or participants.get("beneficiario_final") or participants.get("nome_fantasia")
-    payment_date = receipt_label_value(text, "DATA DO PAGAMENTO", "DATA PAGAMENTO", "PAGAMENTO EFETUADO EM", value_prefix=r"\d")
-    payment_value = receipt_label_value(text, "VALOR DO DOCUMENTO", "VALOR COBRADO", "VALOR PAGO", "VALOR TOTAL", "VALOR RECEBIDO", value_prefix=r"(?:R?\$?\s*[\d.,-])")
+    payment_origin = "BENEFICIARIO"
+    if not payment_name:
+        name_info = find_receipt_name_with_origin(text)
+        payment_name = name_info[0] if name_info else None
+        payment_origin = name_info[1] if name_info else payment_origin
+    payment_date = receipt_label_value(text, "DATA DO PAGAMENTO", "DATA PAGAMENTO", "DATA DO DEBITO", "DATA DO DÉBITO", "PAGAMENTO EFETUADO EM", value_prefix=r"\d")
+    payment_value = receipt_label_value(text, "VALOR DO DOCUMENTO", "VALOR COBRADO", "VALOR PAGO", "VALOR TOTAL", "VALOR RECEBIDO", "VALOR DO DEBITO", "VALOR DO DÉBITO", value_prefix=r"(?:R?\$?\s*[\d.,-])")
     if payment_name and payment_date and payment_value:
         parsed_date, _ = parse_date_time(payment_date)
         financial = extract_financial_values(text)
         amount = financial.valor_pago
         if parsed_date and amount is not None:
-            return [ParsedReceipt(parsed_date, None, payment_name, amount, "PAGAMENTO", text.strip(), page_number, "BENEFICIARIO", financial, participants.get("beneficiario", payment_name), participants.get("nome_fantasia", ""), participants.get("beneficiario_final", ""), participants.get("pagador", ""), participants.get("cnpj_beneficiario", ""), participants.get("cnpj_beneficiario_final", ""), receipt_document_number(text))]
+            return [ParsedReceipt(parsed_date, None, payment_name, amount, receipt_operation_from_text(text), text.strip(), page_number, payment_origin, financial, participants.get("beneficiario", payment_name), participants.get("nome_fantasia", ""), participants.get("beneficiario_final", ""), participants.get("pagador", ""), participants.get("cnpj_beneficiario", ""), participants.get("cnpj_beneficiario_final", ""), receipt_document_number(text))]
 
     transfer_name = re.search(r"TRANSFERIDO PARA\s*:\s*(?:\n|\s)+(?:CLIENTE|NOME|FAVORECIDO)\s*:?\s*([^\n]+)", text, re.I)
     transfer_date = receipt_label_value(text, "DATA DA TRANSFERÊNCIA", "DATA DA TRANSFERENCIA", "DATA TRANSFERÊNCIA", "DATA TRANSFERENCIA", "DATA", value_prefix=r"\d")

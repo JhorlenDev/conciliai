@@ -12,8 +12,6 @@ const banks = [
   "Bradesco",
   "Caixa",
   "Conta Caixa",
-  "Vendas com Cartão",
-  "Comissões Getnet",
   "Apropriações",
   "Empréstimos/Financeiro",
 ];
@@ -24,8 +22,6 @@ const bankLogos: Record<string, string> = {
   Bradesco: "/bancos/bradesco.png",
   Caixa: "/bancos/caixa.png",
   "Conta Caixa": "/bancos/conta-caixa.svg",
-  "Vendas com Cartão": "/bancos/cartao.png",
-  "Comissões Getnet": "/bancos/getnet.png",
   Apropriações: "/bancos/apropriacoes.png",
   "Empréstimos/Financeiro": "/bancos/emprestimos.svg",
 };

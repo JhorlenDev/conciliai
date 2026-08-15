@@ -4,11 +4,29 @@ from decimal import Decimal
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.api.routes import ContaBancariaClienteInput, accounting_rules, apply_accounting_rules, client_bank_accounts, create_reconciliation_process, delete_client_bank_account, delete_reconciliation_process, reconcile, reprocess_document, result, resume_process_bank, save_client_bank_account, unused_documents
+from app.api.routes import ContaBancariaClienteInput, accounting_rules, apply_accounting_rules, banks, client_bank_accounts, create_reconciliation_process, delete_client_bank_account, delete_reconciliation_process, reconcile, reprocess_document, result, resume_process_bank, save_client_bank_account, unused_documents
 from app.core.database import Base
 from app.models import Arquivo, Cliente, Comprovante, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, ProcessoConciliacao, RegraContabil, RegraContabilExcecao
 from app.services.normalization import normalize_name
 from app.api.routes import ProcessoBancoInput, ProcessoConciliacaoInput
+
+
+def test_getnet_is_hidden_from_new_bank_list_but_legacy_processes_still_work():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.commit()
+
+    assert "Santander" in banks()
+    assert "Vendas com Cartão" not in banks()
+    assert "Comissões Getnet" not in banks()
+
+    process = create_reconciliation_process(ProcessoConciliacaoInput(cliente_id=client.id, data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31)), session)
+    legacy = resume_process_bank(process["id"], ProcessoBancoInput(banco="Comissões Getnet"), session)
+
+    assert legacy["banco"] == "Comissões Getnet"
+    assert legacy["processo_id"] == process["id"]
 
 
 def test_process_resumes_the_same_bank_and_exposes_shared_rule_source():

@@ -237,6 +237,12 @@ def receipt_document_number(text: str) -> str:
 
 
 def extract_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
+    getnet_sales = _extract_getnet_sales_receipts(text, page_number)
+    if getnet_sales:
+        return getnet_sales
+    santander = _extract_santander_receipts(text, page_number)
+    if santander:
+        return santander
     page_blocks = split_banco_do_brasil_receipt_blocks(text)
     if len(page_blocks) > 1:
         results = []
@@ -265,6 +271,353 @@ def receipt_operation_from_text(text: str) -> str:
     if "RECEB" in normalized:
         return "RECEBIMENTO"
     return "PAGAMENTO"
+
+
+GETNET_CARD_RE = re.compile(r"^(?:MASTERCARD|VISA|ELO|AMEX|HIPERCARD)(?:\s+\S+)*\s+(?:CR[ÉE]DITO|CREDITO|D[ÉE]BITO|DEBITO)$", re.I)
+
+
+def _extract_getnet_sales_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
+    normalized = normalize_name(text)
+    inline_records = _extract_getnet_inline_sales_receipts(text, page_number)
+    if inline_records:
+        return inline_records
+    if "O QUE VENDI" not in normalized or "CONSOLIDADO POR DATA" not in normalized:
+        return []
+
+    lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
+    results: list[ParsedReceipt] = []
+    index = 0
+    while index < len(lines):
+        card = lines[index]
+        if not GETNET_CARD_RE.fullmatch(card):
+            index += 1
+            continue
+        row = lines[index:index + 7]
+        if len(row) < 7:
+            break
+        parsed_date, _ = parse_date_time(row[1])
+        gross = parse_brl(row[3])
+        net = parse_brl(row[4])
+        fee = parse_brl(row[5])
+        quantity = row[6]
+        if (
+            not parsed_date
+            or gross is None
+            or net is None
+            or fee is None
+            or not re.fullmatch(r"\d+", quantity)
+        ):
+            index += 1
+            continue
+        if gross == Decimal("0.00") and net == Decimal("0.00") and fee == Decimal("0.00"):
+            index += 7
+            continue
+        results.append(_getnet_sales_receipt(parsed_date, card, row[2], gross, abs(fee), net, quantity, "\n".join(row), page_number))
+        index += 7
+    return results
+
+
+def _extract_getnet_inline_sales_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
+    amount = r"R\$\s*\d{1,3}(?:\.\d{3})*,\d{2}"
+    card = r"(?:MASTERCARD|VISA|ELO|AMEX|HIPERCARD)(?:\s+\S+)*?\s+(?:CR[ÉE]DITO|CREDITO|D[ÉE]BITO|DEBITO)"
+    pattern = re.compile(
+        rf"^\s*(?P<establishment>\d{{6,}})\s+"
+        rf"(?P<card>{card})\s+"
+        rf"(?P<date>\d{{2}}/\d{{2}}/\d{{4}})\s+"
+        rf"(?P<quantity>\d+)\s+"
+        rf"(?P<gross>{amount})\s+"
+        rf"(?P<fee>-?\s*{amount})\s+"
+        rf"(?P<net>{amount})\s*$",
+        re.I | re.M,
+    )
+    results: list[ParsedReceipt] = []
+    for match in pattern.finditer(text):
+        parsed_date, _ = parse_date_time(match.group("date"))
+        gross = parse_brl(match.group("gross"))
+        fee = parse_brl(match.group("fee"))
+        net = parse_brl(match.group("net"))
+        if not parsed_date or gross is None or fee is None or net is None:
+            continue
+        if gross == Decimal("0.00") and net == Decimal("0.00") and fee == Decimal("0.00"):
+            continue
+        results.append(_getnet_sales_receipt(
+            parsed_date,
+            " ".join(match.group("card").split()),
+            match.group("establishment"),
+            gross,
+            abs(fee),
+            net,
+            match.group("quantity"),
+            match.group(0).strip(),
+            page_number,
+        ))
+    return results
+
+
+def _getnet_sales_receipt(parsed_date: date, card: str, establishment: str, gross: Decimal, fee: Decimal, net: Decimal, quantity: str, raw_text: str, page_number: int) -> ParsedReceipt:
+    details = {
+        "cartao": card,
+        "estabelecimento": establishment,
+        "quantidade_vendas": quantity,
+        "valor_original": str(gross),
+        "valor_tarifa": str(fee),
+        "valor_pago": str(net),
+    }
+    financial = FinancialValues(
+        valor_original=gross,
+        valor_tarifa=fee,
+        valor_pago=net,
+        detalhes=details,
+        composicao_divergente=abs(gross - fee - net) > Decimal("0.01"),
+    )
+    return ParsedReceipt(
+        data=parsed_date,
+        hora=None,
+        favorecido=f"GETNET - {card}",
+        valor=net,
+        tipo_operacao="GETNET VENDAS",
+        texto_original=raw_text,
+        pagina_numero=page_number,
+        origem_nome="GETNET VENDAS",
+        financeiros=financial,
+        beneficiario=f"GETNET - {card}",
+        numero_documento=establishment,
+    )
+
+
+def _date_from_day_month(value: str, period: tuple[int, int] | None) -> date | None:
+    match = re.fullmatch(r"(\d{2})/(\d{2})", value.strip())
+    if not match or not period:
+        return None
+    return date(period[1], int(match.group(2)), int(match.group(1)))
+
+
+def _text_section_lines(text: str, start: str, *ends: str) -> list[str]:
+    match = re.search(re.escape(start), text, re.I)
+    if not match:
+        return []
+    section = text[match.end():]
+    end_positions = [found.start() for end in ends if (found := re.search(re.escape(end), section, re.I))]
+    if end_positions:
+        section = section[: min(end_positions)]
+    return [" ".join(line.split()) for line in section.splitlines() if line.strip()]
+
+
+def _santander_receipt_financial(amount: Decimal) -> FinancialValues:
+    return FinancialValues(valor_original=amount, valor_pago=amount, detalhes={"valor_original": str(amount), "valor_pago": str(amount)})
+
+
+def _santander_receipt(data: date, favorecido: str, amount: Decimal, operation: str, text: str, page_number: int, origin: str, document: str = "", hora: str | None = None) -> ParsedReceipt:
+    financial = _santander_receipt_financial(amount)
+    name = " ".join(favorecido.split())
+    return ParsedReceipt(data, hora, name, amount, operation, text.strip(), page_number, origin, financial, name, numero_documento=document)
+
+
+def _extract_santander_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
+    internet_banking = _extract_santander_internet_banking_receipt(text, page_number)
+    if internet_banking:
+        return internet_banking
+    normalized = normalize_name(text)
+    if not any(marker in normalized for marker in ("DEBITO AUTOMATICO EM CONTA CORRENTE", "COMPROVANTES PAGAMENTO", "TRANSFERENCIAS ENTRE CONTAS DOCS TEDS PIXS ENVIADOS")):
+        return []
+    period = _santander_statement_period(text)
+    records = []
+    records.extend(_extract_santander_automatic_debit_receipts(text, page_number, period))
+    records.extend(_extract_santander_consumption_receipts(text, page_number, period))
+    records.extend(_extract_santander_transfer_receipts(text, page_number, period))
+    return records
+
+
+def _line_value_after(lines: list[str], label: str) -> str:
+    wanted = normalize_name(label)
+    for index, line in enumerate(lines):
+        normalized = normalize_name(line.replace(":", " "))
+        if normalized == wanted and index + 1 < len(lines):
+            return lines[index + 1].strip()
+        if normalized.startswith(wanted + " "):
+            return line.split(":", 1)[1].strip() if ":" in line else line[len(label):].strip()
+    return ""
+
+
+def _santander_beneficiary_section_lines(lines: list[str]) -> list[str]:
+    start = -1
+    for index, line in enumerate(lines):
+        normalized = normalize_name(line)
+        if "DADOS" in normalized and "ORIGINAL" in normalized and "PAGADOR" not in normalized:
+            start = index + 1
+            break
+    if start < 0:
+        return []
+    end = len(lines)
+    for index in range(start, len(lines)):
+        normalized = normalize_name(lines[index])
+        if ("DADOS" in normalized and "PAGADOR" in normalized) or normalized == "DADOS PAGAMENTO":
+            end = index
+            break
+    return lines[start:end]
+
+
+def _collect_multiline_label_value(lines: list[str], label: str, stop_labels: set[str]) -> str:
+    wanted = normalize_name(label)
+    for index, line in enumerate(lines):
+        normalized = normalize_name(line.replace(":", " "))
+        if normalized != wanted and not normalized.startswith(wanted + " "):
+            continue
+        values = []
+        if ":" in line and line.split(":", 1)[1].strip():
+            values.append(line.split(":", 1)[1].strip())
+        cursor = index + 1
+        while cursor < len(lines):
+            current = lines[cursor].strip()
+            current_normalized = normalize_name(current.replace(":", " "))
+            if current_normalized in stop_labels or current_normalized.startswith("DADOS "):
+                break
+            values.append(current)
+            cursor += 1
+        return " ".join(values).strip()
+    return ""
+
+
+def _first_cnpj(lines: list[str]) -> str:
+    match = re.search(r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b", "\n".join(lines))
+    return match.group(0) if match else ""
+
+
+def _extract_santander_internet_banking_receipt(text: str, page_number: int) -> list[ParsedReceipt]:
+    normalized = normalize_name(text)
+    if not ("INTERNET BANKING EMPRESARIAL" in normalized and "DADOS PAGAMENTO" in normalized and "VALOR TOTAL PAGO" in normalized):
+        return []
+    lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
+    beneficiary_lines = _santander_beneficiary_section_lines(lines)
+    stop_labels = {"CNPJ", "NOME FANTASIA", "DADOS PAGADOR ORIGINAL", "DADOS PAGADOR EFETIVO", "DADOS PAGAMENTO"}
+    name = _collect_multiline_label_value(beneficiary_lines, "Razão Social", stop_labels)
+    if not name:
+        name = _collect_multiline_label_value(beneficiary_lines, "Nome Fantasia", stop_labels)
+    paid_date, paid_time = parse_date_time(_line_value_after(lines, "Data da Transação"))
+    paid_amount = parse_brl(_line_value_after(lines, "Valor total pago"))
+    if not name or not paid_date or paid_amount is None:
+        return []
+    original_amount = parse_brl(_line_value_after(lines, "Valor Nominal"))
+    charges = parse_brl(_line_value_after(lines, "Encargos"))
+    document = _line_value_after(lines, "Número de Autenticação da Instituição Financeira Favorecida") or _line_value_after(lines, "Nosso Número")
+    financial = FinancialValues(
+        valor_original=original_amount or paid_amount,
+        valor_encargos=charges,
+        valor_pago=paid_amount,
+        detalhes={"valor_pago": str(paid_amount)},
+    )
+    if financial.valor_original is not None:
+        financial.detalhes["valor_original"] = str(financial.valor_original)
+    if charges is not None:
+        financial.detalhes["valor_encargos"] = str(charges)
+    if financial.valor_original is not None and charges is not None:
+        financial.composicao_divergente = abs(financial.valor_original + charges - paid_amount) > Decimal("0.01")
+    cnpj = _first_cnpj(beneficiary_lines)
+    return [ParsedReceipt(paid_date, paid_time, name, paid_amount, "PAGAMENTO", text.strip(), page_number, "SANTANDER RAZÃO SOCIAL", financial, name, cnpj_beneficiario=cnpj, numero_documento=document)]
+
+
+def _extract_santander_automatic_debit_receipts(text: str, page_number: int, period: tuple[int, int] | None) -> list[ParsedReceipt]:
+    lines = _text_section_lines(text, "Débito Automático em Conta Corrente", "Comprovantes de Pagamento", "Transferências entre Contas", "Créditos Contratados")
+    results = []
+    index = 0
+    while index < len(lines):
+        paid_date = _date_from_day_month(lines[index], period)
+        if not paid_date:
+            index += 1
+            continue
+        row = []
+        index += 1
+        while index < len(lines) and not re.fullmatch(r"\d{2}/\d{2}", lines[index]):
+            row.append(lines[index])
+            index += 1
+        value_index = next((i for i, line in enumerate(row) if _santander_parse_movement_value(line) is not None), -1)
+        if value_index <= 0:
+            continue
+        amount = _santander_parse_movement_value(row[value_index])
+        if amount is None:
+            continue
+        document = next((line for line in row[:value_index] if re.fullmatch(r"\d{4,}", line)), "")
+        document_index = row.index(document) if document else value_index
+        description = " ".join(line for line in row[:document_index] if not _santander_is_receipt_header_line(line))
+        if description:
+            results.append(_santander_receipt(paid_date, description, amount, "DÉBITO AUTOMÁTICO", "\n".join([paid_date.strftime("%d/%m"), *row]), page_number, "SANTANDER DÉBITO AUTOMÁTICO", document))
+    return results
+
+
+def _extract_santander_consumption_receipts(text: str, page_number: int, period: tuple[int, int] | None) -> list[ParsedReceipt]:
+    lines = _text_section_lines(text, "Contas de Consumo", "Transferências entre Contas", "Créditos Contratados")
+    results = []
+    index = 0
+    while index < len(lines):
+        paid_date = _date_from_day_month(lines[index], period)
+        if not paid_date:
+            index += 1
+            continue
+        row = []
+        index += 1
+        while index < len(lines) and not re.fullmatch(r"\d{2}/\d{2}", lines[index]):
+            row.append(lines[index])
+            index += 1
+        value_index = next((i for i, line in enumerate(row) if _santander_parse_movement_value(line) is not None), -1)
+        if value_index < 0:
+            continue
+        amount = _santander_parse_movement_value(row[value_index])
+        if amount is None:
+            continue
+        before_value = [line for line in row[:value_index] if not _santander_is_receipt_header_line(line)]
+        while before_value and normalize_name(before_value[0]) in {"INTERNET", "BANKING", "INTERNET BANKING"}:
+            before_value.pop(0)
+        if before_value and before_value[-1] == "-":
+            before_value.pop()
+        name = " ".join(before_value)
+        document = next((line for line in reversed(row[value_index + 1:]) if re.fullmatch(r"[\d-]{12,}", line)), "")
+        if name:
+            results.append(_santander_receipt(paid_date, name, amount, "PAGAMENTO", "\n".join([paid_date.strftime("%d/%m"), *row]), page_number, "SANTANDER CONTAS DE CONSUMO", document))
+    return results
+
+
+def _extract_santander_transfer_receipts(text: str, page_number: int, period: tuple[int, int] | None) -> list[ParsedReceipt]:
+    lines = _text_section_lines(text, "Transferências entre Contas, DOCs, TEDs e PIXs Enviados", "Não estão contempladas", "*Identificador", "Créditos Contratados")
+    results = []
+    row = []
+
+    def flush() -> None:
+        nonlocal row
+        if not row:
+            return
+        joined = " ".join(row)
+        match = re.search(
+            r"^(?P<date>\d{2}/\d{2})(?:\s+INTERNET(?:\s+BANKING)?|\s+BANKING)*\s+(?P<op>TRANSF\.?\s+CONTAS|TED|DOC|PIX)\s+(?P<name>.+?)\s+(?P<bank>\d{4})\s+(?P<agency>\d{4})\s+(?P<account>\d{6,})\s+(?P<value>\d{1,3}(?:\.\d{3})*,\d{2})$",
+            joined,
+            re.I,
+        )
+        if match:
+            paid_date = _date_from_day_month(match.group("date"), period)
+            amount = _santander_parse_movement_value(match.group("value"))
+            if paid_date and amount is not None:
+                raw_operation = normalize_name(match.group("op"))
+                operation = "TED" if raw_operation == "TED" else "PIX" if raw_operation == "PIX" else "TRANSFERÊNCIA"
+                document = f"{match.group('bank')} {match.group('agency')} {match.group('account')}"
+                results.append(_santander_receipt(paid_date, match.group("name"), amount, operation, "\n".join(row), page_number, f"SANTANDER {operation}", document))
+        row = []
+
+    for line in lines:
+        if _santander_is_receipt_header_line(line):
+            continue
+        if re.match(r"^\d{2}/\d{2}\b", line):
+            flush()
+        row.append(line)
+    flush()
+    return results
+
+
+def _santander_is_receipt_header_line(line: str) -> bool:
+    return normalize_name(line) in {
+        "DATA", "DESCRICAO", "N IDENTIFICACAO", "VALOR R", "REALIZADO", "MOTIVO",
+        "LIMITE PARA", "DEBITO R", "DATA PAGAMENTO CANAL", "NOME EMPRESA",
+        "DATA VENCIMENTO", "VALOR", "R", "CODIGO BARRAS", "AUTENTICACAO BANCARIA",
+        "DATA CANAL", "TIPO", "FAVORECIDO", "BANCO AGENCIA", "CONTA",
+    }
 
 
 def extract_receipt_block(text: str, page_number: int) -> list[ParsedReceipt]:
@@ -352,6 +705,10 @@ def extract_statement(text: str, page_number: int, bank: str = "") -> list[Parse
         santander_records = _extract_santander_statement(text, page_number)
         if santander_records:
             return santander_records
+    if bank == "BASA":
+        basa_records = _extract_basa_statement(text, page_number)
+        if basa_records:
+            return basa_records
 
     results = []
     for line in text.splitlines():
@@ -409,6 +766,50 @@ def extract_santander_pdfplumber_statement(path: str | Path) -> PdfStatementExtr
     records = extract_santander_words_statement(pages_words, pages_text)
     _validate_santander_expected_statement(records, pages_text)
     return PdfStatementExtraction(pages_text, records)
+
+
+def extract_basa_pdfplumber_pages(path: str | Path) -> list[str]:
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.warning("pdfplumber não instalado; usando PyMuPDF para extrato BASA")
+        return []
+
+    try:
+        with pdfplumber.open(path) as document:
+            pages = [
+                page.extract_text(x_tolerance=1, y_tolerance=3, layout=True) or ""
+                for page in document.pages
+            ]
+    except Exception as error:
+        logger.warning("Falha ao ler BASA com pdfplumber: %s", error)
+        return []
+
+    if any("VALOR LANCTO" in page and "D/C" in page for page in pages):
+        return pages
+    return []
+
+
+def extract_getnet_pdfplumber_pages(path: str | Path) -> list[str]:
+    try:
+        import pdfplumber
+    except ImportError:
+        logger.warning("pdfplumber não instalado; usando PyMuPDF para relatório Getnet")
+        return []
+
+    try:
+        with pdfplumber.open(path) as document:
+            pages = [
+                page.extract_text(x_tolerance=1, y_tolerance=3, layout=True) or ""
+                for page in document.pages
+            ]
+    except Exception as error:
+        logger.warning("Falha ao ler Getnet com pdfplumber: %s", error)
+        return []
+
+    if any("O que vendi" in page or _extract_getnet_inline_sales_receipts(page, index) for index, page in enumerate(pages, 1)):
+        return pages
+    return []
 
 
 def extract_santander_words_statement(
@@ -686,6 +1087,12 @@ def _dedupe_santander_description(history: str) -> str:
         if deduped and normalize_name(deduped[-1]) == normalize_name(part):
             continue
         deduped.append(part)
+    for size in range(len(deduped) // 2, 1, -1):
+        previous = deduped[-2 * size : -size]
+        repeated = deduped[-size:]
+        if normalize_name(" ".join(previous)) == normalize_name(" ".join(repeated)):
+            deduped = deduped[:-size]
+            break
     return " ".join(deduped)
 
 
@@ -1135,7 +1542,55 @@ def _santander_statement_name(history: str) -> str:
         history,
         flags=re.I,
     )
-    return " ".join(cleaned.split())
+    name = " ".join(cleaned.split())
+    name_tokens = set(normalize_name(name).split())
+    history_tokens = set(normalize_name(history).split())
+    return "" if name_tokens and name_tokens <= history_tokens else name
+
+
+def _extract_basa_statement(text: str, page_number: int) -> list[ParsedStatement]:
+    if "VALOR LANCTO" not in text or "D/C" not in text:
+        return []
+
+    amount_pattern = r"-?\d{1,3}(?:\.\d{3})*,\d{2}-?"
+    row_pattern = re.compile(
+        rf"^\s*(?P<data>\d{{2}}/\d{{2}}/\d{{4}})\s+"
+        rf"(?P<documento>\d+)\s+"
+        rf"(?P<historico>.+?)\s+"
+        rf"(?P<valor>{amount_pattern})\s+"
+        rf"(?P<natureza>[CD])\s+"
+        rf"(?P<saldo>{amount_pattern})\s*$",
+        re.M,
+    )
+    results: list[ParsedStatement] = []
+    for match in row_pattern.finditer(text):
+        parsed_date, _ = parse_date_time(match.group("data"))
+        amount = parse_brl(match.group("valor"))
+        if not parsed_date or amount is None:
+            continue
+        history = " ".join(match.group("historico").split())
+        if _basa_should_skip_history(history):
+            continue
+        results.append(ParsedStatement(
+            data=parsed_date,
+            hora=None,
+            historico=history,
+            nome=_basa_statement_name(history),
+            valor=abs(amount),
+            natureza="Crédito" if match.group("natureza") == "C" else "Débito",
+            texto_original=match.group(0).strip(),
+            pagina_numero=page_number,
+            numero_documento=match.group("documento").strip(),
+        ))
+    return results
+
+
+def _basa_should_skip_history(history: str) -> bool:
+    return bool(re.search(r"\b(?:SALDO|TOTAL DE|LIMITE|VENCTO|TIPO CONTA)\b", normalize_name(history), re.I))
+
+
+def _basa_statement_name(history: str) -> str:
+    return re.sub(r"^\d+\s*-\s*", "", history).strip()
 
 
 def _extract_banco_do_brasil_statement(text: str, page_number: int) -> list[ParsedStatement]:

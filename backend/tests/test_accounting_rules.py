@@ -187,6 +187,22 @@ def rule_input(trigger="FORNECEDOR", receipt_trigger="", scope="periodo"):
     return RegraContabilInput(gatilho=trigger, gatilho_comprovante=receipt_trigger, natureza="Crédito", tipo_componente="PRINCIPAL", conta_debito="Despesa", conta_credito="Banco", historico="Pagamento", complemento="Extrato", escopo=scope)
 
 
+def oi_phone_tv_session():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Banco do Brasil", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    session.add(file); session.flush()
+    phone = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 2), historico="13105 363 Pagto conta telefone OI SA", valor=Decimal("85.03"), natureza="saída")
+    tv = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 2), historico="13105 363 Pagto conta telefone OI SA TV", valor=Decimal("392.77"), natureza="saída")
+    session.add_all([phone, tv]); session.flush()
+    return session, reconciliation
+
+
 def test_new_eligible_rule_is_returned_as_pending_suggestion():
     session, reconciliation, _ = rules_session()
 
@@ -228,6 +244,49 @@ def test_rule_keywords_match_statement_regardless_of_selected_word_order():
     assert data["pendentes"] == []
     assert data["salvas"][0]["gatilho"] == "FORNECEDOR PIX"
     assert data["salvas"][0]["cobertos"] == 1
+
+
+def test_rule_exclusion_text_splits_oi_sa_phone_and_tv_preview_and_apply():
+    session, reconciliation = oi_phone_tv_session()
+    phone_payload = RegraContabilInput(gatilho="oi sá", texto_exclusao="tv", natureza="Crédito", tipo_componente="PRINCIPAL", conta_debito="Telefone", conta_credito="Banco", historico="Despesa telefone")
+    tv_payload = RegraContabilInput(gatilho="OI SA TV", natureza="Crédito", tipo_componente="PRINCIPAL", conta_debito="TV", conta_credito="Banco", historico="Despesa TV")
+
+    phone_preview = preview_accounting_rule(reconciliation.id, RegraContabilPreviaInput(gatilho=phone_payload.gatilho, texto_exclusao=phone_payload.texto_exclusao, natureza=phone_payload.natureza, tipo_componente=phone_payload.tipo_componente), session)
+    phone_created = create_accounting_rule(reconciliation.id, phone_payload, session)
+    tv_preview = preview_accounting_rule(reconciliation.id, RegraContabilPreviaInput(gatilho=tv_payload.gatilho, natureza=tv_payload.natureza, tipo_componente=tv_payload.tipo_componente), session)
+    tv_created = create_accounting_rule(reconciliation.id, tv_payload, session)
+
+    entries = session.query(LancamentoContabil).filter_by(status="aplicado_por_regra").all()
+    values_by_history = {entry.historico: entry.valor for entry in entries}
+    data = accounting_rules(reconciliation.id, session)
+
+    assert phone_preview["quantidade"] == phone_created["movimentos_aplicados"] == 1
+    assert "OI SA TV" not in phone_preview["lancamentos"][0]["historico"]
+    assert tv_preview["quantidade"] == tv_created["movimentos_aplicados"] == 1
+    assert tv_preview["lancamentos"][0]["historico"] == "13105 363 Pagto conta telefone OI SA TV"
+    assert values_by_history == {"Despesa telefone": Decimal("85.03"), "Despesa TV": Decimal("392.77")}
+    assert sorted(item["cobertos"] for item in data["salvas"]) == [1, 1]
+    assert any(item["gatilho"] == "OI SA" and item["texto_exclusao"] == "TV" for item in data["salvas"])
+
+
+def test_rule_without_exclusion_keeps_legacy_partial_match_behavior():
+    session, reconciliation = oi_phone_tv_session()
+
+    preview = preview_accounting_rule(reconciliation.id, RegraContabilPreviaInput(gatilho="OI SA", natureza="Crédito", tipo_componente="PRINCIPAL"), session)
+    created = create_accounting_rule(reconciliation.id, RegraContabilInput(gatilho="OI SA", natureza="Crédito", tipo_componente="PRINCIPAL", conta_debito="Telefonia", conta_credito="Banco", historico="Telefonia"), session)
+
+    assert preview["quantidade"] == created["movimentos_aplicados"] == 2
+    assert session.query(LancamentoContabil).filter_by(regra_contabil_id=created["id"], status="aplicado_por_regra").count() == 2
+
+
+def test_pix_recebido_rule_is_unchanged_without_exclusion():
+    session, reconciliation, _ = rules_session("821 PIX RECEBIDO")
+
+    preview = preview_accounting_rule(reconciliation.id, RegraContabilPreviaInput(gatilho="pix recebido", natureza="Crédito", tipo_componente="PRINCIPAL"), session)
+    created = create_accounting_rule(reconciliation.id, RegraContabilInput(gatilho="PIX RECEBIDO", natureza="Crédito", tipo_componente="PRINCIPAL", conta_debito="Banco", conta_credito="Receita", historico="Pix recebido"), session)
+
+    assert preview["quantidade"] == created["movimentos_aplicados"] == 1
+    assert session.query(LancamentoContabil).filter_by(regra_contabil_id=created["id"], status="aplicado_por_regra").count() == 1
 
 
 def test_rule_created_in_one_period_does_not_apply_to_another_period():

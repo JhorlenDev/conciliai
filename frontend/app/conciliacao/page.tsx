@@ -31,8 +31,6 @@ const banks = [
   "Bradesco",
   "Caixa",
   "Conta Caixa",
-  "Vendas com Cartão",
-  "Comissões Getnet",
   "Apropriações",
   "Empréstimos/Financeiro",
 ];
@@ -77,6 +75,29 @@ type Unused = {
   resumo: { comprovantes: Record<string, number>; rfb: Record<string, number> };
 };
 type Viewer = { arquivoId: string; pagina: number; titulo: string };
+const getnetDocumentLabels: Record<string, string> = {
+  getnet_vendas: "Getnet - Vendas",
+  getnet_comissoes: "Getnet - Comissões",
+};
+const documentTypeLabels: Record<string, string> = {
+  extrato: "Extrato",
+  comprovante: "Comprovante bancário",
+  rfb: "Comprovante RFB",
+};
+
+function isGetnetDocumentType(type: string | null | undefined) {
+  return Boolean(type && getnetDocumentLabels[type]);
+}
+
+function documentTypeLabel(type: string | null | undefined) {
+  if (!type) return "—";
+  return getnetDocumentLabels[type] ?? documentTypeLabels[type] ?? type;
+}
+
+function visibleBank(value: string | null | undefined) {
+  if (value === "Vendas com Cartão" || value === "Comissões Getnet") return "Santander";
+  return value && banks.includes(value) ? value : banks[0];
+}
 
 function PdfModal({
   viewer,
@@ -427,6 +448,7 @@ type SavedRule = {
   id: string;
   gatilho: string;
   gatilho_comprovante?: string;
+  texto_exclusao?: string;
   natureza: string;
   natureza_contabil?: string;
   tipo_componente?: string;
@@ -440,7 +462,7 @@ type SavedRule = {
   movimentos?: { data: string; historico: string; texto_extrato?: string; texto_comprovante?: string; tem_comprovante?: boolean; valor: string; tipo_componente?: string; natureza: string; natureza_contabil: string }[];
 };
 
-type IgnoredRule = Pick<SavedRule, "id" | "gatilho" | "gatilho_comprovante" | "tipo_componente" | "historico">;
+type IgnoredRule = Pick<SavedRule, "id" | "gatilho" | "gatilho_comprovante" | "texto_exclusao" | "tipo_componente" | "historico">;
 type RuleCoverageMatch = {
   data: string;
   historico: string;
@@ -453,10 +475,12 @@ type RulePreview = {
   motivo: string;
   gatilho?: string;
   gatilho_comprovante?: string;
+  texto_exclusao?: string;
 };
 type RuleSaveBody = {
   gatilho: string;
   gatilho_comprovante: string;
+  texto_exclusao: string;
   natureza: string;
   tipo_componente: string;
   escopo: string;
@@ -888,24 +912,25 @@ function AdvancedRulesPanel({
     const body = {
       gatilho: value(item.id, "gatilho", fields.gatilho),
       gatilho_comprovante: value(item.id, "gatilhoComprovante", fields.gatilhoComprovante),
+      texto_exclusao: value(item.id, "textoExclusao", fields.textoExclusao),
       natureza: item.natureza_contabil || item.natureza,
       tipo_componente: item.tipo_componente || "",
       regra_id: "gatilho" in item ? item.id : "",
     };
     if (!body.gatilho.trim() && !body.gatilho_comprovante.trim()) {
-      setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Informe um gatilho para validar a regra.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } }));
+      setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Informe um gatilho para validar a regra.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante, texto_exclusao: body.texto_exclusao } }));
       setMessage("Informe um gatilho para ver a cobertura da regra.");
       return;
     }
     setBusyRuleId(item.id);
     try {
       const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/previa`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), cache: "no-store" });
-      if (!response.ok) return setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Não foi possível validar o gatilho.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } }));
+      if (!response.ok) return setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Não foi possível validar o gatilho.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante, texto_exclusao: body.texto_exclusao } }));
       const result = await response.json();
-      setPreviews((current) => ({ ...current, [item.id]: { ...result, gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } }));
+      setPreviews((current) => ({ ...current, [item.id]: { ...result, gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante, texto_exclusao: body.texto_exclusao } }));
       setMessage(result.quantidade ? `Cobertura calculada: vai cobrir ${result.quantidade} lançamento(s).` : result.motivo || "Nenhum lançamento elegível corresponde ao gatilho informado.");
     } catch {
-      setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Não foi possível validar o gatilho.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } }));
+      setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Não foi possível validar o gatilho.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante, texto_exclusao: body.texto_exclusao } }));
       setMessage("Não foi possível validar o gatilho.");
     } finally {
       setBusyRuleId(null);
@@ -916,6 +941,7 @@ function AdvancedRulesPanel({
       ? {
            gatilho: item.gatilho,
            gatilhoComprovante: item.gatilho_comprovante || "",
+          textoExclusao: item.texto_exclusao || "",
           debito: item.conta_debito,
           credito: item.conta_credito,
           historico: item.historico,
@@ -924,6 +950,7 @@ function AdvancedRulesPanel({
       : {
            gatilho: "",
            gatilhoComprovante: "",
+          textoExclusao: "",
           debito: item.natureza_contabil === "Débito" ? account : "",
           credito: item.natureza_contabil === "Crédito" ? account : "",
           historico: "",
@@ -949,6 +976,7 @@ function AdvancedRulesPanel({
     return {
       gatilho: value(item.id, "gatilho", fields.gatilho),
       gatilho_comprovante: value(item.id, "gatilhoComprovante", fields.gatilhoComprovante),
+      texto_exclusao: value(item.id, "textoExclusao", fields.textoExclusao),
       natureza: item.natureza_contabil || item.natureza,
       tipo_componente: item.tipo_componente || "",
       escopo: existing && "gatilho" in item ? item.escopo || "global" : "global",
@@ -965,6 +993,7 @@ function AdvancedRulesPanel({
       body: JSON.stringify({
         gatilho: body.gatilho,
         gatilho_comprovante: body.gatilho_comprovante,
+        texto_exclusao: body.texto_exclusao,
         natureza: body.natureza,
         tipo_componente: body.tipo_componente,
         regra_id: existing && "gatilho" in item ? item.id : "",
@@ -973,7 +1002,7 @@ function AdvancedRulesPanel({
     });
     if (!response.ok) throw new Error(await errorMessage(response, "Não foi possível calcular a cobertura da regra."));
     const result = await response.json();
-    const preview = { ...result, gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante } as RulePreview;
+    const preview = { ...result, gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante, texto_exclusao: body.texto_exclusao } as RulePreview;
     setPreviews((current) => ({ ...current, [item.id]: preview }));
     return preview;
   }
@@ -1026,7 +1055,7 @@ function AdvancedRulesPanel({
     setBusyRuleId(item.id);
     try {
       const storedPreview = previews[item.id];
-      const preview = storedPreview?.gatilho === body.gatilho && storedPreview.gatilho_comprovante === body.gatilho_comprovante
+      const preview = storedPreview?.gatilho === body.gatilho && storedPreview.gatilho_comprovante === body.gatilho_comprovante && storedPreview.texto_exclusao === body.texto_exclusao
         ? storedPreview
         : await loadRulePreview(item, body, false);
       if (!preview.quantidade) {
@@ -1318,15 +1347,16 @@ function AdvancedRulesPanel({
     const words = pendingItem?.historico.match(/[\p{L}\p{N}]+/gu) ?? [];
     const keyword = value(item.id, "gatilho", fields.gatilho);
     const receiptKeyword = value(item.id, "gatilhoComprovante", fields.gatilhoComprovante);
+    const exclusionKeyword = value(item.id, "textoExclusao", fields.textoExclusao);
     const componentTrigger = componentTriggerLabel(item.tipo_componente);
     const debitValue = value(item.id, "debito", fields.debito);
     const creditValue = value(item.id, "credito", fields.credito);
     const historyValue = value(item.id, "historico", fields.historico);
     const complementValue = value(item.id, "complemento", fields.complemento);
     const storedPreview = previews[item.id];
-    const preview = storedPreview && storedPreview.gatilho === keyword && storedPreview.gatilho_comprovante === receiptKeyword ? storedPreview : undefined;
+    const preview = storedPreview && storedPreview.gatilho === keyword && storedPreview.gatilho_comprovante === receiptKeyword && storedPreview.texto_exclusao === exclusionKeyword ? storedPreview : undefined;
     const coveredCount =
-      "cobertos" in item && keyword === fields.gatilho && receiptKeyword === fields.gatilhoComprovante
+      "cobertos" in item && keyword === fields.gatilho && receiptKeyword === fields.gatilhoComprovante && exclusionKeyword === fields.textoExclusao
         ? item.cobertos
         : preview?.quantidade ?? 0;
     const canSave = existing || Boolean((keyword.trim() || receiptKeyword.trim()) && debitValue.trim() && creditValue.trim() && historyValue.trim());
@@ -1366,6 +1396,7 @@ function AdvancedRulesPanel({
             <td className={`${existing ? "w-[14%]" : "w-64 max-w-64"} px-2 py-2`}>
               <p className="line-clamp-2 break-words leading-4" title={"gatilho" in item ? item.gatilho : item.historico}>{"gatilho" in item ? item.gatilho : item.historico}</p>
               {"gatilho" in item && item.gatilho_comprovante && <p className={`mt-1 text-[10px] text-violet-700 ${existing ? "break-words" : "max-w-64 truncate"}`} title={item.gatilho_comprovante}>Comprovante: {item.gatilho_comprovante}</p>}
+              {"gatilho" in item && item.texto_exclusao && <p className={`mt-1 text-[10px] text-rose-700 ${existing ? "break-words" : "max-w-64 truncate"}`} title={item.texto_exclusao}>Não contém: {item.texto_exclusao}</p>}
               {pendingItem?.tarifa_no_extrato && <p className="mt-1 text-[10px] text-sky-700">Tarifa do comprovante está presente no extrato.</p>}
               {pendingItem?.tarifa_referente_ao_comprovante && <p className="mt-1 text-[10px] text-slate-500">Esta tarifa é referente ao comprovante de {pendingItem.tarifa_referencia_nome}, R$ {Number(pendingItem.tarifa_referencia_valor || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2 })} em {pendingItem.tarifa_referencia_data}.</p>}
               {pendingItem?.composicao_simples && <p className="mt-1 whitespace-pre-line text-[10px] text-slate-500">{pendingItem.composicao_simples}</p>}
@@ -1534,6 +1565,13 @@ function AdvancedRulesPanel({
                 {componentTrigger}
               </button>
             )}
+            <input
+              className={`${existing ? "mt-1 w-full min-w-0" : "mt-1 w-20"} rounded border border-rose-200 px-1.5 py-1 text-[10px]`}
+              placeholder="não contém..."
+              title="Texto de exclusão"
+              value={exclusionKeyword}
+              onChange={(event) => change(item.id, "textoExclusao", event.target.value)}
+            />
             {(pendingItem?.comprovante_arquivo_id || pendingItem?.comprovante_rfb_arquivo_id) && (
               <div className="mt-1 flex items-center gap-1">
                 <input className="w-20 rounded border border-violet-200 px-1.5 py-1" placeholder="comprovante..." value={receiptKeyword} onChange={(event) => change(item.id, "gatilhoComprovante", event.target.value)} />
@@ -1556,6 +1594,7 @@ function AdvancedRulesPanel({
                 <span className="font-semibold">Texto usado pela regra</span>
                 <br /><span className={coverageClass}>{coveredCount ? "✓" : preview || existing ? "!" : "•"} {coverageMessage}</span>
                 {(keyword || receiptKeyword) && <><br /><span className="text-slate-500">«{[keyword, receiptKeyword].filter(Boolean).join(" | ")}»</span></>}
+                {exclusionKeyword && <><br /><span className="text-rose-700">Não contém: «{exclusionKeyword}»</span></>}
                 {preview?.lancamentos[0]?.fonte && <><br /><span className="text-slate-500">Fonte: {preview.lancamentos.map((match) => match.fonte).filter((value, index, values) => values.indexOf(value) === index).join(", ")}</span></>}
                 {preview?.motivo && <><br /><span className="text-red-700">{preview.motivo}</span></>}
               </div>
@@ -1947,6 +1986,7 @@ function AdvancedRulesPanel({
             <div className="grid grid-cols-2 gap-2 max-sm:grid-cols-1">
               <p><strong>Gatilho:</strong> {coverageModal.body.gatilho || "—"}</p>
               <p><strong>Comprovante:</strong> {coverageModal.body.gatilho_comprovante || "—"}</p>
+              <p><strong>Não contém:</strong> {coverageModal.body.texto_exclusao || "—"}</p>
               <p><strong>Débito:</strong> {coverageModal.body.conta_debito}</p>
               <p><strong>Crédito:</strong> {coverageModal.body.conta_credito}</p>
               <p className="col-span-2 max-sm:col-span-1"><strong>Histórico:</strong> {coverageModal.body.historico}</p>
@@ -2707,7 +2747,7 @@ function ConciliacaoFlow({
   const [clients, setClients] = useState<Client[]>([]),
     [clientId, setClientId] = useState(initialClientId || ""),
     [newClient, setNewClient] = useState("");
-  const [bank, setBank] = useState(initialBank || banks[0]),
+  const [bank, setBank] = useState(visibleBank(initialBank)),
     [start, setStart] = useState(""),
     [end, setEnd] = useState(""),
     [reconciliationId, setReconciliationId] = useState("");
@@ -2743,11 +2783,7 @@ function ConciliacaoFlow({
     const params = new URLSearchParams(window.location.search);
     const requestedProcess = params.get("process");
     const requestedBank = params.get("bank");
-    const fallbackBank =
-      requestedBank ||
-      initialBank ||
-      localStorage.getItem("conciliai_banco") ||
-      banks[0];
+    const fallbackBank = requestedBank ? visibleBank(requestedBank) : visibleBank(initialBank || localStorage.getItem("conciliai_banco"));
     const storedClientId = params.get("client") || initialClientId || localStorage.getItem("conciliai_cliente_id") || "";
     fetch(`${API}/api/clientes`)
       .then((r) => r.json())
@@ -2987,7 +3023,9 @@ function ConciliacaoFlow({
           ? "Extrato"
           : type === "comprovante"
             ? "Comprovantes bancários"
-            : "Comprovantes RFB";
+            : type === "rfb"
+              ? "Comprovantes RFB"
+              : documentTypeLabel(type);
       setMessage(
         `${documentName} disponível. Continue na aba Início para enviar os demais documentos.`,
       );
@@ -3125,6 +3163,26 @@ function ConciliacaoFlow({
     .reduce((total, item) => total + numberValue(item.valor), 0);
   const rulesToCreate =
     results?.filter((item) => item.fonte_regra === "extrato").length ?? 0;
+  const isSantander = bank === "Santander";
+  const getnetFiles = review.arquivos.filter((file) => isGetnetDocumentType(file.tipo));
+  const getnetFileIds = new Set(getnetFiles.map((file) => file.id));
+  const getnetReceipts = review.comprovantes.filter((row) => getnetFileIds.has(String(row.arquivo_id || "")));
+  const bankReceipts = isSantander ? review.comprovantes.filter((row) => !getnetFileIds.has(String(row.arquivo_id || ""))) : review.comprovantes;
+  const navigationTabs = [
+    "Início",
+    ...(review.arquivos.length
+      ? [
+          "Extrato",
+          "Comprovantes bancários",
+          ...(isSantander ? ["Getnet"] : []),
+          "Comprovantes RFB",
+          "Conciliação",
+          "Conciliação Avançada",
+        ]
+      : isSantander && reconciliationId
+        ? ["Getnet"]
+        : []),
+  ];
   function downloadCsv() {
     if (!reconciliationId) return;
     window.location.assign(
@@ -3149,18 +3207,7 @@ function ConciliacaoFlow({
       <main className="workspace-main mx-auto max-w-[90rem] px-3 py-3 sm:px-4">
         <div className="mb-5 flex items-center justify-center gap-2 overflow-x-auto border-b text-sm">
           <div className="flex shrink-0">
-            {[
-              "Início",
-              ...(review.arquivos.length
-                ? [
-                    "Extrato",
-                    "Comprovantes bancários",
-                    "Comprovantes RFB",
-                    "Conciliação",
-                    "Conciliação Avançada",
-                  ]
-                : []),
-            ].map((item) => (
+            {navigationTabs.map((item) => (
               <button
                 onClick={() => setActiveTab(item)}
                 className={`flex shrink-0 items-center gap-1.5 border-b-2 px-4 py-2 ${activeTab === item ? `${theme} font-semibold` : "border-transparent text-slate-500"}`}
@@ -3275,7 +3322,7 @@ function ConciliacaoFlow({
                   >
                     <span className="min-w-0 truncate">{file.nome}</span>
                     <span className="ml-auto shrink-0 text-slate-500">
-                      {file.tipo} · {file.status}
+                      {documentTypeLabel(file.tipo)} · {file.status}
                     </span>
                     <button
                       onClick={() => reprocessDocument(file.id)}
@@ -3325,9 +3372,86 @@ function ConciliacaoFlow({
               "Valor pago",
               "Tipo",
             ]}
-            rows={review.comprovantes}
+            rows={bankReceipts}
             onView={setViewer}
           />
+        )}
+        {reconciliationId && activeTab === "Getnet" && isSantander && (
+          <div className="space-y-5">
+            <section className="rounded-xl border border-slate-200 bg-white p-5">
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="font-semibold">Getnet</h2>
+                  <p className="text-sm text-slate-500">Envie os documentos da Getnet dentro do processo Santander.</p>
+                </div>
+                <span className="rounded-full bg-red-50 px-3 py-1 text-xs font-semibold text-red-800">
+                  {getnetFiles.length} arquivo(s)
+                </span>
+              </div>
+              <div className="grid gap-4 md:grid-cols-2">
+                {[
+                  ["getnet_vendas", "Vendas Getnet"],
+                  ["getnet_comissoes", "Comissões Getnet"],
+                ].map(([type, label]) => (
+                  <label
+                    className="cursor-pointer rounded-xl border-2 border-dashed border-red-200 bg-red-50 p-5 text-center hover:border-red-700"
+                    key={String(type)}
+                  >
+                    <Upload className="mx-auto mb-2 text-red-700" />
+                    <strong className="block">{String(label)}</strong>
+                    <input
+                      className="hidden"
+                      type="file"
+                      accept="application/pdf"
+                      multiple
+                      onChange={(event) => upload(String(type), event)}
+                    />
+                  </label>
+                ))}
+              </div>
+              {getnetFiles.length > 0 && (
+                <ul className="mt-4 divide-y rounded-md border text-sm">
+                  {getnetFiles.map((file) => (
+                    <li className="flex items-center justify-between gap-3 px-3 py-2" key={file.id}>
+                      <span className="min-w-0 truncate">{file.nome}</span>
+                      <span className="ml-auto shrink-0 text-slate-500">{documentTypeLabel(file.tipo)} · {file.status}</span>
+                      <button
+                        onClick={() => reprocessDocument(file.id)}
+                        title="Reprocessar arquivo"
+                        aria-label={`Reprocessar ${file.nome}`}
+                        className="shrink-0 rounded p-1 text-teal-700 hover:bg-teal-50"
+                      >
+                        <RefreshCw size={15} />
+                      </button>
+                      <button
+                        onClick={() => deleteDocument(file.id)}
+                        title="Excluir arquivo"
+                        aria-label={`Excluir ${file.nome}`}
+                        className="shrink-0 rounded p-1 text-red-600 hover:bg-red-50"
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+            <Table
+              title="Registros Getnet"
+              columns={[
+                "Data",
+                "Hora",
+                "Documento",
+                "Favorecido",
+                "Valor original",
+                "Ajustes",
+                "Valor pago",
+                "Tipo",
+              ]}
+              rows={getnetReceipts}
+              onView={setViewer}
+            />
+          </div>
         )}
         {reconciliationId && activeTab === "Comprovantes RFB" && (
           <Table

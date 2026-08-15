@@ -135,6 +135,187 @@ HISTORICO LANCAMENTO:  PAGAMENTO SEGURO BB
     assert record.valor == Decimal("136.93")
 
 
+def test_santander_extracts_receipts_from_consolidated_tables():
+    text = """EXTRATO CONSOLIDADO INTELIGENTE
+janeiro/2024
+Débito Automático em Conta Corrente
+Data
+Descrição
+Nº Identificação
+Valor (R$)
+Realizado
+Motivo
+Limite para
+Débito (R$)
+02/01
+CARTAO DE CREDITO
+MASTERCARD
+55264202
+2.320,83
+Sim
+-
+NÃO HÁ
+Comprovantes de Pagamento
+Contas de Consumo
+Data de
+Pagamento Canal
+Nome da
+Empresa
+Data de
+Vencimento
+Valor
+(R$)
+Código de Barras
+Autenticação
+Bancária
+18/01
+INTERNET
+BANKING
+TNL PSC SA - RJ
+-
+396,15
+846800000032-961501132974-
+878932903411-079167002009
+50039143067323780040434
+Transferências entre Contas, DOCs, TEDs e PIXs Enviados
+Data Canal
+Tipo
+Favorecido
+Banco Agência
+Conta
+Valor (R$)
+10/01 INTERNET BANKING
+TRANSF. CONTAS
+LEANDRO BARBOSA FIGUEIRO
+0033
+2478
+0000010026686
+4.500,00
+15/01 INTERNET BANKING
+TED
+LEANDRO BARBOSA FIGUEIRO
+0001
+0577
+0000000256323
+6.000,00
+25/01 INTERNET BANKING
+TED
+RENATA FIGUEIRO
+0001
+0577
+0000000236705
+6.000,00
+Não estão contempladas nesse quadro as transferências efetuadas
+Créditos Contratados
+"""
+
+    records = extract_receipts(text, 5)
+
+    assert [(item.data, item.tipo_operacao, item.favorecido, item.valor, item.numero_documento) for item in records] == [
+        (date(2024, 1, 2), "DÉBITO AUTOMÁTICO", "CARTAO DE CREDITO MASTERCARD", Decimal("2320.83"), "55264202"),
+        (date(2024, 1, 18), "PAGAMENTO", "TNL PSC SA - RJ", Decimal("396.15"), "50039143067323780040434"),
+        (date(2024, 1, 10), "TRANSFERÊNCIA", "LEANDRO BARBOSA FIGUEIRO", Decimal("4500.00"), "0033 2478 0000010026686"),
+        (date(2024, 1, 15), "TED", "LEANDRO BARBOSA FIGUEIRO", Decimal("6000.00"), "0001 0577 0000000256323"),
+        (date(2024, 1, 25), "TED", "RENATA FIGUEIRO", Decimal("6000.00"), "0001 0577 0000000236705"),
+    ]
+
+
+def test_santander_extracts_internet_banking_title_receipt_with_charges():
+    text = """CENTRO ODONTOLOGICO FIGUEIRO LTDA
+Internet Banking Empresarial
+Títulos > 2ª via de Comprovante
+Dados do Beneﬁciário Original
+CNPJ:
+07.707.650/0001-10
+Razão Social:
+QUANTITY SERVICOS E
+COMERCIO DE PRODUTOS
+PARA SAUD
+Nome Fantasia:
+QUANTITY SERVICOS E
+COMERCIO DE PRODUTOS
+PARA SAUD
+Dados do Pagador Original
+Dados do Pagamento
+Data de Vencimento:
+10/01/2024
+Valor Nominal:
+R$ 835,00
+Encargos:
+R$ 1,40
+Valor total pago:
+R$ 836,40
+Data da Transação:
+15/01/2024
+Número de Autenticação da Instituição Financeira Favorecida:
+B9B664BB73A6A85535A8BAB
+Canal:
+Internet Banking
+"""
+
+    record = extract_receipts(text, 6)[0]
+
+    assert record.data == date(2024, 1, 15)
+    assert record.tipo_operacao == "PAGAMENTO"
+    assert record.favorecido == "QUANTITY SERVICOS E COMERCIO DE PRODUTOS PARA SAUD"
+    assert record.valor == Decimal("836.40")
+    assert record.financeiros.valor_original == Decimal("835.00")
+    assert record.financeiros.valor_encargos == Decimal("1.40")
+    assert not record.financeiros.composicao_divergente
+    assert record.cnpj_beneficiario == "07.707.650/0001-10"
+    assert record.numero_documento == "B9B664BB73A6A85535A8BAB"
+
+
+def test_getnet_sales_report_extracts_net_gross_fee_and_quantity():
+    text = """O que vendi - Consolidado por Data de Vendas
+Razão Social: CENTRO ODONTOLOGICO FIGUEIRO LTDA
+Período: 01/01/2024 a 31/01/2024
+MASTERCARD CRÉDITO
+02/01/2024
+12289884
+R$ 220,00
+R$ 215,29
+- R$ 4,71
+1
+VISA DÉBITO
+04/01/2024
+12289884
+R$ 540,00
+R$ 534,60
+- R$ 5,40
+4
+"""
+
+    records = extract_receipts(text, 1)
+
+    assert len(records) == 2
+    assert records[0].data == date(2024, 1, 2)
+    assert records[0].favorecido == "GETNET - MASTERCARD CRÉDITO"
+    assert records[0].tipo_operacao == "GETNET VENDAS"
+    assert records[0].valor == Decimal("215.29")
+    assert records[0].financeiros.valor_original == Decimal("220.00")
+    assert records[0].financeiros.valor_tarifa == Decimal("4.71")
+    assert records[0].financeiros.valor_pago == Decimal("215.29")
+    assert records[0].financeiros.detalhes["quantidade_vendas"] == "1"
+    assert not records[0].financeiros.composicao_divergente
+    assert records[1].financeiros.detalhes["quantidade_vendas"] == "4"
+
+
+def test_getnet_sales_report_extracts_inline_rows_without_header():
+    text = """12289884 VISA DÉBITO  15/07/2024  1       R$ 200,00  - R$ 2,74  R$ 197,26
+12289884 MASTERCARD DÉBITO 08/07/2024 2    R$ 0,00    R$ 0,00    R$ 0,00
+"""
+
+    records = extract_receipts(text, 2)
+
+    assert len(records) == 1
+    assert records[0].data == date(2024, 7, 15)
+    assert records[0].favorecido == "GETNET - VISA DÉBITO"
+    assert records[0].financeiros.valor_original == Decimal("200.00")
+    assert records[0].financeiros.valor_tarifa == Decimal("2.74")
+    assert records[0].financeiros.valor_pago == Decimal("197.26")
+
+
 def test_invoice_is_not_matched_by_value_only():
     assert not invoice_is_candidate(
         Decimal("520.52"), date(2024, 1, 2), "Fornecedor A",
@@ -178,6 +359,37 @@ def test_banco_do_brasil_parser_is_not_used_for_other_banks():
 02/01 09:40 Lia Da Silva Alexandre
 """
     assert extract_statement(text, 1, "Santander") == []
+
+
+def test_basa_extracts_statement_table_rows():
+    text = """DATA    NR DOC HISTÓRICO                             VALOR LANCTO D/C       SALDO
+   02/01/2024 026577 1127 - AUTOMATIZACAO TARIFA MANUTENCAO PJ -45,00 D     40.318,30
+   02/01/2024 021031 1025 - TARIFA ENVIO SMS EM CONTA CORRENTE -0,22 D      40.318,08
+   15/01/2024 235096 1417 - DEB PARCELA CONTRATO FOMENTO   -248,94  D       40.069,14
+                                                            Total de débito:  294,16
+                                                           Total de crédito:
+"""
+    records = extract_statement(text, 1, "BASA")
+
+    assert len(records) == 3
+    assert records[0].data == date(2024, 1, 2)
+    assert records[0].numero_documento == "026577"
+    assert records[0].historico == "1127 - AUTOMATIZACAO TARIFA MANUTENCAO PJ"
+    assert records[0].nome == "AUTOMATIZACAO TARIFA MANUTENCAO PJ"
+    assert records[0].valor == Decimal("45.00")
+    assert records[0].natureza == "Débito"
+    assert sum(record.valor for record in records if record.natureza == "Débito") == Decimal("294.16")
+
+
+def test_basa_extracts_credit_from_dc_column():
+    text = """DATA    NR DOC HISTÓRICO                             VALOR LANCTO D/C       SALDO
+   03/01/2024 000123 9999 - CREDITO PIX RECEBIDO 1.234,56 C     41.552,64
+"""
+    record = extract_statement(text, 1, "BASA")[0]
+
+    assert record.numero_documento == "000123"
+    assert record.valor == Decimal("1234.56")
+    assert record.natureza == "Crédito"
 
 
 def test_santander_extracts_single_date_column_statement_without_bb_rules():
@@ -520,6 +732,41 @@ def test_santander_words_keep_first_description_word_with_float_coordinate_noise
         ("PAGAMENTO CARTAO DE DEBITO GETNET-ELO DEBITO", Decimal("118.80"), "289884"),
         ("PAGAMENTO CARTAO DE DEBITO GETNET-MAESTRO", Decimal("257.27"), "289884"),
     ]
+
+
+def test_santander_words_remove_repeated_trailing_description_phrase():
+    pages_words = [[
+        *word_line(10, [("Conta Corrente", 40)]),
+        *word_line(20, [("Movimentação", 40)]),
+        *santander_split_header(30),
+        *word_line(50, [("02/01", 34), ("TARIFA MENSALIDADE PACOTE SERVICOS DEZEMBRO / 2023", 65), ("106,50-", 435)]),
+        *word_line(60, [("MENSALIDADE PACOTE SERVICOS DEZEMBRO / 2023", 65)]),
+    ]]
+    pages_text = ["EXTRATO CONSOLIDADO INTELIGENTE\nSantander\njaneiro/2024\nConta Corrente\nMovimentação\nMovimentos (R$)"]
+
+    records = extract_santander_words_statement(pages_words, pages_text)
+
+    assert len(records) == 1
+    assert records[0].historico == "TARIFA MENSALIDADE PACOTE SERVICOS DEZEMBRO / 2023"
+    assert records[0].nome == ""
+    assert records[0].valor == Decimal("106.50")
+    assert records[0].natureza == "Débito"
+
+
+def test_santander_statement_name_does_not_repeat_tokens_from_history():
+    pages_words = [[
+        *word_line(10, [("Conta Corrente", 40)]),
+        *word_line(20, [("Movimentação", 40)]),
+        *santander_split_header(30),
+        *word_line(50, [("02/01", 34), ("DEBITO AUT. FAT.CARTAO MASTER CARD FINAL 4202", 65), ("2.320,83-", 435)]),
+    ]]
+    pages_text = ["EXTRATO CONSOLIDADO INTELIGENTE\nSantander\njaneiro/2024\nConta Corrente\nMovimentação\nMovimentos (R$)"]
+
+    records = extract_santander_words_statement(pages_words, pages_text)
+
+    assert len(records) == 1
+    assert records[0].historico == "DEBITO AUT. FAT.CARTAO MASTER CARD FINAL 4202"
+    assert records[0].nome == ""
 
 
 def test_santander_words_use_columns_not_description_words_for_nature_and_ignore_informational_sections():

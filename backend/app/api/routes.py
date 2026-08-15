@@ -25,12 +25,16 @@ from app.core.database import get_db
 from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, ComprovanteRfbItem, Conciliacao, ContaBancaria, Correspondencia, DocumentoImportante, LancamentoContabil, MovimentoExtrato, NotaFiscal, ProcessoConciliacao, RegraContabil, RegraContabilExcecao
 from app.services.normalization import accounting_nature, is_statement_debit, normalize_name, normalize_rule_accounting_nature, normalize_statement_nature
 from app.services.matching import names_similar
-from app.services.parsers import deduplicate_statement_records, extract_receipts, extract_santander_pdfplumber_statement, extract_statement_pages
+from app.services.parsers import deduplicate_statement_records, extract_basa_pdfplumber_pages, extract_getnet_pdfplumber_pages, extract_receipts, extract_santander_pdfplumber_statement, extract_statement_pages
 from app.services.rfb import belongs_to_selected_bank, extract_competence, parse_rfb_page
 from app.services.rule_source import choose_rule_source
 
 router = APIRouter()
-BANKS = ["Banco do Brasil", "Santander", "BASA", "Bradesco", "Caixa", "Conta Caixa", "Vendas com Cartão", "Comissões Getnet", "Apropriações", "Empréstimos/Financeiro"]
+PRIMARY_BANKS = ["Banco do Brasil", "Santander", "BASA", "Bradesco", "Caixa", "Conta Caixa", "Apropriações", "Empréstimos/Financeiro"]
+LEGACY_GETNET_BANKS = ["Vendas com Cartão", "Comissões Getnet"]
+BANKS = [*PRIMARY_BANKS, *LEGACY_GETNET_BANKS]
+RECEIPT_DOCUMENT_TYPES = {"comprovante", "getnet_vendas", "getnet_comissoes"}
+DOCUMENT_TYPES = {"extrato", *RECEIPT_DOCUMENT_TYPES, "rfb"}
 logger = logging.getLogger(__name__)
 
 
@@ -50,7 +54,7 @@ def delete_file(arquivo_id: str, db: Session = Depends(get_db)):
     reset_reconciliation(record.conciliacao_id, db)
     if record.tipo_documento == "extrato":
         db.query(MovimentoExtrato).filter_by(arquivo_id=record.id).delete()
-    elif record.tipo_documento == "comprovante":
+    elif record.tipo_documento in RECEIPT_DOCUMENT_TYPES:
         db.query(Comprovante).filter_by(arquivo_id=record.id).delete()
     else:
         receipts = db.query(ComprovanteRfb).filter_by(arquivo_id=record.id).all()
@@ -93,6 +97,7 @@ class ProcessoBancoInput(BaseModel):
 class RegraContabilInput(BaseModel):
     gatilho: str
     gatilho_comprovante: str = ""
+    texto_exclusao: str = ""
     natureza: str
     conta_debito: str
     conta_credito: str
@@ -105,6 +110,7 @@ class RegraContabilInput(BaseModel):
 class RegraContabilPreviaInput(BaseModel):
     gatilho: str = ""
     gatilho_comprovante: str = ""
+    texto_exclusao: str = ""
     natureza: str
     tipo_componente: str = ""
     regra_id: str = ""
@@ -140,7 +146,7 @@ class LancamentosInput(BaseModel):
 
 @router.get("/bancos")
 def banks():
-    return BANKS
+    return PRIMARY_BANKS
 
 
 def important_document_payload(record: DocumentoImportante) -> dict:
@@ -217,6 +223,14 @@ def extract_important_catalog(path: Path, extension: str, tipo: str) -> dict:
 def extract_pdf_pages(path: Path, bank: str, document_type: str) -> list[str]:
     if document_type == "extrato" and bank == "Santander":
         pages = extract_santander_pdfplumber_pages(path)
+        if pages:
+            return pages
+    if document_type == "extrato" and bank == "BASA":
+        pages = extract_basa_pdfplumber_pages(path)
+        if pages:
+            return pages
+    if document_type == "getnet_vendas":
+        pages = extract_getnet_pdfplumber_pages(path)
         if pages:
             return pages
     with fitz.open(path) as document:
@@ -555,7 +569,7 @@ def normalized_trigger_key(value: str) -> str:
     return " ".join(sorted(normalize_name(value).split()))
 
 
-def rule_identity(cliente_id: str | None, banco: str, natureza: str, componente: str, gatilho: str, gatilho_comprovante: str, conta_debito: str, conta_credito: str, historico: str, complemento: str) -> tuple[str, ...]:
+def rule_identity(cliente_id: str | None, banco: str, natureza: str, componente: str, gatilho: str, gatilho_comprovante: str, texto_exclusao: str, conta_debito: str, conta_credito: str, historico: str, complemento: str) -> tuple[str, ...]:
     return (
         cliente_id or "",
         normalize_name(banco),
@@ -563,6 +577,7 @@ def rule_identity(cliente_id: str | None, banco: str, natureza: str, componente:
         normalize_name(componente or "PRINCIPAL"),
         normalized_trigger_key(gatilho),
         normalized_trigger_key(gatilho_comprovante),
+        normalized_trigger_key(texto_exclusao),
         normalize_name(conta_debito),
         normalize_name(conta_credito),
         normalize_name(historico),
@@ -571,7 +586,7 @@ def rule_identity(cliente_id: str | None, banco: str, natureza: str, componente:
 
 
 def saved_rule_identity(rule: RegraContabil) -> tuple[str, ...]:
-    return rule_identity(rule.cliente_id, rule.banco, rule.tipo_operacao, rule.tipo_componente, rule.favorecido_normalizado, rule.gatilho_comprovante_normalizado, rule.conta_debito, rule.conta_credito, rule.historico, rule.complemento)
+    return rule_identity(rule.cliente_id, rule.banco, rule.tipo_operacao, rule.tipo_componente, rule.favorecido_normalizado, rule.gatilho_comprovante_normalizado, rule.texto_exclusao_normalizado, rule.conta_debito, rule.conta_credito, rule.historico, rule.complemento)
 
 
 def legacy_trigger_matches_receipt(rule: RegraContabil, history: str, receipt: Comprovante | None, rfb: ComprovanteRfb | None = None, rfb_items: list[ComprovanteRfbItem] | None = None) -> bool:
@@ -651,7 +666,9 @@ def rule_matches_movement(rule: RegraContabil, movement: MovimentoExtrato, recei
     receipt_trigger = normalize_name(rule.gatilho_comprovante_normalizado or "")
     receipt_tokens_match = not receipt_trigger or receipt_trigger in normalize_name(receipt_source) or set(receipt_trigger.split()) <= set(normalize_name(receipt_source).split())
     statement_matches = trigger_matches(component_source, trigger) or legacy_trigger_matches_receipt(rule, history, receipt, rfb, rfb_items)
-    return bool(statement_matches and receipt_tokens_match and (not rule.tipo_operacao or normalize_rule_accounting_nature(rule.tipo_operacao) == accounting_nature(movement.natureza)) and component_matches)
+    exclusion = normalize_name(rule.texto_exclusao_normalizado or "")
+    exclusion_matches = bool(exclusion and trigger_matches(component_source, exclusion))
+    return bool(statement_matches and not exclusion_matches and receipt_tokens_match and (not rule.tipo_operacao or normalize_rule_accounting_nature(rule.tipo_operacao) == accounting_nature(movement.natureza)) and component_matches)
 
 
 def in_reconciliation_period(reconciliation: Conciliacao, movement: MovimentoExtrato) -> bool:
@@ -735,7 +752,7 @@ def is_transfer_without_counterparty(movement: MovimentoExtrato) -> bool:
 def rule_payload(rule: RegraContabil, movements: list[MovimentoExtrato], receipts: dict[str, Comprovante], covered_entries: list[tuple[str, LancamentoContabil]]) -> dict:
     movement_by_id = {movement.id: movement for movement in movements}
     covered = [(movement_by_id[movement_id], entry) for movement_id, entry in covered_entries if movement_id in movement_by_id]
-    return {"id": rule.id, "gatilho": rule.favorecido_normalizado, "gatilho_comprovante": rule.gatilho_comprovante_normalizado, "natureza": normalize_rule_accounting_nature(rule.tipo_operacao), "tipo_componente": rule.tipo_componente, "conta_debito": rule.conta_debito, "conta_credito": rule.conta_credito, "historico": rule.historico, "complemento": rule.complemento, "escopo": rule.escopo, "banco_origem": rule.banco, "criada_em": rule.created_at.isoformat() if rule.created_at else "", "cobertos": len(covered), "movimentos": [{"data": movement.data.strftime("%d/%m/%Y") if movement.data else "—", "historico": " ".join(part for part in [movement.historico, movement.nome_encontrado] if part), "texto_extrato": " ".join(part for part in [movement.historico, movement.nome_encontrado] if part), "texto_comprovante": receipt_description(receipts.get(movement.id)), "tem_comprovante": bool(receipts.get(movement.id)), "valor": str(entry.valor or 0), "tipo_componente": entry.componente, "natureza": normalize_statement_nature(movement.natureza), "natureza_contabil": accounting_nature(movement.natureza)} for movement, entry in covered]}
+    return {"id": rule.id, "gatilho": rule.favorecido_normalizado, "gatilho_comprovante": rule.gatilho_comprovante_normalizado, "texto_exclusao": rule.texto_exclusao_normalizado, "natureza": normalize_rule_accounting_nature(rule.tipo_operacao), "tipo_componente": rule.tipo_componente, "conta_debito": rule.conta_debito, "conta_credito": rule.conta_credito, "historico": rule.historico, "complemento": rule.complemento, "escopo": rule.escopo, "banco_origem": rule.banco, "criada_em": rule.created_at.isoformat() if rule.created_at else "", "cobertos": len(covered), "movimentos": [{"data": movement.data.strftime("%d/%m/%Y") if movement.data else "—", "historico": " ".join(part for part in [movement.historico, movement.nome_encontrado] if part), "texto_extrato": " ".join(part for part in [movement.historico, movement.nome_encontrado] if part), "texto_comprovante": receipt_description(receipts.get(movement.id)), "tem_comprovante": bool(receipts.get(movement.id)), "valor": str(entry.valor or 0), "tipo_componente": entry.componente, "natureza": normalize_statement_nature(movement.natureza), "natureza_contabil": accounting_nature(movement.natureza)} for movement, entry in covered]}
 
 
 def scoped_rules(reconciliation: Conciliacao, db: Session) -> list[RegraContabil]:
@@ -758,6 +775,19 @@ def rule_period_exception(rule_id: str, reconciliation: Conciliacao, db: Session
 
 def complete_accounting_entry(entry: LancamentoContabil) -> bool:
     return bool(entry.status in {"aplicado_por_regra", "editado_manual"} and entry.valor and entry.valor > 0 and entry.conta_debito.strip() and entry.conta_credito.strip() and entry.historico.strip())
+
+
+def count_rule_entries_in_reconciliation(rule_id: str, reconciliation: Conciliacao, db: Session) -> int:
+    return (
+        db.query(LancamentoContabil)
+        .join(Correspondencia, LancamentoContabil.correspondencia_id == Correspondencia.id)
+        .filter(
+            Correspondencia.conciliacao_id == reconciliation.id,
+            LancamentoContabil.regra_contabil_id == rule_id,
+            LancamentoContabil.status == "aplicado_por_regra",
+        )
+        .count()
+    )
 
 
 DISCOUNT_COMPONENTS = {"DESCONTO", "ABATIMENTO", "DESCONTO_ABATIMENTO"}
@@ -1016,7 +1046,7 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
     for exception in exceptions:
         rule = rules_by_id.get(exception.regra_contabil_id)
         if rule and rule.ativo and rule.cliente_id == reconciliation.cliente_id and rule.banco == reconciliation.banco:
-            ignored.append({"id": rule.id, "gatilho": rule.favorecido_normalizado, "gatilho_comprovante": rule.gatilho_comprovante_normalizado, "tipo_componente": rule.tipo_componente, "historico": rule.historico})
+            ignored.append({"id": rule.id, "gatilho": rule.favorecido_normalizado, "gatilho_comprovante": rule.gatilho_comprovante_normalizado, "texto_exclusao": rule.texto_exclusao_normalizado, "tipo_componente": rule.tipo_componente, "historico": rule.historico})
     return {
         "pendentes": pending,
         "salvas": saved_payloads,
@@ -1088,7 +1118,7 @@ def preview_accounting_rule(conciliacao_id: str, payload: RegraContabilPreviaInp
         current_rule = db.get(RegraContabil, current_rule_id)
         if not current_rule or current_rule.cliente_id != reconciliation.cliente_id or current_rule.banco != reconciliation.banco or not current_rule.ativo:
             raise HTTPException(404, "Regra não encontrada")
-    rule = RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco=reconciliation.banco, tipo_fonte="extrato", tipo_operacao=payload.natureza, tipo_componente=payload.tipo_componente.strip().upper(), favorecido_normalizado=normalize_name(payload.gatilho), gatilho_comprovante_normalizado=normalize_name(payload.gatilho_comprovante))
+    rule = RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco=reconciliation.banco, tipo_fonte="extrato", tipo_operacao=payload.natureza, tipo_componente=payload.tipo_componente.strip().upper(), favorecido_normalizado=normalize_name(payload.gatilho), gatilho_comprovante_normalizado=normalize_name(payload.gatilho_comprovante), texto_exclusao_normalizado=normalize_name(payload.texto_exclusao))
     matches = rule_preview(rule, reconciliation, db, current_rule_id)
     return {"quantidade": len(matches), "lancamentos": matches, "motivo": "Nenhum lançamento elegível corresponde ao gatilho informado." if not matches else ""}
 
@@ -1098,7 +1128,7 @@ def create_accounting_rule(conciliacao_id: str, payload: RegraContabilInput, db:
     reconciliation = reconciliation_or_404(conciliacao_id, db)
     if not (payload.gatilho.strip() or payload.gatilho_comprovante.strip()) or not all([payload.conta_debito.strip(), payload.conta_credito.strip(), payload.historico.strip()]):
         raise HTTPException(422, "Preencha ao menos um gatilho, débito, crédito e histórico")
-    candidate_identity = rule_identity(reconciliation.cliente_id, reconciliation.banco, payload.natureza, payload.tipo_componente, payload.gatilho, payload.gatilho_comprovante, payload.conta_debito, payload.conta_credito, payload.historico, payload.complemento)
+    candidate_identity = rule_identity(reconciliation.cliente_id, reconciliation.banco, payload.natureza, payload.tipo_componente, payload.gatilho, payload.gatilho_comprovante, payload.texto_exclusao, payload.conta_debito, payload.conta_credito, payload.historico, payload.complemento)
     existing_rule = next((item for item in scoped_rules(reconciliation, db) if saved_rule_identity(item) == candidate_identity), None)
     if existing_rule:
         exception = rule_period_exception(existing_rule.id, reconciliation, db)
@@ -1107,23 +1137,27 @@ def create_accounting_rule(conciliacao_id: str, payload: RegraContabilInput, db:
         try:
             db.delete(exception)
             targets = [item for item in scoped_reconciliations(reconciliation, db) if item.banco == reconciliation.banco] if existing_rule.escopo == "global" else [reconciliation]
-            applied = sum(apply_accounting_rules(item, db) for item in targets)
+            for item in targets:
+                apply_accounting_rules(item, db)
+            applied = count_rule_entries_in_reconciliation(existing_rule.id, reconciliation, db)
             db.commit(); db.refresh(existing_rule)
         except Exception:
             db.rollback()
             raise
         return {"id": existing_rule.id, "movimentos_aplicados": applied, "reativada": True, "regras": accounting_rules(conciliacao_id, db)}
-    shared_rule = next((item for item in scoped_rules(reconciliation, db) if item.banco != reconciliation.banco and item.tipo_operacao == payload.natureza and item.tipo_componente == payload.tipo_componente.strip().upper() and normalize_name(item.favorecido_normalizado) == normalize_name(payload.gatilho) and normalize_name(item.gatilho_comprovante_normalizado) == normalize_name(payload.gatilho_comprovante)), None)
+    shared_rule = next((item for item in scoped_rules(reconciliation, db) if item.banco != reconciliation.banco and item.tipo_operacao == payload.natureza and item.tipo_componente == payload.tipo_componente.strip().upper() and normalize_name(item.favorecido_normalizado) == normalize_name(payload.gatilho) and normalize_name(item.gatilho_comprovante_normalizado) == normalize_name(payload.gatilho_comprovante) and normalize_name(item.texto_exclusao_normalizado) == normalize_name(payload.texto_exclusao)), None)
     if shared_rule:
         raise HTTPException(409, f"Já existe uma regra deste cliente criada no banco {shared_rule.banco}")
     scope = "global" if payload.escopo == "global" else "periodo"
-    rule = RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco=reconciliation.banco, tipo_fonte="extrato", tipo_operacao=payload.natureza, tipo_componente=payload.tipo_componente.strip().upper(), favorecido_normalizado=normalize_name(payload.gatilho), gatilho_comprovante_normalizado=normalize_name(payload.gatilho_comprovante), conta_debito=payload.conta_debito.strip(), conta_credito=payload.conta_credito.strip(), historico=payload.historico.strip(), complemento=payload.complemento.strip(), escopo=scope)
+    rule = RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco=reconciliation.banco, tipo_fonte="extrato", tipo_operacao=payload.natureza, tipo_componente=payload.tipo_componente.strip().upper(), favorecido_normalizado=normalize_name(payload.gatilho), gatilho_comprovante_normalizado=normalize_name(payload.gatilho_comprovante), texto_exclusao_normalizado=normalize_name(payload.texto_exclusao), conta_debito=payload.conta_debito.strip(), conta_credito=payload.conta_credito.strip(), historico=payload.historico.strip(), complemento=payload.complemento.strip(), escopo=scope)
     if not rule_has_eligible_movement(rule, reconciliation, db):
         raise HTTPException(422, "O gatilho não cobre nenhum lançamento elegível nesta conciliação")
     try:
         db.add(rule); db.flush()
         targets = [item for item in scoped_reconciliations(reconciliation, db) if item.banco == reconciliation.banco] if scope == "global" else [reconciliation]
-        applied = sum(apply_accounting_rules(item, db) for item in targets)
+        for item in targets:
+            apply_accounting_rules(item, db)
+        applied = count_rule_entries_in_reconciliation(rule.id, reconciliation, db)
         db.commit(); db.refresh(rule)
     except Exception:
         db.rollback()
@@ -1154,7 +1188,7 @@ def update_accounting_rule(conciliacao_id: str, regra_id: str, payload: RegraCon
         raise HTTPException(404, "Regra não encontrada")
     if not (payload.gatilho.strip() or payload.gatilho_comprovante.strip()) or not all([payload.conta_debito.strip(), payload.conta_credito.strip(), payload.historico.strip()]):
         raise HTTPException(422, "Preencha ao menos um gatilho, débito, crédito e histórico")
-    candidate_identity = rule_identity(reconciliation.cliente_id, reconciliation.banco, payload.natureza, payload.tipo_componente, payload.gatilho, payload.gatilho_comprovante, payload.conta_debito, payload.conta_credito, payload.historico, payload.complemento)
+    candidate_identity = rule_identity(reconciliation.cliente_id, reconciliation.banco, payload.natureza, payload.tipo_componente, payload.gatilho, payload.gatilho_comprovante, payload.texto_exclusao, payload.conta_debito, payload.conta_credito, payload.historico, payload.complemento)
     if any(item.id != rule.id and saved_rule_identity(item) == candidate_identity for item in scoped_rules(reconciliation, db)):
         raise HTTPException(409, "Já existe uma regra equivalente neste banco")
     try:
@@ -1162,6 +1196,7 @@ def update_accounting_rule(conciliacao_id: str, regra_id: str, payload: RegraCon
         rule.tipo_componente = payload.tipo_componente.strip().upper()
         rule.favorecido_normalizado = normalize_name(payload.gatilho)
         rule.gatilho_comprovante_normalizado = normalize_name(payload.gatilho_comprovante)
+        rule.texto_exclusao_normalizado = normalize_name(payload.texto_exclusao)
         rule.conta_debito = payload.conta_debito.strip()
         rule.conta_credito = payload.conta_credito.strip()
         rule.historico = payload.historico.strip()
@@ -1493,7 +1528,7 @@ def accounting_pdf(conciliacao_id: str, db: Session = Depends(get_db)):
 
 @router.post("/conciliacoes/{conciliacao_id}/arquivos")
 def upload(conciliacao_id: str, tipo_documento: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    if tipo_documento not in {"extrato", "comprovante", "rfb"} or not file.filename.lower().endswith(".pdf"):
+    if tipo_documento not in DOCUMENT_TYPES or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(422, "Envie um PDF com tipo de documento válido")
     reconciliation = db.get(Conciliacao, conciliacao_id)
     if not reconciliation:
@@ -1522,15 +1557,15 @@ def upload(conciliacao_id: str, tipo_documento: str, file: UploadFile = File(...
                 for tax in item.itens:
                     db.add(ComprovanteRfbItem(comprovante_rfb_id=receipt.id, codigo=tax.codigo, descricao=tax.descricao, valor_principal=tax.valor_principal, valor_multa=tax.valor_multa, valor_juros=tax.valor_juros, valor_total=tax.valor_total))
                 continue
-            original_data = {"origem_nome": item.origem_nome} if tipo_documento == "comprovante" else {}
+            original_data = {"origem_nome": item.origem_nome, "tipo_documento": tipo_documento} if tipo_documento in RECEIPT_DOCUMENT_TYPES else {}
             if tipo_documento == "extrato":
                 original_data["ordem_extrato"] = position
                 if getattr(item, "numero_documento", ""):
                     original_data["numero_documento"] = item.numero_documento
-            common = dict(conciliacao_id=conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, texto_original=item.texto_original, dados_originais=original_data, dados_normalizados={"nome": normalize_name(item.favorecido if tipo_documento == "comprovante" else item.nome)})
-            if tipo_documento == "comprovante":
+            common = dict(conciliacao_id=conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, texto_original=item.texto_original, dados_originais=original_data, dados_normalizados={"nome": normalize_name(item.favorecido if tipo_documento in RECEIPT_DOCUMENT_TYPES else item.nome)})
+            if tipo_documento in RECEIPT_DOCUMENT_TYPES:
                 common.update(beneficiario=item.beneficiario or item.favorecido, nome_fantasia=item.nome_fantasia, beneficiario_final=item.beneficiario_final, pagador=item.pagador, cnpj_beneficiario=item.cnpj_beneficiario, cnpj_beneficiario_final=item.cnpj_beneficiario_final, numero_documento=item.numero_documento)
-            db.add(Comprovante(**common, data=item.data, hora=item.hora, favorecido=item.favorecido, valor=item.financeiros.valor_pago, valor_original=item.financeiros.valor_original, valor_desconto=item.financeiros.valor_desconto, valor_abatimento=item.financeiros.valor_abatimento, valor_desconto_abatimento=item.financeiros.valor_desconto_abatimento, valor_juros=item.financeiros.valor_juros, valor_multa=item.financeiros.valor_multa, valor_encargos=item.financeiros.valor_encargos, valor_tarifa=item.financeiros.valor_tarifa, valor_pago=item.financeiros.valor_pago, detalhes_financeiros=item.financeiros.detalhes, status_revisao="revisao" if item.financeiros.composicao_divergente else "valido", tipo_operacao=item.tipo_operacao) if tipo_documento == "comprovante" else MovimentoExtrato(**common, data=item.data, hora=item.hora, historico=item.historico, nome_encontrado=item.nome, valor=item.valor, natureza=item.natureza, data_origem=item.data_origem))
+            db.add(Comprovante(**common, data=item.data, hora=item.hora, favorecido=item.favorecido, valor=item.financeiros.valor_pago, valor_original=item.financeiros.valor_original, valor_desconto=item.financeiros.valor_desconto, valor_abatimento=item.financeiros.valor_abatimento, valor_desconto_abatimento=item.financeiros.valor_desconto_abatimento, valor_juros=item.financeiros.valor_juros, valor_multa=item.financeiros.valor_multa, valor_encargos=item.financeiros.valor_encargos, valor_tarifa=item.financeiros.valor_tarifa, valor_pago=item.financeiros.valor_pago, detalhes_financeiros=item.financeiros.detalhes, status_revisao="revisao" if item.financeiros.composicao_divergente else "valido", tipo_operacao=item.tipo_operacao) if tipo_documento in RECEIPT_DOCUMENT_TYPES else MovimentoExtrato(**common, data=item.data, hora=item.hora, historico=item.historico, nome_encontrado=item.nome, valor=item.valor, natureza=item.natureza, data_origem=item.data_origem))
         if tipo_documento == "extrato" and any(not rule.gatilho_comprovante_normalizado for rule in current_bank_rules(reconciliation, db)):
             apply_accounting_rules(reconciliation, db)
         record.status_processamento = "concluido"
@@ -1597,10 +1632,10 @@ def reset_reconciliation(conciliacao_id: str, db: Session) -> None:
 @router.post("/arquivos/{arquivo_id}/reprocessar")
 def reprocess_document(arquivo_id: str, db: Session = Depends(get_db)):
     record = db.get(Arquivo, arquivo_id)
-    if not record or record.tipo_documento not in {"extrato", "comprovante", "rfb"}:
+    if not record or record.tipo_documento not in DOCUMENT_TYPES:
         raise HTTPException(404, "Documento reprocessável não encontrado")
     reset_reconciliation(record.conciliacao_id, db)
-    model = MovimentoExtrato if record.tipo_documento == "extrato" else Comprovante if record.tipo_documento == "comprovante" else ComprovanteRfb
+    model = MovimentoExtrato if record.tipo_documento == "extrato" else Comprovante if record.tipo_documento in RECEIPT_DOCUMENT_TYPES else ComprovanteRfb
     db.query(model).filter_by(arquivo_id=record.id).delete()
     pages = (record.texto_bruto or "").split("\n\f\n")
     if Path(record.caminho).is_file():
@@ -1636,13 +1671,13 @@ def reprocess_document(arquivo_id: str, db: Session = Depends(get_db)):
             for tax in item.itens:
                 db.add(ComprovanteRfbItem(comprovante_rfb_id=receipt.id, codigo=tax.codigo, descricao=tax.descricao, valor_principal=tax.valor_principal, valor_multa=tax.valor_multa, valor_juros=tax.valor_juros, valor_total=tax.valor_total))
             continue
-        original_data = {"origem_nome": item.origem_nome} if record.tipo_documento == "comprovante" else {}
+        original_data = {"origem_nome": item.origem_nome, "tipo_documento": record.tipo_documento} if record.tipo_documento in RECEIPT_DOCUMENT_TYPES else {}
         if record.tipo_documento == "extrato":
             original_data["ordem_extrato"] = position
             if getattr(item, "numero_documento", ""):
                 original_data["numero_documento"] = item.numero_documento
         common = dict(conciliacao_id=record.conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, texto_original=item.texto_original, dados_originais=original_data, dados_normalizados={"nome": normalize_name(item.nome if record.tipo_documento == "extrato" else item.favorecido)})
-        if record.tipo_documento == "comprovante":
+        if record.tipo_documento in RECEIPT_DOCUMENT_TYPES:
             common.update(beneficiario=item.beneficiario or item.favorecido, nome_fantasia=item.nome_fantasia, beneficiario_final=item.beneficiario_final, pagador=item.pagador, cnpj_beneficiario=item.cnpj_beneficiario, cnpj_beneficiario_final=item.cnpj_beneficiario_final, numero_documento=item.numero_documento)
         db.add(MovimentoExtrato(**common, data=item.data, hora=item.hora, historico=item.historico, nome_encontrado=item.nome, valor=item.valor, natureza=item.natureza, data_origem=item.data_origem) if record.tipo_documento == "extrato" else Comprovante(**common, data=item.data, hora=item.hora, favorecido=item.favorecido, valor=item.financeiros.valor_pago, valor_original=item.financeiros.valor_original, valor_desconto=item.financeiros.valor_desconto, valor_abatimento=item.financeiros.valor_abatimento, valor_desconto_abatimento=item.financeiros.valor_desconto_abatimento, valor_juros=item.financeiros.valor_juros, valor_multa=item.financeiros.valor_multa, valor_encargos=item.financeiros.valor_encargos, valor_tarifa=item.financeiros.valor_tarifa, valor_pago=item.financeiros.valor_pago, detalhes_financeiros=item.financeiros.detalhes, status_revisao="revisao" if item.financeiros.composicao_divergente else "valido", tipo_operacao=item.tipo_operacao))
     reconciliation = db.get(Conciliacao, record.conciliacao_id)
@@ -1874,7 +1909,7 @@ def review(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPI
         return f"R$ {int(integer):,}".replace(",", ".") + f",{decimal}"
 
     def adjustments(item):
-        fields = (("Desconto", item.valor_desconto), ("Abatimento", item.valor_abatimento), ("Desconto/abatimento", item.valor_desconto_abatimento), ("Juros", item.valor_juros), ("Multa", item.valor_multa), ("Encargos", item.valor_encargos))
+        fields = (("Desconto", item.valor_desconto), ("Abatimento", item.valor_abatimento), ("Desconto/abatimento", item.valor_desconto_abatimento), ("Taxa/tarifa", item.valor_tarifa), ("Juros", item.valor_juros), ("Multa", item.valor_multa), ("Encargos", item.valor_encargos))
         values = [f"{label}: {money(value)}" for label, value in fields if value is not None and value > 0]
         suffix = " Composição de valor divergente." if item.status_revisao == "revisao" else ""
         return (" + ".join(values) if values else "Sem ajustes") + suffix

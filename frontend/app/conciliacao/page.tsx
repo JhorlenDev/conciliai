@@ -61,6 +61,7 @@ type Review = {
   extratos: Row[];
   comprovantes: Row[];
   rfb: Row[];
+  ajustes_getnet?: GetnetAdjustment[];
   arquivos: {
     id: string;
     nome: string;
@@ -68,6 +69,22 @@ type Review = {
     status: string;
     erro: string | null;
   }[];
+};
+type GetnetAdjustment = {
+  competencia: string;
+  competencia_label: string;
+  total_getnet: string;
+  total_santander: string;
+  diferenca: string;
+  situacao: string;
+  lancamento?: {
+    id: string;
+    data: string;
+    historico: string;
+    complemento: string;
+    valor: string;
+    origem: string;
+  } | null;
 };
 type Unused = {
   comprovantes: Row[];
@@ -97,6 +114,11 @@ function documentTypeLabel(type: string | null | undefined) {
 function visibleBank(value: string | null | undefined) {
   if (value === "Vendas com Cartão" || value === "Comissões Getnet") return "Santander";
   return value && banks.includes(value) ? value : banks[0];
+}
+
+function formatMoney(value: string | number | null | undefined) {
+  const numeric = Number(value ?? 0);
+  return numeric.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
 }
 
 function PdfModal({
@@ -3167,6 +3189,7 @@ function ConciliacaoFlow({
   const getnetFiles = review.arquivos.filter((file) => isGetnetDocumentType(file.tipo));
   const getnetFileIds = new Set(getnetFiles.map((file) => file.id));
   const getnetReceipts = review.comprovantes.filter((row) => getnetFileIds.has(String(row.arquivo_id || "")));
+  const getnetAdjustments = review.ajustes_getnet ?? [];
   const bankReceipts = isSantander ? review.comprovantes.filter((row) => !getnetFileIds.has(String(row.arquivo_id || ""))) : review.comprovantes;
   const navigationTabs = [
     "Início",
@@ -3434,6 +3457,66 @@ function ConciliacaoFlow({
                     </li>
                   ))}
                 </ul>
+              )}
+            </section>
+            <section className="rounded-xl border border-red-200 bg-white p-5">
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="font-semibold">Juros sobre antecipações — Getnet</h2>
+                  <p className="text-sm text-slate-500">Conferência pelo valor líquido Getnet contra os créditos Getnet no Santander.</p>
+                </div>
+                <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
+                  {getnetAdjustments.length} competência(s)
+                </span>
+              </div>
+              {getnetAdjustments.length ? (
+                <div className="grid gap-3 lg:grid-cols-2">
+                  {getnetAdjustments.map((adjustment) => {
+                    const generated = Boolean(adjustment.lancamento);
+                    const statusClass =
+                      adjustment.situacao === "Ajuste gerado"
+                        ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                        : adjustment.situacao === "Divergência para revisão"
+                          ? "border-amber-200 bg-amber-50 text-amber-800"
+                          : adjustment.situacao === "Dados insuficientes"
+                            ? "border-slate-200 bg-slate-50 text-slate-600"
+                            : "border-sky-200 bg-sky-50 text-sky-800";
+                    return (
+                      <article className="rounded-lg border border-slate-200 p-3" key={adjustment.competencia}>
+                        <div className="mb-3 flex items-center justify-between gap-2">
+                          <strong>{adjustment.competencia_label}</strong>
+                          <span className={`rounded-full border px-2 py-1 text-[11px] font-semibold ${statusClass}`}>
+                            {adjustment.situacao}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-3 gap-2 text-xs">
+                          <div>
+                            <span className="block text-slate-500">Getnet líquido</span>
+                            <strong>{formatMoney(adjustment.total_getnet)}</strong>
+                          </div>
+                          <div>
+                            <span className="block text-slate-500">Santander</span>
+                            <strong>{formatMoney(adjustment.total_santander)}</strong>
+                          </div>
+                          <div>
+                            <span className="block text-slate-500">Diferença</span>
+                            <strong>{formatMoney(adjustment.diferenca)}</strong>
+                          </div>
+                        </div>
+                        {generated && adjustment.lancamento && (
+                          <div className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 p-2 text-xs text-emerald-900">
+                            <div className="font-semibold">{adjustment.lancamento.data} · {adjustment.lancamento.historico}</div>
+                            <div>{formatMoney(adjustment.lancamento.valor)} · {adjustment.lancamento.complemento}</div>
+                          </div>
+                        )}
+                      </article>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="rounded-lg border border-dashed border-slate-200 px-3 py-6 text-center text-sm text-slate-500">
+                  Nenhuma competência Getnet disponível.
+                </div>
               )}
             </section>
             <Table

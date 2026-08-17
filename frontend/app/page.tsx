@@ -269,30 +269,30 @@ export default function EntryPage() {
               </button>
             </div>
           </div>
-           <div className="grid gap-2 md:grid-cols-2">
+           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
              {orderedProcesses.map((process) => (
-                <article className="flex min-w-0 items-center rounded-lg border bg-white shadow-sm transition hover:border-emerald-700 hover:shadow-md" key={process.id}>
-                  <button type="button" onClick={() => open(process)} className="flex min-w-0 flex-1 items-center justify-between p-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700 focus-visible:ring-inset">
-                   <div>
-                     <h3 className="text-sm font-semibold">{process.cliente_nome}</h3>
-                     <p className="mt-0.5 text-xs font-medium text-emerald-800">{month(process.data_inicio)}</p>
-                     <p className="text-xs text-slate-500">
+                <article className="flex min-w-0 items-stretch rounded-md border bg-white shadow-sm transition hover:border-emerald-700 hover:shadow-md" key={process.id}>
+                  <button type="button" onClick={() => open(process)} className="flex min-w-0 flex-1 items-center justify-between gap-2 p-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700 focus-visible:ring-inset">
+                   <div className="min-w-0">
+                     <h3 className="truncate text-xs font-semibold text-slate-800" title={process.cliente_nome}>{process.cliente_nome}</h3>
+                     <p className="mt-0.5 truncate text-[11px] font-semibold text-emerald-800">{month(process.data_inicio)}</p>
+                     <p className="text-[11px] text-slate-500">
                        {date(process.data_inicio)} - {date(process.data_fim)}
                      </p>
-                     <p className="mt-0.5 text-[10px] text-slate-400">Criado em: {dateTime(process.criado_em)}</p>
+                     <p className="mt-0.5 truncate text-[10px] text-slate-400">Criado: {dateTime(process.criado_em)}</p>
                    </div>
-                   <ArrowRight size={16} className="shrink-0 text-emerald-800" aria-hidden="true" />
+                   <ArrowRight size={14} className="shrink-0 text-emerald-800" aria-hidden="true" />
                    </button>
-                  <button type="button" onClick={() => setProcessToDelete(process)} aria-label={`Excluir processo de ${process.cliente_nome}`} title="Excluir processo" className="mr-2 rounded-md p-1.5 text-slate-500 hover:bg-red-50 hover:text-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600"><Trash2 size={15}/></button>
+                  <button type="button" onClick={() => setProcessToDelete(process)} aria-label={`Excluir processo de ${process.cliente_nome}`} title="Excluir processo" className="mr-1.5 self-center rounded-md p-1.5 text-slate-500 hover:bg-red-50 hover:text-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600"><Trash2 size={14}/></button>
                 </article>
             ))}
             {!processes.length && (
-              <div className="rounded-xl border border-dashed bg-white p-10 text-center text-sm text-slate-500">
+              <div className="col-span-full rounded-xl border border-dashed bg-white p-10 text-center text-sm text-slate-500">
                 Nenhum processo ainda. Crie a primeira conciliação.
               </div>
             )}
             {!!processes.length && !orderedProcesses.length && (
-              <div className="rounded-xl border border-dashed bg-white p-10 text-center text-sm text-slate-500">
+              <div className="col-span-full rounded-xl border border-dashed bg-white p-10 text-center text-sm text-slate-500">
                 Nenhum processo encontrado para os filtros selecionados.
               </div>
             )}

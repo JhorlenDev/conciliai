@@ -26,6 +26,7 @@ from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, Comprovant
 from app.services.normalization import accounting_nature, is_statement_debit, normalize_name, normalize_rule_accounting_nature, normalize_statement_nature
 from app.services.matching import names_similar
 from app.services.parsers import deduplicate_statement_records, extract_basa_pdfplumber_pages, extract_getnet_pdfplumber_pages, extract_receipts, extract_santander_pdfplumber_statement, extract_statement_pages
+from app.services.getnet_adjustments import GETNET_ADJUSTMENT_STATUS, sync_getnet_anticipation_adjustments
 from app.services.rfb import belongs_to_selected_bank, extract_competence, parse_rfb_page
 from app.services.rule_source import choose_rule_source
 
@@ -63,6 +64,9 @@ def delete_file(arquivo_id: str, db: Session = Depends(get_db)):
         db.query(ComprovanteRfb).filter_by(arquivo_id=record.id).delete()
     Path(record.caminho).unlink(missing_ok=True)
     db.delete(record)
+    reconciliation = db.get(Conciliacao, record.conciliacao_id)
+    if reconciliation:
+        sync_getnet_anticipation_adjustments(reconciliation, db)
     db.commit()
 
 
@@ -774,7 +778,7 @@ def rule_period_exception(rule_id: str, reconciliation: Conciliacao, db: Session
 
 
 def complete_accounting_entry(entry: LancamentoContabil) -> bool:
-    return bool(entry.status in {"aplicado_por_regra", "editado_manual"} and entry.valor and entry.valor > 0 and entry.conta_debito.strip() and entry.conta_credito.strip() and entry.historico.strip())
+    return bool(entry.status in {"aplicado_por_regra", "editado_manual", GETNET_ADJUSTMENT_STATUS} and entry.valor and entry.valor > 0 and entry.conta_debito.strip() and entry.conta_credito.strip() and entry.historico.strip())
 
 
 def count_rule_entries_in_reconciliation(rule_id: str, reconciliation: Conciliacao, db: Session) -> int:
@@ -818,7 +822,7 @@ def statement_effect_value(value: Decimal, effect: str) -> Decimal:
 
 
 def active_accounting_entry(entry: LancamentoContabil, active_rule_ids: set[str]) -> bool:
-    return entry.status == "editado_manual" or entry.regra_contabil_id in active_rule_ids
+    return entry.status == "editado_manual" or entry.status == GETNET_ADJUSTMENT_STATUS or entry.regra_contabil_id in active_rule_ids
 
 
 def accounting_integrity(reconciliation: Conciliacao, db: Session) -> dict:
@@ -957,7 +961,7 @@ def save_bank_account(conciliacao_id: str, payload: ContaBancariaInput, db: Sess
 
 
 @router.get("/conciliacoes/{conciliacao_id}/regras-contabeis")
-def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPIResponse = None):
+def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPIResponse = None, auto_hide_zero_covered: bool = True):
     reconciliation = reconciliation_or_404(conciliacao_id, db)
     movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True) if in_reconciliation_period(reconciliation, item)]
     movements.sort(key=movement_statement_order)
@@ -1039,6 +1043,15 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
         entry_order = min((accounting_entry_order(entry) for _, entry in covered_by_rule[item["id"]]), default=(10**9, 10**9, ""))
         return ((item.get("criada_em") or "")[:19], -entry_order[0], -entry_order[1])
     saved_payloads.sort(key=saved_rule_order, reverse=True)
+    if auto_hide_zero_covered:
+        zero_rule_ids = [item["id"] for item in saved_payloads if item["cobertos"] == 0]
+        if zero_rule_ids:
+            for rule_id in zero_rule_ids:
+                if not db.query(RegraContabilExcecao).filter_by(regra_contabil_id=rule_id, conciliacao_id=reconciliation.id).first():
+                    db.add(RegraContabilExcecao(regra_contabil_id=rule_id, conciliacao_id=reconciliation.id))
+            release_rule_entries(zero_rule_ids, db, reconciliation.id)
+            db.commit()
+            saved_payloads = [item for item in saved_payloads if item["id"] not in zero_rule_ids]
     exceptions = db.query(RegraContabilExcecao).filter_by(conciliacao_id=reconciliation.id).all()
     exception_rule_ids = [item.regra_contabil_id for item in exceptions]
     rules_by_id = {item.id: item for item in db.query(RegraContabil).filter(RegraContabil.id.in_(exception_rule_ids)).all()} if exception_rule_ids else {}
@@ -1295,7 +1308,7 @@ def delete_zero_covered_accounting_rules(conciliacao_id: str, db: Session = Depe
     try:
         zero_rule_ids = [
             item["id"]
-            for item in accounting_rules(conciliacao_id, db)["salvas"]
+            for item in accounting_rules(conciliacao_id, db, auto_hide_zero_covered=False)["salvas"]
             if item["cobertos"] == 0
         ]
         for rule_id in zero_rule_ids:
@@ -1384,6 +1397,8 @@ def delete_all_accounting_rules(conciliacao_id: str, db: Session = Depends(get_d
 
 def accounting_csv_response(conciliacao_id: str, db: Session):
     reconciliation = reconciliation_or_404(conciliacao_id, db)
+    sync_getnet_anticipation_adjustments(reconciliation, db)
+    db.commit()
     account = db.query(ContaBancaria).filter_by(cliente_id=reconciliation.cliente_id, banco=reconciliation.banco).first()
     if not account or not account.conta_contabil.strip():
         raise HTTPException(422, "Informe a conta deste banco no plano de contas antes de gerar o CSV")
@@ -1433,6 +1448,8 @@ def accounting_csv(conciliacao_id: str, db: Session = Depends(get_db)):
 @router.get("/conciliacoes/{conciliacao_id}/lancamentos-contabeis.pdf")
 def accounting_pdf(conciliacao_id: str, db: Session = Depends(get_db)):
     reconciliation = reconciliation_or_404(conciliacao_id, db)
+    sync_getnet_anticipation_adjustments(reconciliation, db)
+    db.commit()
     integrity = accounting_integrity(reconciliation, db)
     if abs(integrity["diferenca"]) > Decimal("0.01"):
         raise HTTPException(422, f"Não foi possível gerar o PDF. O Razão possui uma diferença de R$ {abs(integrity['diferenca']):.2f}.")
@@ -1568,6 +1585,7 @@ def upload(conciliacao_id: str, tipo_documento: str, file: UploadFile = File(...
             db.add(Comprovante(**common, data=item.data, hora=item.hora, favorecido=item.favorecido, valor=item.financeiros.valor_pago, valor_original=item.financeiros.valor_original, valor_desconto=item.financeiros.valor_desconto, valor_abatimento=item.financeiros.valor_abatimento, valor_desconto_abatimento=item.financeiros.valor_desconto_abatimento, valor_juros=item.financeiros.valor_juros, valor_multa=item.financeiros.valor_multa, valor_encargos=item.financeiros.valor_encargos, valor_tarifa=item.financeiros.valor_tarifa, valor_pago=item.financeiros.valor_pago, detalhes_financeiros=item.financeiros.detalhes, status_revisao="revisao" if item.financeiros.composicao_divergente else "valido", tipo_operacao=item.tipo_operacao) if tipo_documento in RECEIPT_DOCUMENT_TYPES else MovimentoExtrato(**common, data=item.data, hora=item.hora, historico=item.historico, nome_encontrado=item.nome, valor=item.valor, natureza=item.natureza, data_origem=item.data_origem))
         if tipo_documento == "extrato" and any(not rule.gatilho_comprovante_normalizado for rule in current_bank_rules(reconciliation, db)):
             apply_accounting_rules(reconciliation, db)
+        sync_getnet_anticipation_adjustments(reconciliation, db)
         record.status_processamento = "concluido"
     except Exception as error:
         record.status_processamento = "erro"; record.mensagem_erro = str(error)
@@ -1683,6 +1701,8 @@ def reprocess_document(arquivo_id: str, db: Session = Depends(get_db)):
     reconciliation = db.get(Conciliacao, record.conciliacao_id)
     if record.tipo_documento == "extrato" and reconciliation and any(not rule.gatilho_comprovante_normalizado for rule in current_bank_rules(reconciliation, db)):
         apply_accounting_rules(reconciliation, db)
+    if reconciliation:
+        sync_getnet_anticipation_adjustments(reconciliation, db)
     record.status_processamento = "concluido"
     record.mensagem_erro = None
     db.commit()
@@ -1733,6 +1753,7 @@ def reconcile(conciliacao_id: str, db: Session = Depends(get_db)):
         if receipt and not tariff: used_receipts.add(receipt.id)
         if rfb: used_rfb.add(rfb.id)
     apply_accounting_rules(reconciliation, db)
+    sync_getnet_anticipation_adjustments(reconciliation, db)
     reconciliation.status = "concluido"
     if reconciliation.processo_id:
         process = db.get(ProcessoConciliacao, reconciliation.processo_id)
@@ -1921,6 +1942,8 @@ def review(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPI
         return f"Beneficiário: {beneficiary}"
 
     reconciliation = db.get(Conciliacao, conciliacao_id)
+    getnet_adjustments = sync_getnet_anticipation_adjustments(reconciliation, db) if reconciliation else []
+    db.commit()
     rfb_records = [item for item in db.query(ComprovanteRfb).filter_by(conciliacao_id=conciliacao_id).order_by(ComprovanteRfb.data_arrecadacao.asc(), ComprovanteRfb.id.asc()) if reconciliation and belongs_to_selected_bank(item, reconciliation.banco)]
 
     statement_records = db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True).all()
@@ -1931,4 +1954,5 @@ def review(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPI
         "comprovantes": [base(x, {"data": display_date(x.data), "hora": x.hora, "documento": x.numero_documento, "favorecido": receipt_counterparty(x), "valor_original": money(x.valor_original), "ajustes": adjustments(x), "valor_pago": money(x.valor_pago), "tipo": x.tipo_operacao}) for x in db.query(Comprovante).filter_by(conciliacao_id=conciliacao_id, ativo=True).order_by(Comprovante.data.asc(), Comprovante.hora.asc().nulls_last(), Comprovante.id.asc())],
         "rfb": [base(x, {"tipo": x.tipo, "competencia_apuracao": x.competencia or x.periodo_apuracao or "—", "data_arrecadacao": display_date(x.data_arrecadacao), "documento": x.numero_documento, "banco": x.nome_banco, "principal": money(x.valor_principal), "multa_juros": "Sem acréscimos" if not ((x.valor_multa or 0) + (x.valor_juros or 0)) else f"Multa: {money(x.valor_multa)} + Juros: {money(x.valor_juros)}", "total": money(x.valor_total), "situacao": x.status}) for x in rfb_records],
         "arquivos": [{"id": x.id, "nome": x.nome_original, "tipo": x.tipo_documento, "status": x.status_processamento, "erro": x.mensagem_erro} for x in db.query(Arquivo).filter_by(conciliacao_id=conciliacao_id, ativo=True)],
+        "ajustes_getnet": getnet_adjustments,
     }

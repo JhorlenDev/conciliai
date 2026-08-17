@@ -473,8 +473,8 @@ def test_persisted_covered_entry_does_not_return_zero_eligible_suggestion():
     data = accounting_rules(reconciliation.id, session)
 
     assert len(data["pendentes"]) == 1
-    assert len(data["salvas"]) == 1
-    assert data["salvas"][0]["cobertos"] == 0
+    assert data["salvas"] == []
+    assert data["ignoradas"][0]["id"] == legacy_rule.id
     assert data["integridade"]["movimentos_incompletos"][0]["movimento_id"] == movement.id
 
 
@@ -788,11 +788,12 @@ def test_clearing_zero_covered_rules_hides_only_current_period_and_keeps_global_
     created = create_accounting_rule(january.id, rule_input("PIX", scope="global"), session)
 
     before = accounting_rules(february.id, session)
-    assert before["salvas"][0]["cobertos"] == 0
+    assert before["salvas"] == []
+    assert before["ignoradas"][0]["id"] == created["id"]
 
     response = delete_zero_covered_accounting_rules(february.id, session)
 
-    assert response["quantidade"] == 1
+    assert response["quantidade"] == 0
     assert response["regras"]["salvas"] == []
     assert session.get(RegraContabil, created["id"]).ativo is True
     assert session.query(RegraContabilExcecao).filter_by(regra_contabil_id=created["id"], conciliacao_id=february.id).count() == 1

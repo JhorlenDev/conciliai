@@ -3298,17 +3298,27 @@ function ConciliacaoFlow({
               </div>
             </section>
             {reconciliationId && (
-              <section className="my-6 grid gap-4 md:grid-cols-3">
+              <section className="my-6 grid gap-4 md:grid-cols-3 xl:grid-cols-5">
                 {[
                   ["extrato", "Extrato bancário", false],
                   ["comprovante", "Comprovantes bancários", true],
                   ["rfb", "Comprovantes da Receita Federal", true],
+                  ...(isSantander
+                    ? [
+                        ["getnet_vendas", "Getnet - Vendas", true],
+                        ["getnet_comissoes", "Getnet - Comissões", true],
+                      ]
+                    : []),
                 ].map(([type, label, multiple]) => (
                   <label
-                    className="cursor-pointer rounded-xl border-2 border-dashed border-slate-300 bg-white p-5 text-center hover:border-teal-600"
+                    className={`cursor-pointer rounded-xl border-2 border-dashed bg-white p-5 text-center ${
+                      isGetnetDocumentType(String(type))
+                        ? "border-red-200 hover:border-red-700"
+                        : "border-slate-300 hover:border-teal-600"
+                    }`}
                     key={String(type)}
                   >
-                    <Upload className="mx-auto mb-2 text-teal-700" />
+                    <Upload className={`mx-auto mb-2 ${isGetnetDocumentType(String(type)) ? "text-red-700" : "text-teal-700"}`} />
                     <strong className="block">{String(label)}</strong>
                     <input
                       className="hidden"

@@ -29,7 +29,7 @@ def test_getnet_is_hidden_from_new_bank_list_but_legacy_processes_still_work():
     assert legacy["processo_id"] == process["id"]
 
 
-def test_process_resumes_the_same_bank_and_exposes_shared_rule_source():
+def test_process_resumes_the_same_bank_without_cross_bank_rule_source():
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine)()
@@ -48,9 +48,7 @@ def test_process_resumes_the_same_bank_and_exposes_shared_rule_source():
     session.commit()
 
     rules = accounting_rules(bradesco["id"], session)
-    source = rules["pendentes"][0]["regra_compartilhada"]
-    assert source["banco_origem"] == "Santander"
-    assert source["gatilho"] == normalize_name("PIX")
+    assert rules["pendentes"][0].get("regra_compartilhada") is None
     assert rules["salvas"] == []
 
 

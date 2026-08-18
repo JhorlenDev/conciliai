@@ -460,11 +460,9 @@ type PendingRule = {
   comprovante_rfb_arquivo_id?: string | null;
   comprovante_rfb_pagina?: number | null;
   comprovante_confere?: boolean;
-  regra_compartilhada?: {
-    id: string;
-    banco_origem: string;
-    gatilho: string;
-  } | null;
+  ajuste_getnet?: boolean;
+  gatilho_sugerido?: string;
+  complemento_sugerido?: string;
 };
 type SavedRule = {
   id: string;
@@ -970,13 +968,13 @@ function AdvancedRulesPanel({
           complemento: item.complemento,
         }
       : {
-           gatilho: "",
+           gatilho: item.gatilho_sugerido || "",
            gatilhoComprovante: "",
           textoExclusao: "",
           debito: item.natureza_contabil === "Débito" ? account : "",
           credito: item.natureza_contabil === "Crédito" ? account : "",
-          historico: "",
-          complemento: "Conforme extrato bancário",
+          historico: item.ajuste_getnet ? item.historico : "",
+          complemento: item.complemento_sugerido || "Conforme extrato bancário",
         };
   async function saveAccount() {
     const response = await fetch(
@@ -1192,6 +1190,7 @@ function AdvancedRulesPanel({
       ABATIMENTO: "Abatimento",
       JUROS: "Juros",
       MULTA: "Multa",
+      JUROS_ANTECIPACAO_GETNET: "Getnet",
     } as Record<string, string>)[component.toUpperCase()] ?? "";
   }
   function keywordHasPart(keyword: string, part: string) {
@@ -1354,6 +1353,7 @@ function AdvancedRulesPanel({
       MULTA: "Multa",
       ENCARGOS: "Encargos",
       SIMPLES_NACIONAL: "Simples Nacional",
+      JUROS_ANTECIPACAO_GETNET: "Juros antecipação Getnet",
     })[component] ?? component;
   function editor(
     item: PendingRule | SavedRule,
@@ -1393,9 +1393,10 @@ function AdvancedRulesPanel({
           : "Não cobre lançamentos elegíveis"
         : "Clique em Ver cobertura para calcular";
     const coverageClass = coveredCount ? "" : preview || existing ? "text-red-700" : "text-slate-500";
+    const isGetnetAdjustment = Boolean(pendingItem?.ajuste_getnet || item.tipo_componente === "JUROS_ANTECIPACAO_GETNET");
     return (
       <tr
-        className={`border-t align-top ${composite ? "border-x-2 border-x-sky-200 bg-sky-50/50" : ""} ${isRecent ? "bg-teal-50" : compact ? "bg-inherit" : simple ? "border-y border-l-4 border-emerald-200 border-l-emerald-300 bg-emerald-50/70" : ""}`}
+        className={`border-t align-top ${isGetnetAdjustment && !compact ? "border-l-4 border-l-rose-500 bg-rose-50/70" : ""} ${composite ? "border-x-2 border-x-sky-200 bg-sky-50/50" : ""} ${isRecent ? "bg-teal-50" : compact ? "bg-inherit" : simple ? "border-y border-l-4 border-emerald-200 border-l-emerald-300 bg-emerald-50/70" : ""}`}
         key={item.id}
       >
         {compact && pendingItem ? (
@@ -1422,13 +1423,6 @@ function AdvancedRulesPanel({
               {pendingItem?.tarifa_no_extrato && <p className="mt-1 text-[10px] text-sky-700">Tarifa do comprovante está presente no extrato.</p>}
               {pendingItem?.tarifa_referente_ao_comprovante && <p className="mt-1 text-[10px] text-slate-500">Esta tarifa é referente ao comprovante de {pendingItem.tarifa_referencia_nome}, R$ {Number(pendingItem.tarifa_referencia_valor || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2 })} em {pendingItem.tarifa_referencia_data}.</p>}
               {pendingItem?.composicao_simples && <p className="mt-1 whitespace-pre-line text-[10px] text-slate-500">{pendingItem.composicao_simples}</p>}
-              {pendingItem?.regra_compartilhada && (
-                <p className="mt-1 text-[10px] font-medium text-amber-800">
-                  Regra compartilhada: {pendingItem.regra_compartilhada.gatilho}{" "}
-                  (origem: {pendingItem.regra_compartilhada.banco_origem}). Não
-                  crie uma duplicada.
-                </p>
-              )}
               {(pendingItem?.comprovante_arquivo_id || pendingItem?.comprovante_rfb_arquivo_id) && (
                 <div className="mt-1 flex items-center gap-1 text-[10px] text-emerald-700">
                   {pendingItem.comprovante_arquivo_id && <button
@@ -1456,8 +1450,13 @@ function AdvancedRulesPanel({
                   {isDebit ? "Débito" : "Crédito"}
                 </span>
                 {item.tipo_componente && !simple && (
-                  <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700">
+                  <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${isGetnetAdjustment ? "bg-rose-100 text-rose-800" : "bg-slate-100 text-slate-700"}`}>
                     {componentLabel(item.tipo_componente)}
+                  </span>
+                )}
+                {isGetnetAdjustment && !existing && (
+                  <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800">
+                    Ajuste Getnet
                   </span>
                 )}
                 {existing && "gatilho" in item && <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${item.escopo === "periodo" ? "bg-violet-100 text-violet-800" : "bg-amber-100 text-amber-800"}`}>{item.escopo === "periodo" ? "Este período" : "Global"}</span>}
@@ -1675,15 +1674,11 @@ function AdvancedRulesPanel({
           />
         </td>
         {showAction && <td className={`${existing ? "w-[6%]" : "w-px"} whitespace-nowrap px-2 py-1`}>
-          {!pendingItem?.regra_compartilhada && (
-            <>
-              {!existing && <button title="Ver cobertura" aria-label="Ver cobertura" disabled={busyRuleId === item.id} onClick={() => previewRule(item)} className="inline-flex h-7 w-7 items-center justify-center rounded border border-teal-700 text-teal-800 hover:bg-teal-50 disabled:cursor-wait disabled:opacity-60">{busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : <Gauge size={14} />}</button>}
-              {canSave && <button title={existing ? "Atualizar regra" : "Salvar regra"} aria-label={existing ? "Atualizar regra" : "Salvar regra"} disabled={busyRuleId === item.id} onClick={() => saveRule(item, existing)} className="ml-1 inline-flex h-7 w-7 items-center justify-center rounded bg-teal-700 text-white disabled:cursor-wait disabled:opacity-60">
-                {busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : existing ? <RefreshCw size={14} /> : <CheckCircle2 size={14} />}
-              </button>}
-              {existing && <button title="Excluir regra" aria-label="Excluir regra" disabled={busyRuleId === item.id} onClick={() => setDeleteTarget(item as SavedRule)} className="ml-1 rounded border border-red-200 px-2 py-1 text-red-700 disabled:cursor-wait disabled:opacity-60">{busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : <Trash2 size={14} />}</button>}
-            </>
-          )}
+          {!existing && <button title="Ver cobertura" aria-label="Ver cobertura" disabled={busyRuleId === item.id} onClick={() => previewRule(item)} className="inline-flex h-7 w-7 items-center justify-center rounded border border-teal-700 text-teal-800 hover:bg-teal-50 disabled:cursor-wait disabled:opacity-60">{busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : <Gauge size={14} />}</button>}
+          {canSave && <button title={existing ? "Atualizar regra" : "Salvar regra"} aria-label={existing ? "Atualizar regra" : "Salvar regra"} disabled={busyRuleId === item.id} onClick={() => saveRule(item, existing)} className="ml-1 inline-flex h-7 w-7 items-center justify-center rounded bg-teal-700 text-white disabled:cursor-wait disabled:opacity-60">
+            {busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : existing ? <RefreshCw size={14} /> : <CheckCircle2 size={14} />}
+          </button>}
+          {existing && <button title="Excluir regra" aria-label="Excluir regra" disabled={busyRuleId === item.id} onClick={() => setDeleteTarget(item as SavedRule)} className="ml-1 rounded border border-red-200 px-2 py-1 text-red-700 disabled:cursor-wait disabled:opacity-60">{busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : <Trash2 size={14} />}</button>}
         </td>}
       </tr>
     );
@@ -3484,8 +3479,10 @@ function ConciliacaoFlow({
                   {getnetAdjustments.map((adjustment) => {
                     const generated = Boolean(adjustment.lancamento);
                     const statusClass =
-                      adjustment.situacao === "Ajuste gerado"
+                      adjustment.situacao === "Ajuste lançado"
                         ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                        : adjustment.situacao === "Pendente em regras"
+                          ? "border-rose-200 bg-rose-50 text-rose-800"
                         : adjustment.situacao === "Divergência para revisão"
                           ? "border-amber-200 bg-amber-50 text-amber-800"
                           : adjustment.situacao === "Dados insuficientes"

@@ -4,7 +4,7 @@ from decimal import Decimal
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.api.routes import accounting_csv, accounting_integrity
+from app.api.routes import RegraContabilInput, accounting_csv, accounting_integrity, accounting_rules, create_accounting_rule
 from app.core.database import Base
 from app.models import Arquivo, Cliente, Comprovante, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato
 from app.services.getnet_adjustments import GETNET_ADJUSTMENT_ORIGIN, GETNET_ADJUSTMENT_STATUS, sync_getnet_anticipation_adjustments
@@ -59,17 +59,28 @@ def test_getnet_net_greater_than_santander_generates_anticipation_expense_and_cs
     summary = sync_getnet_anticipation_adjustments(reconciliation, session)
     session.commit()
 
-    assert summary[0]["situacao"] == "Ajuste gerado"
+    assert summary[0]["situacao"] == "Pendente em regras"
     assert summary[0]["total_getnet"] == "1100.00"
     assert summary[0]["total_santander"] == "1000.00"
     assert summary[0]["diferenca"] == "100.00"
     entry = generated_entries(session)[0]
-    assert (entry.valor, entry.status, entry.conta_credito) == (Decimal("100.00"), GETNET_ADJUSTMENT_STATUS, "219 - Banco Santander")
+    assert (entry.valor, entry.status, entry.conta_debito, entry.conta_credito) == (Decimal("100.00"), GETNET_ADJUSTMENT_STATUS, "", "219 - Banco Santander")
     movement = movement_for_entry(session, entry)
     assert (movement.data, movement.ativo) == (date(2024, 1, 31), False)
-    assert accounting_integrity(reconciliation, session)["csv_permitido"] is True
+
+    rules = accounting_rules(reconciliation.id, session)
+    pending = next(item for item in rules["pendentes"] if item["ajuste_getnet"])
+    assert pending["gatilho_sugerido"] == "JUROS ANTECIPACOES GETNET"
+    assert pending["natureza_contabil"] == "Crédito"
+    assert "Getnet líquido: R$ 1.100,00" in pending["composicao_simples"]
+
+    created = create_accounting_rule(reconciliation.id, RegraContabilInput(gatilho="JUROS ANTECIPACOES GETNET", natureza="Crédito", tipo_componente="JUROS_ANTECIPACAO_GETNET", conta_debito="Juros sobre antecipações", conta_credito="Banco Santander", historico="Juros Getnet", complemento="Diferença Getnet x Santander"), session)
+    assert created["movimentos_aplicados"] == 1
+    integrity = accounting_integrity(reconciliation, session)
+    assert (integrity["outros_debito"], integrity["outros_credito"], integrity["outros"]) == (Decimal("100.00"), Decimal("100.00"), Decimal("0.00"))
+    assert sync_getnet_anticipation_adjustments(reconciliation, session)[0]["situacao"] == "Ajuste lançado"
     csv = accounting_csv(reconciliation.id, session).body.decode("utf-8-sig")
-    assert "JUROS SOBRE ANTECIPAÇÕES GETNET;100.00;DIFERENÇA ENTRE GETNET E RECEBIMENTOS NO SANTANDER" in csv
+    assert "Juros Getnet;100.00;DIFERENÇA ENTRE GETNET E RECEBIMENTOS NO SANTANDER" in csv
 
 
 def test_equal_values_do_not_generate_adjustment():
@@ -142,8 +153,8 @@ def test_multiple_months_and_leap_february_use_real_month_end():
     entries = generated_entries(session)
 
     assert [(item["competencia"], item["diferenca"], item["situacao"]) for item in summary] == [
-        ("2024-01", "100.00", "Ajuste gerado"),
-        ("2024-02", "200.00", "Ajuste gerado"),
+        ("2024-01", "100.00", "Pendente em regras"),
+        ("2024-02", "200.00", "Pendente em regras"),
     ]
     assert sorted((movement_for_entry(session, entry).data for entry in entries)) == [date(2024, 1, 31), date(2024, 2, 29)]
     assert sorted(item["lancamento"]["data"] for item in summary) == ["29/02/2024", "31/01/2024"]

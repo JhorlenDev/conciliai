@@ -15,7 +15,7 @@ GETNET_ADJUSTMENT_ORIGIN = "ajuste_getnet"
 GETNET_ADJUSTMENT_DESCRIPTION = "JUROS SOBRE ANTECIPAÇÕES GETNET"
 GETNET_ADJUSTMENT_COMPLEMENT = "DIFERENÇA ENTRE GETNET E RECEBIMENTOS NO SANTANDER"
 GETNET_ADJUSTMENT_COMPONENT = "JUROS_ANTECIPACAO_GETNET"
-GETNET_ADJUSTMENT_STATUS = "ajuste_automatico"
+GETNET_ADJUSTMENT_STATUS = "pendente_regra"
 
 
 def money(value: Decimal | int | None) -> Decimal:
@@ -54,12 +54,15 @@ def is_santander_getnet_credit(movement: MovimentoExtrato) -> bool:
     return "ANTECIPACAO GETNET" in text or ("PAGAMENTO CARTAO DEBITO" in text and "GETNET" in text)
 
 
-def adjustment_marker(competence_key: str) -> dict:
+def adjustment_marker(competence_key: str, total_getnet: str = "", total_santander: str = "", difference: str = "") -> dict:
     return {
         "origem": GETNET_ADJUSTMENT_ORIGIN,
         "competencia": competence_key,
         "banco": "Santander",
         "fonte": "Getnet",
+        "total_getnet": total_getnet,
+        "total_santander": total_santander,
+        "diferenca": difference,
     }
 
 
@@ -117,7 +120,7 @@ def calculate_getnet_anticipation_adjustments(reconciliation: Conciliacao, db: S
         if not has_getnet or not has_santander:
             status = "Dados insuficientes"
         elif difference > Decimal("0.00"):
-            status = "Ajuste gerado" if existing_entry else "Ajuste pendente"
+            status = "Ajuste lançado" if existing_entry and existing_entry.status in {"aplicado_por_regra", "editado_manual"} else "Pendente em regras"
         elif difference < Decimal("0.00"):
             status = "Divergência para revisão"
         else:
@@ -132,10 +135,11 @@ def calculate_getnet_anticipation_adjustments(reconciliation: Conciliacao, db: S
             "lancamento": {
                 "id": existing_entry.id,
                 "data": month_end(key).strftime("%d/%m/%Y"),
-                "historico": existing_entry.historico,
-                "complemento": existing_entry.complemento,
+                "historico": existing_entry.historico or GETNET_ADJUSTMENT_DESCRIPTION,
+                "complemento": existing_entry.complemento or GETNET_ADJUSTMENT_COMPLEMENT,
                 "valor": str(existing_entry.valor),
-                "origem": "Ajuste automático Getnet/Santander",
+                "origem": "Ajuste Getnet/Santander",
+                "status": existing_entry.status,
             } if existing_entry else None,
         })
     return items
@@ -163,12 +167,12 @@ def sync_getnet_anticipation_adjustments(reconciliation: Conciliacao, db: Sessio
         .first()
     )
     account = db.query(ContaBancaria).filter_by(cliente_id=reconciliation.cliente_id, banco="Santander").first()
-    expected_keys = {item["competencia"] for item in summary if item["situacao"] in {"Ajuste pendente", "Ajuste gerado"} and statement_file}
+    expected_keys = {item["competencia"] for item in summary if item["situacao"] in {"Pendente em regras", "Ajuste lançado"} and statement_file}
     for item in summary:
         key = item["competencia"]
         movement, match, entries = existing.get(key, (None, None, []))
-        if item["situacao"] not in {"Ajuste pendente", "Ajuste gerado"}:
-            if movement and item["situacao"] != "Ajuste gerado":
+        if item["situacao"] not in {"Pendente em regras", "Ajuste lançado"}:
+            if movement and item["situacao"] != "Ajuste lançado":
                 remove_adjustment(movement, match, entries, db)
             continue
         if not statement_file:
@@ -185,7 +189,7 @@ def sync_getnet_anticipation_adjustments(reconciliation: Conciliacao, db: Sessio
                 valor=value,
                 natureza="Débito",
                 texto_original=GETNET_ADJUSTMENT_DESCRIPTION,
-                dados_originais=adjustment_marker(key),
+                dados_originais=adjustment_marker(key, item["total_getnet"], item["total_santander"], item["diferenca"]),
                 dados_normalizados={"nome": normalize_name(GETNET_ADJUSTMENT_DESCRIPTION)},
                 ativo=False,
             )
@@ -197,7 +201,7 @@ def sync_getnet_anticipation_adjustments(reconciliation: Conciliacao, db: Sessio
             movement.historico = GETNET_ADJUSTMENT_DESCRIPTION
             movement.natureza = "Débito"
             movement.ativo = False
-            movement.dados_originais = adjustment_marker(key)
+            movement.dados_originais = adjustment_marker(key, item["total_getnet"], item["total_santander"], item["diferenca"])
         if not match:
             match = Correspondencia(
                 conciliacao_id=reconciliation.id,
@@ -209,26 +213,25 @@ def sync_getnet_anticipation_adjustments(reconciliation: Conciliacao, db: Sessio
             )
             db.add(match)
             db.flush()
-        manual_entries = [entry for entry in entries if entry.status == "editado_manual"]
-        if manual_entries:
-            continue
         entry = next((entry for entry in entries if entry.origem == GETNET_ADJUSTMENT_ORIGIN), None)
         if not entry:
             entry = LancamentoContabil(correspondencia_id=match.id, origem=GETNET_ADJUSTMENT_ORIGIN)
             db.add(entry)
+        classified = entry.status in {"aplicado_por_regra", "editado_manual"} or bool(entry.regra_contabil_id)
         entry.componente = GETNET_ADJUSTMENT_COMPONENT
         entry.categoria = "JUROS"
         entry.descricao = GETNET_ADJUSTMENT_DESCRIPTION
         entry.efeito_no_total = "OUTROS"
         entry.ordem = 90
         entry.valor = value
-        entry.conta_debito = GETNET_ADJUSTMENT_DESCRIPTION
-        entry.conta_credito = account.conta_contabil.strip() if account and account.conta_contabil.strip() else "BANCO SANTANDER"
-        entry.historico = GETNET_ADJUSTMENT_DESCRIPTION
-        entry.complemento = GETNET_ADJUSTMENT_COMPLEMENT
-        entry.status = GETNET_ADJUSTMENT_STATUS
+        if not classified:
+            entry.conta_debito = ""
+            entry.conta_credito = account.conta_contabil.strip() if account and account.conta_contabil.strip() else ""
+            entry.historico = GETNET_ADJUSTMENT_DESCRIPTION
+            entry.complemento = GETNET_ADJUSTMENT_COMPLEMENT
+            entry.status = GETNET_ADJUSTMENT_STATUS
     for key, (movement, match, entries) in existing.items():
-        if key not in expected_keys and not any(item["competencia"] == key and item["situacao"] == "Ajuste gerado" for item in summary):
+        if key not in expected_keys and not any(item["competencia"] == key and item["situacao"] == "Ajuste lançado" for item in summary):
             remove_adjustment(movement, match, entries, db)
     db.flush()
     return calculate_getnet_anticipation_adjustments(reconciliation, db)

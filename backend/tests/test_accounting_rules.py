@@ -582,6 +582,17 @@ def test_equivalent_rule_with_reordered_keywords_is_not_saved_twice():
         create_accounting_rule(reconciliation.id, rule_input("FORNECEDOR, PIX"), session)
 
 
+def test_equivalent_rule_from_another_bank_does_not_block_current_bank_rule():
+    session, reconciliation, _ = rules_session("TARIFA MENSALIDADE PACOTE SERVICOS DEZEMBRO 2023")
+    session.add(RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco="Banco do Brasil", tipo_fonte="extrato", tipo_operacao="Crédito", tipo_componente="PRINCIPAL", favorecido_normalizado=normalize_name("TARIFA PACOTE SERVICOS"), conta_debito="Despesa BB", conta_credito="Banco BB", historico="Tarifa BB"))
+    session.commit()
+
+    created = create_accounting_rule(reconciliation.id, RegraContabilInput(gatilho="TARIFA PACOTE SERVICOS", natureza="Crédito", tipo_componente="PRINCIPAL", conta_debito="Despesa Santander", conta_credito="Banco Santander", historico="Tarifa Santander"), session)
+
+    assert created["movimentos_aplicados"] == 1
+    assert sorted(rule.banco for rule in session.query(RegraContabil).all()) == ["Banco do Brasil", "Santander"]
+
+
 def test_rule_save_rolls_back_when_accounting_entry_creation_fails(monkeypatch):
     session, reconciliation, _ = rules_session()
 

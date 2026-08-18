@@ -26,7 +26,7 @@ from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, Comprovant
 from app.services.normalization import accounting_nature, is_statement_debit, normalize_name, normalize_rule_accounting_nature, normalize_statement_nature
 from app.services.matching import names_similar
 from app.services.parsers import deduplicate_statement_records, extract_basa_pdfplumber_pages, extract_getnet_pdfplumber_pages, extract_receipts, extract_santander_pdfplumber_statement, extract_statement_pages
-from app.services.getnet_adjustments import GETNET_ADJUSTMENT_STATUS, sync_getnet_anticipation_adjustments
+from app.services.getnet_adjustments import GETNET_ADJUSTMENT_COMPONENT, GETNET_ADJUSTMENT_DESCRIPTION, is_getnet_adjustment_movement, is_santander_getnet_credit, sync_getnet_anticipation_adjustments
 from app.services.rfb import belongs_to_selected_bank, extract_competence, parse_rfb_page
 from app.services.rule_source import choose_rule_source
 
@@ -626,6 +626,7 @@ def rule_component_trigger_label(component: str) -> str:
         "ABATIMENTO": "Abatimento",
         "JUROS": "Juros",
         "MULTA": "Multa",
+        GETNET_ADJUSTMENT_COMPONENT: "Getnet",
     }.get((component or "").upper(), "")
 
 
@@ -778,7 +779,7 @@ def rule_period_exception(rule_id: str, reconciliation: Conciliacao, db: Session
 
 
 def complete_accounting_entry(entry: LancamentoContabil) -> bool:
-    return bool(entry.status in {"aplicado_por_regra", "editado_manual", GETNET_ADJUSTMENT_STATUS} and entry.valor and entry.valor > 0 and entry.conta_debito.strip() and entry.conta_credito.strip() and entry.historico.strip())
+    return bool(entry.status in {"aplicado_por_regra", "editado_manual"} and entry.valor and entry.valor > 0 and entry.conta_debito.strip() and entry.conta_credito.strip() and entry.historico.strip())
 
 
 def count_rule_entries_in_reconciliation(rule_id: str, reconciliation: Conciliacao, db: Session) -> int:
@@ -801,8 +802,12 @@ def is_discount_component(component: str | None) -> bool:
     return (component or "") in DISCOUNT_COMPONENTS
 
 
+def is_balanced_other_component(component: str | None) -> bool:
+    return is_discount_component(component) or component == GETNET_ADJUSTMENT_COMPONENT
+
+
 def is_other_accounting_entry(entry: LancamentoContabil) -> bool:
-    return entry.efeito_no_total == "OUTROS" or is_discount_component(entry.componente)
+    return entry.efeito_no_total == "OUTROS" or is_balanced_other_component(entry.componente)
 
 
 def accounting_entry_order(entry: LancamentoContabil) -> tuple[int, int, str]:
@@ -822,7 +827,17 @@ def statement_effect_value(value: Decimal, effect: str) -> Decimal:
 
 
 def active_accounting_entry(entry: LancamentoContabil, active_rule_ids: set[str]) -> bool:
-    return entry.status == "editado_manual" or entry.status == GETNET_ADJUSTMENT_STATUS or entry.regra_contabil_id in active_rule_ids
+    return entry.status == "editado_manual" or entry.regra_contabil_id in active_rule_ids
+
+
+def accounting_rule_movements(reconciliation: Conciliacao, db: Session) -> list[MovimentoExtrato]:
+    movements = [
+        item
+        for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=reconciliation.id).all()
+        if (item.ativo or is_getnet_adjustment_movement(item)) and in_reconciliation_period(reconciliation, item)
+    ]
+    movements.sort(key=movement_statement_order)
+    return movements
 
 
 def accounting_integrity(reconciliation: Conciliacao, db: Session) -> dict:
@@ -850,7 +865,7 @@ def accounting_integrity(reconciliation: Conciliacao, db: Session) -> dict:
         valid_entries.extend(completed)
         for entry in completed:
             if is_other_accounting_entry(entry):
-                if is_discount_component(entry.componente):
+                if is_balanced_other_component(entry.componente):
                     other_debit += entry.valor
                     other_credit += entry.valor
                 elif accounting_nature(movement.natureza) == "Débito":
@@ -873,8 +888,7 @@ def apply_accounting_rules(reconciliation: Conciliacao, db: Session) -> int:
     """Create or update accounting entries without changing document matching links."""
     rules = current_bank_rules(reconciliation, db)
     applied = 0
-    movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=reconciliation.id, ativo=True) if in_reconciliation_period(reconciliation, item)]
-    movements.sort(key=movement_statement_order)
+    movements = accounting_rule_movements(reconciliation, db)
     correspondences = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id).all()
     match_by_movement = {item.movimento_extrato_id: item for item in correspondences}
     match_ids = [item.id for item in correspondences]
@@ -964,12 +978,15 @@ def save_bank_account(conciliacao_id: str, payload: ContaBancariaInput, db: Sess
 def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPIResponse = None, auto_hide_zero_covered: bool = True):
     reconciliation = reconciliation_or_404(conciliacao_id, db)
     movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True) if in_reconciliation_period(reconciliation, item)]
-    movements.sort(key=movement_statement_order)
+    if reconciliation.banco == "Santander" and any(is_santander_getnet_credit(item) for item in movements):
+        sync_getnet_anticipation_adjustments(reconciliation, db)
+        movements = accounting_rule_movements(reconciliation, db)
+    else:
+        movements.sort(key=movement_statement_order)
     movement_by_id = {item.id: item for item in movements}
     if reconciliation.banco == "Banco do Brasil":
         for movement in movements:
             logger.info("Total do extrato BB: data=%s historico=%s valor=%s natureza=%s", movement.data, movement.historico, movement.valor, movement.natureza)
-    rules = scoped_rules(reconciliation, db)
     same_bank_rules = current_bank_rules(reconciliation, db)
     matches = {item.movimento_extrato_id: item for item in db.query(Correspondencia).filter_by(conciliacao_id=conciliacao_id).all()}
     match_ids = [item.id for item in matches.values()]
@@ -1007,14 +1024,23 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
         receipt = receipts_by_id.get(match.comprovante_id) if match and match.comprovante_id else None
         rfb = rfb_by_id.get(match.comprovante_rfb_id) if match and match.comprovante_rfb_id else None
         rfb_items = rfb_items_by_receipt.get(rfb.id, []) if rfb else []
+        is_getnet_adjustment = is_getnet_adjustment_movement(item)
+        original = item.dados_originais if isinstance(item.dados_originais, dict) else {}
         history = rule_match_history(item, receipt)
-        shared_rule = next((rule for rule in rules if rule.banco != reconciliation.banco and rule_matches_movement(rule, item, receipt, component, rfb, rfb_items)), None)
         tariff_in_statement = bool(receipt and receipt.valor_tarifa and "TARIFA PIX" not in normalize_name(item.historico) and receipt.id in tariff_receipt_ids)
         tariff_reference = bool(receipt and "TARIFA PIX" in normalize_name(item.historico))
         bank_receipt_words = list(dict.fromkeys(([receipt.numero_documento] if receipt and receipt.numero_documento else []) + normalize_name(receipt_trigger_text(receipt)).split()))
         rfb_words = list(dict.fromkeys(normalize_name(receipt_trigger_text(None, rfb, rfb_items)).split()))
         receipt_words = list(dict.fromkeys([*bank_receipt_words, *rfb_words]))
         composition = ""
+        if is_getnet_adjustment:
+            receipt_words = ["JUROS", "ANTECIPACOES", "GETNET", "SANTANDER"]
+            composition = "\n".join([
+                "Ajuste Getnet/Santander",
+                f"Getnet líquido: R$ {Decimal(original.get('total_getnet') or 0):,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+                f"Santander recebido: R$ {Decimal(original.get('total_santander') or 0):,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+                f"Diferença a lançar: R$ {Decimal(original.get('diferenca') or item.valor or 0):,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+            ])
         if rfb and (rfb.tipo.upper() == "DAS" or any("SIMPLES NACIONAL" in tax.descricao.upper() for tax in rfb_items)):
             taxes = rfb_items
             money = lambda amount: f"R$ {amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -1023,7 +1049,7 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
             if rfb.valor_juros: lines.append(f"Juros: {money(rfb.valor_juros)}")
             composition = "Composição:\n- " + "\n- ".join(lines) + f"\nTotal do documento: {money(rfb.valor_total or 0)}"
         document_components = document_components or [component]
-        return {"id": f"{item.id}:{component}", "data": item.data.strftime("%d/%m/%y") if item.data else "—", "historico": history, "valor": str(value if value is not None else item.valor or 0), "natureza": normalize_statement_nature(item.natureza), "natureza_contabil": accounting_nature(item.natureza), "tipo_componente": component, "movimento_composto": len(document_components) > 1, "componentes_documento": document_components, "componentes_cobertos": covered_document_components or [], "palavras_comprovante": receipt_words, "palavras_comprovante_banco": bank_receipt_words, "palavras_comprovante_rfb": rfb_words, "valor_documento": str(receipt.valor_original) if receipt and receipt.valor_original else "", "composicao_simples": composition, "tarifa_no_extrato": tariff_in_statement, "tarifa_referente_ao_comprovante": tariff_reference, "tarifa_referencia_nome": (receipt.beneficiario or receipt.favorecido) if tariff_reference else "", "tarifa_referencia_valor": str(receipt.valor_pago or 0) if tariff_reference else "", "tarifa_referencia_data": receipt.data.strftime("%d/%m/%Y") if tariff_reference and receipt.data else "", "pagina": item.pagina_numero, "arquivo_id": item.arquivo_id, "comprovante_arquivo_id": receipt.arquivo_id if receipt else None, "comprovante_pagina": receipt.pagina_numero if receipt else None, "comprovante_rfb_arquivo_id": rfb.arquivo_id if rfb else None, "comprovante_rfb_pagina": rfb.pagina_numero if rfb else None, "comprovante_confere": bool((receipt or rfb) and match and match.status.startswith("Conciliado")), "regra_compartilhada": {"id": shared_rule.id, "banco_origem": shared_rule.banco, "gatilho": shared_rule.favorecido_normalizado} if shared_rule else None}
+        return {"id": f"{item.id}:{component}", "data": item.data.strftime("%d/%m/%y") if item.data else "—", "historico": history, "valor": str(value if value is not None else item.valor or 0), "natureza": normalize_statement_nature(item.natureza), "natureza_contabil": accounting_nature(item.natureza), "tipo_componente": component, "movimento_composto": len(document_components) > 1, "componentes_documento": document_components, "componentes_cobertos": covered_document_components or [], "palavras_comprovante": receipt_words, "palavras_comprovante_banco": bank_receipt_words, "palavras_comprovante_rfb": rfb_words, "valor_documento": str(receipt.valor_original) if receipt and receipt.valor_original else "", "composicao_simples": composition, "tarifa_no_extrato": tariff_in_statement, "tarifa_referente_ao_comprovante": tariff_reference, "tarifa_referencia_nome": (receipt.beneficiario or receipt.favorecido) if tariff_reference else "", "tarifa_referencia_valor": str(receipt.valor_pago or 0) if tariff_reference else "", "tarifa_referencia_data": receipt.data.strftime("%d/%m/%Y") if tariff_reference and receipt.data else "", "pagina": item.pagina_numero, "arquivo_id": item.arquivo_id, "comprovante_arquivo_id": receipt.arquivo_id if receipt else None, "comprovante_pagina": receipt.pagina_numero if receipt else None, "comprovante_rfb_arquivo_id": rfb.arquivo_id if rfb else None, "comprovante_rfb_pagina": rfb.pagina_numero if rfb else None, "comprovante_confere": bool((receipt or rfb) and match and match.status.startswith("Conciliado")), "ajuste_getnet": is_getnet_adjustment, "gatilho_sugerido": "JUROS ANTECIPACOES GETNET" if is_getnet_adjustment else "", "complemento_sugerido": "DIFERENÇA ENTRE GETNET E RECEBIMENTOS NO SANTANDER" if is_getnet_adjustment else ""}
     pending = []
     for movement in movements:
         match = matches.get(movement.id)
@@ -1066,8 +1092,8 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
         "ignoradas": ignored,
         "resumo": {
             "extrato": {
-                "debito": str(sum((item.valor or 0 for item in movements if is_statement_debit(item.natureza)), 0)),
-                "credito": str(sum((item.valor or 0 for item in movements if not is_statement_debit(item.natureza)), 0)),
+                "debito": str(sum((item.valor or 0 for item in movements if item.ativo and is_statement_debit(item.natureza)), 0)),
+                "credito": str(sum((item.valor or 0 for item in movements if item.ativo and not is_statement_debit(item.natureza)), 0)),
                 "outros": "0.00",
                 "outros_debito": "0.00",
                 "outros_credito": "0.00",
@@ -1080,8 +1106,7 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
 
 def rule_preview(rule: RegraContabil, reconciliation: Conciliacao, db: Session, current_rule_id: str | None = None) -> list[dict]:
     matches = []
-    movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=reconciliation.id, ativo=True) if in_reconciliation_period(reconciliation, item)]
-    movements.sort(key=movement_statement_order)
+    movements = accounting_rule_movements(reconciliation, db)
     correspondences = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id).all()
     match_by_movement = {item.movimento_extrato_id: item for item in correspondences}
     match_ids = [item.id for item in correspondences]
@@ -1158,9 +1183,6 @@ def create_accounting_rule(conciliacao_id: str, payload: RegraContabilInput, db:
             db.rollback()
             raise
         return {"id": existing_rule.id, "movimentos_aplicados": applied, "reativada": True, "regras": accounting_rules(conciliacao_id, db)}
-    shared_rule = next((item for item in scoped_rules(reconciliation, db) if item.banco != reconciliation.banco and item.tipo_operacao == payload.natureza and item.tipo_componente == payload.tipo_componente.strip().upper() and normalize_name(item.favorecido_normalizado) == normalize_name(payload.gatilho) and normalize_name(item.gatilho_comprovante_normalizado) == normalize_name(payload.gatilho_comprovante) and normalize_name(item.texto_exclusao_normalizado) == normalize_name(payload.texto_exclusao)), None)
-    if shared_rule:
-        raise HTTPException(409, f"Já existe uma regra deste cliente criada no banco {shared_rule.banco}")
     scope = "global" if payload.escopo == "global" else "periodo"
     rule = RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco=reconciliation.banco, tipo_fonte="extrato", tipo_operacao=payload.natureza, tipo_componente=payload.tipo_componente.strip().upper(), favorecido_normalizado=normalize_name(payload.gatilho), gatilho_comprovante_normalizado=normalize_name(payload.gatilho_comprovante), texto_exclusao_normalizado=normalize_name(payload.texto_exclusao), conta_debito=payload.conta_debito.strip(), conta_credito=payload.conta_credito.strip(), historico=payload.historico.strip(), complemento=payload.complemento.strip(), escopo=scope)
     if not rule_has_eligible_movement(rule, reconciliation, db):

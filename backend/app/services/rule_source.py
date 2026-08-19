@@ -86,6 +86,16 @@ def _rfb_lines(rfb) -> list[RuleLine]:
 
 def _receipt_lines(receipt) -> list[RuleLine]:
     values = getattr(receipt, "financeiros", receipt)
+    operation = getattr(receipt, "tipo_operacao", "")
+    if "EMPR" in operation.upper() or "FINANCI" in operation.upper():
+        lines = []
+        principal = values.valor_original or values.valor_pago
+        if principal and principal > 0:
+            lines.append(RuleLine("PRINCIPAL", principal, origem="emprestimo"))
+        for component, value in (("JUROS", values.valor_juros), ("ENCARGOS", values.valor_encargos)):
+            if value and value > 0:
+                lines.append(RuleLine(component, value, origem="emprestimo"))
+        return lines
     additions = (("MULTA", values.valor_multa), ("JUROS", values.valor_juros), ("ENCARGOS", values.valor_encargos))
     reductions = (("DESCONTO", values.valor_desconto), ("ABATIMENTO", values.valor_abatimento), ("DESCONTO_ABATIMENTO", values.valor_desconto_abatimento))
     has_reductions = any(value and value > 0 for _, value in reductions)

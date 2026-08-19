@@ -16,6 +16,7 @@ GETNET_ADJUSTMENT_DESCRIPTION = "JUROS SOBRE ANTECIPAÇÕES GETNET"
 GETNET_ADJUSTMENT_COMPLEMENT = "DIFERENÇA ENTRE GETNET E RECEBIMENTOS NO SANTANDER"
 GETNET_ADJUSTMENT_COMPONENT = "JUROS_ANTECIPACAO_GETNET"
 GETNET_ADJUSTMENT_STATUS = "pendente_regra"
+GETNET_STATEMENT_DOCUMENT_TYPES = {"maquininha_extrato", "getnet_extrato", "getnet_vendas", "getnet_comissoes"}
 
 
 def money(value: Decimal | int | None) -> Decimal:
@@ -42,7 +43,7 @@ def in_period(reconciliation: Conciliacao, value: date | None) -> bool:
 
 def is_getnet_sales_receipt(receipt: Comprovante, file_by_id: dict[str, Arquivo]) -> bool:
     file = file_by_id.get(receipt.arquivo_id)
-    return bool(file and file.ativo and file.tipo_documento == "getnet_vendas" and receipt.ativo and receipt.valor_pago is not None)
+    return bool(file and file.ativo and file.tipo_documento in GETNET_STATEMENT_DOCUMENT_TYPES and receipt.ativo and receipt.valor_pago is not None)
 
 
 def is_santander_getnet_credit(movement: MovimentoExtrato) -> bool:

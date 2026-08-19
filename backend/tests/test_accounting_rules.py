@@ -45,6 +45,39 @@ def test_rule_application_and_csv_include_only_covered_movements():
     assert data["resumo"]["razao"] == {"debito": "0.00", "credito": "12.50", "outros": "0.00", "outros_debito": "0.00", "outros_credito": "0.00"}
 
 
+def test_ignored_statement_movement_is_not_used_in_rules_result_or_csv():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Banco do Brasil", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    session.add(file); session.flush()
+    used = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 2), historico="TRANSFERENCIA ENTRE CONTAS", valor=Decimal("100.00"), natureza="saída")
+    ignored = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 3), historico="TRANSFERENCIA ENTRE CONTAS", valor=Decimal("100.00"), natureza="saída")
+    rule = RegraContabil(cliente_id=client.id, conciliacao_id=reconciliation.id, banco="Banco do Brasil", tipo_fonte="extrato", tipo_operacao="saída", favorecido_normalizado=normalize_name("TRANSFERENCIA ENTRE CONTAS"), conta_debito="1.1.01 - Banco Santander", conta_credito="1.1.02 - Banco do Brasil", historico="310 - Transferência", complemento="Conforme extrato bancário")
+    account = ContaBancaria(cliente_id=client.id, banco="Banco do Brasil", conta_contabil="1.1.02 - Banco do Brasil")
+    session.add_all([used, ignored, rule, account]); session.commit()
+
+    assert apply_accounting_rules(reconciliation, session) == 2
+
+    response = routes.set_statement_movement_usage(reconciliation.id, ignored.id, routes.MovimentoUsoInput(usar=False), session)
+
+    assert response["usado_no_periodo"] is False
+    rules = accounting_rules(reconciliation.id, session)
+    assert rules["salvas"][0]["cobertos"] == 1
+    assert all(item["movimento_id"] != ignored.id for item in rules["pendentes"])
+    rows = result(reconciliation.id, session)
+    ignored_row = next(item for item in rows if item["movimento_id"] == ignored.id)
+    assert ignored_row["situacao"] == "Não usado neste período"
+    assert ignored_row["lancamentos"] == []
+    csv = accounting_csv(reconciliation.id, session).body.decode("utf-8-sig")
+    assert "02/01/2024;1.1.01;1.1.02;310;100.00;Conforme extrato bancário" in csv
+    assert "03/01/2024;1.1.01;1.1.02;310;100.00;Conforme extrato bancário" not in csv
+
+
 def test_credit_rule_moves_entry_to_saved_and_reason_only_sums_covered_value():
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)

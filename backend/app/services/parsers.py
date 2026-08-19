@@ -1,5 +1,7 @@
 import re
 import logging
+import calendar
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -84,6 +86,18 @@ class PdfStatementExtraction:
     records: list[ParsedStatement]
 
 
+@dataclass
+class ParsedInvoice:
+    data_emissao: date | None
+    fornecedor: str
+    cpf_cnpj: str
+    numero_nota: str
+    valor_total: Decimal | None
+    texto_original: str
+    pagina_numero: int
+    dados: dict = field(default_factory=dict)
+
+
 SANTANDER_IGNORE_AUTOMATIC_INVESTMENT_MOVEMENTS = False
 SANTANDER_AUTOMATIC_INVESTMENT_RE = re.compile(r"\b(?:APLICACAO|APLICAÇÃO|RESGATE)\s+CONTAMAX\b", re.I)
 SANTANDER_EXPECTED_RECORDS = 98
@@ -106,6 +120,10 @@ def parse_date_time(value: str) -> tuple[date | None, str | None]:
     time_match = re.search(TIME_RE, value)
     parsed_date = date(*map(int, reversed(re.split(r"[/.]", date_match.group(1))))) if date_match else None
     return parsed_date, time_match.group(1) if time_match else None
+
+
+def amount_text(value: str) -> bool:
+    return bool(re.fullmatch(r"-?\s*(?:R\$\s*)?\d{1,3}(?:\.\d{3})*,\d{2}\s*[CD]?", value.strip(), re.I))
 
 
 def receipt_label_value(text: str, *labels: str, value_prefix: str = r".") -> str | None:
@@ -236,6 +254,183 @@ def receipt_document_number(text: str) -> str:
     return ""
 
 
+def _clean_receipt_amount(value: str | None) -> Decimal | None:
+    if not value:
+        return None
+    return parse_brl(value.replace("R$", "").strip())
+
+
+def _lines(text: str) -> list[str]:
+    return [" ".join(line.split()) for line in text.splitlines() if line.strip()]
+
+
+def _line_is_label(value: str) -> bool:
+    return value.strip().endswith(":")
+
+
+def _line_value_near(lines: list[str], label: str, prefer_before: bool = False) -> str:
+    normalized_label = normalize_name(label)
+    for index, line in enumerate(lines):
+        normalized_line = normalize_name(line)
+        if normalized_label not in normalized_line:
+            continue
+        same_line = re.split(r":", line, maxsplit=1)
+        if len(same_line) > 1 and same_line[1].strip():
+            return same_line[1].strip()
+        offsets = (-1, 1, -2, 2) if prefer_before else (1, -1, 2, -2)
+        for offset in offsets:
+            candidate_index = index + offset
+            if 0 <= candidate_index < len(lines):
+                candidate = lines[candidate_index].strip()
+                if candidate and normalize_name(candidate) != normalized_label and not _line_is_label(candidate):
+                    return candidate
+    return ""
+
+
+def _value_after_section(lines: list[str], section: str, label: str, limit: int = 12) -> str:
+    normalized_section = normalize_name(section)
+    normalized_label = normalize_name(label)
+    for section_index, line in enumerate(lines):
+        if normalized_section not in normalize_name(line):
+            continue
+        end = min(len(lines), section_index + limit + 1)
+        for index in range(section_index + 1, end):
+            normalized_line = normalize_name(lines[index])
+            if normalized_label not in normalized_line:
+                continue
+            same_line = re.split(r":", lines[index], maxsplit=1)
+            if len(same_line) > 1 and same_line[1].strip():
+                return same_line[1].strip()
+            for candidate in lines[index + 1:end]:
+                candidate = candidate.strip()
+                if candidate and not _line_is_label(candidate):
+                    return candidate
+    return ""
+
+
+def _previous_value_for_label_context(lines: list[str], label: str, required_next: str = "", rejected_next: tuple[str, ...] = ()) -> str:
+    normalized_label = normalize_name(label)
+    normalized_required = normalize_name(required_next)
+    normalized_rejected = tuple(normalize_name(item) for item in rejected_next)
+    for index, line in enumerate(lines):
+        normalized_line = normalize_name(line)
+        if normalized_line != normalized_label:
+            continue
+        next_line = normalize_name(lines[index + 1]) if index + 1 < len(lines) else ""
+        if normalized_required and normalized_required not in next_line:
+            continue
+        if any(item in next_line for item in normalized_rejected):
+            continue
+        for candidate_index in range(index - 1, max(-1, index - 4), -1):
+            candidate = lines[candidate_index].strip()
+            if candidate and not _line_is_label(candidate):
+                return candidate
+    return ""
+
+
+def _bradesco_original_amount(lines: list[str]) -> str:
+    for index, line in enumerate(lines):
+        if normalize_name(line) != "VALOR":
+            continue
+        for candidate_index in range(index - 1, max(-1, index - 4), -1):
+            candidate = lines[candidate_index].strip()
+            if candidate and amount_text(candidate):
+                return candidate
+    return ""
+
+
+def _receipt_financial(original: Decimal | None, paid: Decimal | None, text: str) -> FinancialValues:
+    financial = extract_financial_values(text)
+    if original is not None:
+        financial.valor_original = original
+    if paid is not None:
+        financial.valor_pago = paid
+    for key in ("valor_original", "valor_pago"):
+        amount = getattr(financial, key)
+        if amount is not None:
+            financial.detalhes[key] = str(amount)
+    return financial
+
+
+def _extract_caixa_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
+    normalized = normalize_name(text)
+    if "COMPROVANTE PAGAMENTO BOLETO" not in normalized or "INTERNET BANKING CAIXA" not in normalized:
+        return []
+    lines = _lines(text)
+    paid_date, paid_time = parse_date_time(_line_value_near(lines, "Data/hora da operação") or _line_value_near(lines, "Data de Efetivação / Agendamento"))
+    beneficiary = (
+        _value_after_section(lines, "Beneficiário original / Cedente", "Nome/Razão Social")
+        or _value_after_section(lines, "Beneficiário original / Cedente", "Nome Fantasia")
+        or _line_value_near(lines, "Nome Fantasia")
+        or _line_value_near(lines, "Nome/Razão Social")
+    )
+    fantasy = _value_after_section(lines, "Beneficiário original / Cedente", "Nome Fantasia")
+    cnpj = _value_after_section(lines, "Beneficiário original / Cedente", "CPF/CNPJ") or _line_value_near(lines, "CPF/CNPJ")
+    document = _line_value_near(lines, "Código da operação") or receipt_document_number(text)
+    original = _clean_receipt_amount(_line_value_near(lines, "Valor Nominal do Boleto"))
+    paid = _clean_receipt_amount(_line_value_near(lines, "Valor Pago")) or _clean_receipt_amount(_line_value_near(lines, "Valor Calculado"))
+    if not paid_date or paid is None or not beneficiary:
+        return []
+    financial = _receipt_financial(original, paid, text)
+    return [ParsedReceipt(
+        data=paid_date,
+        hora=paid_time,
+        favorecido=beneficiary,
+        valor=paid,
+        tipo_operacao="BOLETO",
+        texto_original=text.strip(),
+        pagina_numero=page_number,
+        origem_nome="CAIXA BOLETO",
+        financeiros=financial,
+        beneficiario=beneficiary,
+        nome_fantasia=fantasy,
+        pagador=_line_value_near(lines, "Pagador Final - Correntista") or _line_value_near(lines, "Nome"),
+        cnpj_beneficiario=cnpj,
+        numero_documento=document,
+    )]
+
+
+def _extract_bradesco_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
+    normalized = normalize_name(text)
+    if "COMPROVANTE TRANSACAO BANCARIA" not in normalized or "BOLETO COBRANCA" not in normalized:
+        return []
+    blocks = [text.strip()]
+    results: list[ParsedReceipt] = []
+    for block in blocks:
+        lines = _lines(block)
+        date_value = _line_value_near(lines, "Data da operação") or _line_value_near(lines, "Data de débito")
+        paid_date, paid_time = parse_date_time(date_value)
+        document = _line_value_near(lines, "Documento", prefer_before=True)
+        beneficiary = (
+            _previous_value_for_label_context(lines, "Razão Social", "Beneficiário", ("Final",))
+            or _previous_value_for_label_context(lines, "Nome Fantasia", "Beneficiário", ("Final",))
+        )
+        fantasy = _previous_value_for_label_context(lines, "Nome Fantasia", "Beneficiário", ("Final",))
+        cnpj = _previous_value_for_label_context(lines, "CPF/CNPJ Beneficiário", "", ("Final",))
+        original = _clean_receipt_amount(_bradesco_original_amount(lines))
+        paid = _clean_receipt_amount(_line_value_near(lines, "Valor total", prefer_before=True)) or original
+        if not paid_date or paid is None or not beneficiary or normalize_name(beneficiary) == "NAO INFORMADO":
+            continue
+        financial = _receipt_financial(original, paid, block)
+        results.append(ParsedReceipt(
+            data=paid_date,
+            hora=paid_time,
+            favorecido=beneficiary,
+            valor=paid,
+            tipo_operacao="BOLETO",
+            texto_original=block,
+            pagina_numero=page_number,
+            origem_nome="BRADESCO BOLETO",
+            financeiros=financial,
+            beneficiario=beneficiary,
+            nome_fantasia=fantasy,
+            pagador=_line_value_near(lines, "Nome do Pagador", prefer_before=True),
+            cnpj_beneficiario=cnpj,
+            numero_documento=document,
+        ))
+    return results
+
+
 def extract_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
     getnet_sales = _extract_getnet_sales_receipts(text, page_number)
     if getnet_sales:
@@ -243,6 +438,12 @@ def extract_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
     santander = _extract_santander_receipts(text, page_number)
     if santander:
         return santander
+    caixa = _extract_caixa_receipts(text, page_number)
+    if caixa:
+        return caixa
+    bradesco = _extract_bradesco_receipts(text, page_number)
+    if bradesco:
+        return bradesco
     page_blocks = split_banco_do_brasil_receipt_blocks(text)
     if len(page_blocks) > 1:
         results = []
@@ -250,6 +451,392 @@ def extract_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
             results.extend(extract_receipt_block(block, page_number))
         return results
     return extract_receipt_block(text, page_number)
+
+
+def extract_loan_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
+    normalized = normalize_name(text)
+    if not any(term in normalized for term in ("EMPRESTIMO", "FINANCIAMENTO", "CONTRATO", "OPERACAO")):
+        return []
+
+    scheduled = _extract_banco_do_brasil_loan_schedule(text, page_number)
+    if scheduled:
+        return scheduled
+
+    def label_text(*labels: str) -> str:
+        for label in labels:
+            value = receipt_label_value(text, label, value_prefix=r"[^\n]")
+            if value:
+                return " ".join(value.split())
+        return ""
+
+    def label_amount(*labels: str) -> Decimal | None:
+        for label in labels:
+            value = receipt_label_value(text, label, value_prefix=r"(?:R?\$?\s*[\d.,-])")
+            if value:
+                amount = parse_brl(value)
+                if amount is not None:
+                    return abs(amount)
+        return None
+
+    contract = label_text(
+        "NR. CONTRATO",
+        "NR CONTRATO",
+        "Nº CONTRATO",
+        "NUMERO DO CONTRATO",
+        "NÚMERO DO CONTRATO",
+        "CONTRATO",
+        "NR. OPERACAO",
+        "NR OPERAÇÃO",
+        "Nº OPERAÇÃO",
+        "OPERACAO",
+        "OPERAÇÃO",
+    )
+    if not contract:
+        match = re.search(r"\b\d{2,3}[.\s]\d{3}[.\s]\d{3}(?:[.\s]\d{3}[.\s]\d{3})?\b", text)
+        contract = " ".join(match.group(0).replace(" ", ".").split()) if match else ""
+
+    parsed_date, parsed_time = parse_date_time(
+        "\n".join(
+            value
+            for value in [
+                label_text("DATA DO PAGAMENTO", "DATA DO DÉBITO", "DATA DO DEBITO", "DATA DA PARCELA", "DATA"),
+                text,
+            ]
+            if value
+        )
+    )
+    principal = label_amount("VALOR PRINCIPAL", "PRINCIPAL", "CAPITAL", "AMORTIZACAO", "AMORTIZAÇÃO")
+    interest = label_amount("JUROS", "VALOR JUROS", "JUROS DO PERIODO", "JUROS DO PERÍODO")
+    iof = label_amount("IOF", "VALOR IOF")
+    charges = label_amount("ENCARGOS", "TARIFAS", "TARIFA")
+    paid = label_amount("VALOR TOTAL", "TOTAL", "VALOR DA PARCELA", "VALOR DO DÉBITO", "VALOR DO DEBITO", "VALOR PAGO", "VALOR COBRADO")
+    component_total = sum((value or Decimal("0.00") for value in (principal, interest, iof, charges)), Decimal("0.00"))
+    if paid is None and component_total > 0:
+        paid = component_total
+    if paid is None or paid <= 0:
+        return []
+
+    details = {}
+    for key, value in (("contrato", contract), ("principal", principal), ("juros", interest), ("iof", iof), ("encargos", charges), ("valor_pago", paid)):
+        if value:
+            details[key] = str(value)
+    financial = FinancialValues(
+        valor_original=principal or paid,
+        valor_juros=interest,
+        valor_encargos=(iof or Decimal("0.00")) + (charges or Decimal("0.00")) or None,
+        valor_pago=paid,
+        detalhes=details,
+        composicao_divergente=bool(component_total > 0 and abs(component_total - paid) > Decimal("0.01")),
+    )
+    beneficiary = " ".join(part for part in ["Empréstimo/Financiamento", contract] if part).strip()
+    return [
+        ParsedReceipt(
+            data=parsed_date,
+            hora=parsed_time,
+            favorecido=beneficiary or "Empréstimo/Financiamento",
+            valor=paid,
+            tipo_operacao="EMPRÉSTIMO/FINANCIAMENTO",
+            texto_original=text,
+            pagina_numero=page_number,
+            origem_nome="CONTRATO",
+            financeiros=financial,
+            beneficiario=beneficiary or "Empréstimo/Financiamento",
+            numero_documento=contract,
+        )
+    ]
+
+
+def _extract_banco_do_brasil_loan_schedule(text: str, page_number: int) -> list[ParsedReceipt]:
+    normalized = normalize_name(text)
+    if not ("CRONOGRAMA" in normalized and "REPOSICAO" in normalized and "EXIGIVEL" in normalized):
+        return []
+    contract = ""
+    contract_match = re.search(r"\bOpera[cç][aã]o\s*:?\s*([0-9.\s]{6,})", text, re.I)
+    if contract_match:
+        contract = re.sub(r"\s+", "", contract_match.group(1).strip(" ."))
+    if not contract:
+        fallback = re.search(r"\b\d{2,3}[.\s]\d{3}[.\s]\d{3}\b", text)
+        contract = re.sub(r"\s+", "", fallback.group(0).strip(" .")) if fallback else ""
+
+    amount = r"\d{1,3}(?:\.\d{3})*,\d{2}"
+    row_pattern = re.compile(
+        rf"^\s*(?P<date>\d{{2}}[/.]\d{{2}}[/.]\d{{4}})\s+"
+        rf"(?P<component>JUROS|CAPITAL|AMORTIZA[ÇC][AÃ]O|PRINCIPAL)\b"
+        rf"(?P<tail>.*?(?:{amount}).*)$",
+        re.I | re.M,
+    )
+    grouped: dict[date, dict[str, Decimal | str]] = {}
+    raw_lines: dict[date, list[str]] = defaultdict(list)
+    for match in row_pattern.finditer(text):
+        parsed_date, _ = parse_date_time(match.group("date"))
+        if not parsed_date:
+            continue
+        values = [parse_brl(value) for value in re.findall(amount, match.group("tail"))]
+        values = [value for value in values if value is not None]
+        if not values:
+            continue
+        realized = values[1] if len(values) > 1 else values[0]
+        component = normalize_name(match.group("component"))
+        bucket = grouped.setdefault(parsed_date, {"principal": Decimal("0.00"), "juros": Decimal("0.00"), "encargos": Decimal("0.00")})
+        if component == "JUROS":
+            bucket["juros"] = Decimal(bucket["juros"]) + realized
+        elif component in {"CAPITAL", "AMORTIZACAO", "PRINCIPAL"}:
+            bucket["principal"] = Decimal(bucket["principal"]) + realized
+        else:
+            bucket["encargos"] = Decimal(bucket["encargos"]) + realized
+        raw_lines[parsed_date].append(match.group(0).strip())
+
+    results = []
+    for parsed_date in sorted(grouped):
+        values = grouped[parsed_date]
+        principal = Decimal(values["principal"])
+        interest = Decimal(values["juros"])
+        charges = Decimal(values["encargos"])
+        paid = principal + interest + charges
+        if paid <= 0:
+            continue
+        details = {
+            "contrato": contract,
+            "principal": str(principal),
+            "juros": str(interest),
+            "encargos": str(charges),
+            "valor_pago": str(paid),
+            "origem": "cronograma_bb",
+        }
+        financial = FinancialValues(
+            valor_original=principal if principal > 0 else paid,
+            valor_juros=interest if interest > 0 else None,
+            valor_encargos=charges if charges > 0 else None,
+            valor_pago=paid,
+            detalhes=details,
+            composicao_divergente=False,
+        )
+        beneficiary = " ".join(part for part in ["Empréstimo/Financiamento", contract] if part).strip()
+        results.append(
+            ParsedReceipt(
+                data=parsed_date,
+                hora=None,
+                favorecido=beneficiary or "Empréstimo/Financiamento",
+                valor=paid,
+                tipo_operacao="EMPRÉSTIMO/FINANCIAMENTO",
+                texto_original="\n".join(raw_lines[parsed_date]),
+                pagina_numero=page_number,
+                origem_nome="CRONOGRAMA_BB",
+                financeiros=financial,
+                beneficiario=beneficiary or "Empréstimo/Financiamento",
+                numero_documento=contract,
+            )
+        )
+    return results
+
+
+def _extract_tefe_nfse_invoice(text: str, page_number: int) -> ParsedInvoice | None:
+    normalized = normalize_name(text)
+    if "PM TEFE" not in normalized or "NOTA FISCAL SERVICOS ELETRONICA" not in normalized:
+        return None
+    lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
+
+    def standalone_document(line: str) -> str:
+        match = re.search(r"\b(?:\d{3}\.\d{3}\.\d{3}-\d{2}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})\b", line)
+        return match.group(0) if match else ""
+
+    def likely_name(line: str) -> bool:
+        normalized_line = normalize_name(line)
+        blocked = {
+            "NOME RAZAO SOCIAL",
+            "RG INSCRICAO ESTADUAL",
+            "INSCRICAO MUNICIPAL",
+            "CPF CNPJ DOCUMENTO",
+            "CPF CNPJ",
+            "CADASTRO",
+            "LOGRADOURO",
+            "COMPLEMENTO",
+            "BAIRRO",
+            "CEP COD POSTAL",
+            "CIDADE PAIS",
+            "COD IBGE",
+            "TELEFONE",
+            "E MAIL",
+        }
+        return bool(normalized_line and normalized_line not in blocked and not standalone_document(line) and not re.search(r"\d", line))
+
+    def extract_party(window: list[str], cnpj_only: bool = False) -> tuple[str, str]:
+        document_pattern = r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b" if cnpj_only else r"\b(?:\d{3}\.\d{3}\.\d{3}-\d{2}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})\b"
+        for position, candidate in enumerate(window):
+            doc_match = re.search(document_pattern, candidate)
+            if not doc_match:
+                continue
+            document = doc_match.group(0)
+            name = candidate[doc_match.end():].strip()
+            name = re.sub(r"^(?:\d+\s+){1,3}", "", name).strip()
+            if not name:
+                label_index = next((index for index in range(position - 1, -1, -1) if normalize_name(window[index]) == "NOME RAZAO SOCIAL"), None)
+                if label_index is not None:
+                    name = next((item for item in window[label_index + 1:position] if likely_name(item)), "")
+            if not name:
+                name = next((item for item in reversed(window[:position]) if likely_name(item)), "")
+            return name, document
+        return "", ""
+
+    number = ""
+    for index, line in enumerate(lines):
+        if "NUMERO NFS E" in normalize_name(line):
+            window = lines[max(0, index - 3):index + 4]
+            number = next((candidate for candidate in window if re.fullmatch(r"\d{3,}", candidate)), "")
+            break
+    if not number:
+        match = re.search(r"N[uú]mero da NFS-e\s*\n\s*(\d{3,})", text, re.I)
+        number = match.group(1) if match else ""
+
+    parsed_date, _ = parse_date_time(text)
+
+    tomador_name = ""
+    tomador_document = ""
+    for index, line in enumerate(lines):
+        if normalize_name(line) == "TOMADOR SERVICOS":
+            tomador_name, tomador_document = extract_party(lines[index + 1:index + 10])
+            if not tomador_document:
+                tomador_name, tomador_document = extract_party(lines[max(0, index - 30):index])
+            break
+
+    prestador_name = ""
+    prestador_document = ""
+    for index, line in enumerate(lines):
+        if normalize_name(line) == "PRESTADOR SERVICOS":
+            prestador_name, prestador_document = extract_party(lines[index + 1:index + 10], cnpj_only=True)
+            if not prestador_document:
+                prestador_name, prestador_document = extract_party(lines[max(0, index - 25):index], cnpj_only=True)
+            break
+
+    invoice_total = None
+    total_match = re.search(r"Valor\s+L[ií]quido\s+da\s+NFS-e\s*:\s*R\$\s*([\d.]+,\d{2})", text, re.I)
+    if total_match:
+        invoice_total = parse_brl(total_match.group(1))
+    if invoice_total is None:
+        total_match = re.search(r"Valor\s+Total\s+dos\s+Servi[cç]os.*?\n\s*R\$\s*([\d.]+,\d{2})", text, re.I | re.S)
+        if total_match:
+            invoice_total = parse_brl(total_match.group(1))
+
+    service = ""
+    service_match = re.search(r"\b1\.0\s+\S+\s+(.+?)\s+(?:\d+(?:[.,]\d+)?)\s+R\$\s*[\d.]+,\d{2}", text, re.I)
+    if service_match:
+        service = " ".join(service_match.group(1).split())
+
+    payment = {}
+    payment_match = re.search(
+        r"FATURAS:\s*([A-Z0-9 /.-]+?)\s+Venc:\s*(\d{2}/\d{2}/\d{4})\s+R\$\s*([\d.]+,\d{2})(?:\s+Doc:\s*([^\s]+))?",
+        text,
+        re.I,
+    )
+    if payment_match:
+        payment_date, _ = parse_date_time(payment_match.group(2))
+        payment = {
+            "forma_pagamento": " ".join(payment_match.group(1).split()),
+            "data_pagamento": payment_date.isoformat() if payment_date else "",
+            "valor_pagamento": str(parse_brl(payment_match.group(3)) or ""),
+            "documento_pagamento": payment_match.group(4) or "",
+        }
+
+    counterparty = tomador_name or prestador_name
+    document = tomador_document or prestador_document
+    if not counterparty and not number and invoice_total is None:
+        return None
+    return ParsedInvoice(
+        parsed_date,
+        counterparty,
+        document,
+        number,
+        invoice_total,
+        text,
+        page_number,
+        {
+            "layout": "tefe_nfse",
+            "tomador": tomador_name,
+            "cpf_cnpj_tomador": tomador_document,
+            "prestador": prestador_name,
+            "cnpj_prestador": prestador_document,
+            "servico": service,
+            **payment,
+        },
+    )
+
+
+def extract_invoices(text: str, page_number: int) -> list[ParsedInvoice]:
+    normalized = normalize_name(text)
+    if not any(term in normalized for term in ("NOTA FISCAL", "NF E", "NFS E", "DANFE")):
+        return []
+    tefe_invoice = _extract_tefe_nfse_invoice(text, page_number)
+    if tefe_invoice:
+        return [tefe_invoice]
+
+    def label_text(*labels: str) -> str:
+        for label in labels:
+            value = receipt_label_value(text, label, value_prefix=r"[^\n]")
+            if value:
+                return " ".join(value.split())
+        return ""
+
+    def label_amount(*labels: str) -> Decimal | None:
+        for label in labels:
+            value = receipt_label_value(text, label, value_prefix=r"(?:R?\$?\s*[\d.,-])")
+            if value:
+                amount = parse_brl(value)
+                if amount is not None:
+                    return abs(amount)
+        return None
+
+    number = label_text(
+        "NÚMERO DA NOTA",
+        "NUMERO DA NOTA",
+        "Nº DA NOTA",
+        "N° DA NOTA",
+        "NOTA FISCAL Nº",
+        "NOTA FISCAL N",
+        "NF-E Nº",
+        "NFS-E Nº",
+        "NÚMERO",
+        "NUMERO",
+    )
+    if not number:
+        match = re.search(r"\b(?:NF-?E|NFS-?E|NOTA FISCAL)\s*(?:N[º°.]?|NUMERO)?\s*[:\-]?\s*(\d{3,})", text, re.I)
+        number = match.group(1) if match else ""
+
+    cnpj_match = re.search(r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b", text)
+    cpf_cnpj = cnpj_match.group(0) if cnpj_match else ""
+    supplier = label_text(
+        "PRESTADOR",
+        "RAZÃO SOCIAL",
+        "RAZAO SOCIAL",
+        "FORNECEDOR",
+        "EMITENTE",
+        "NOME/RAZÃO SOCIAL",
+        "NOME/RAZAO SOCIAL",
+    )
+    if not supplier:
+        lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
+        supplier = next((line for line in lines if cpf_cnpj and cpf_cnpj not in line and len(line) > 4 and not re.search(r"\d{2}/\d{2}/\d{4}", line)), "")
+
+    parsed_date, _ = parse_date_time(
+        "\n".join(
+            value
+            for value in [
+                label_text("DATA DE EMISSÃO", "DATA DE EMISSAO", "EMISSÃO", "EMISSAO"),
+                text,
+            ]
+            if value
+        )
+    )
+    total = label_amount(
+        "VALOR TOTAL DA NOTA",
+        "VALOR TOTAL",
+        "VALOR DOS SERVIÇOS",
+        "VALOR DOS SERVICOS",
+        "VALOR DO SERVIÇO",
+        "VALOR DO SERVICO",
+    )
+    if not supplier and not number and total is None:
+        return []
+    return [ParsedInvoice(parsed_date, supplier, cpf_cnpj, number, total, text, page_number)]
 
 
 def split_banco_do_brasil_receipt_blocks(text: str) -> list[str]:
@@ -709,6 +1296,14 @@ def extract_statement(text: str, page_number: int, bank: str = "") -> list[Parse
         basa_records = _extract_basa_statement(text, page_number)
         if basa_records:
             return basa_records
+    if bank == "Caixa":
+        caixa_records = _extract_caixa_statement(text, page_number)
+        if caixa_records:
+            return caixa_records
+    if bank == "Bradesco":
+        bradesco_records, _ = _extract_bradesco_statement_page(text, page_number)
+        if bradesco_records:
+            return bradesco_records
 
     results = []
     for line in text.splitlines():
@@ -735,6 +1330,8 @@ def extract_statement_pages(pages: list[str], bank: str = "") -> list[ParsedStat
             for number, page_text in enumerate(pages, 1)
         )
         return extract_statement(combined, 1, bank)
+    if bank == "Bradesco":
+        return _extract_bradesco_statement_pages(pages)
 
     records: list[ParsedStatement] = []
     for number, page_text in enumerate(pages, 1):
@@ -826,6 +1423,8 @@ def extract_santander_words_statement(
     in_movement_table = False
     columns: dict[str, float] | None = None
     pending_columns: dict[str, float] = {}
+    final_balance_pattern = _santander_balance_line_pattern(period)
+    initial_balance_pattern = _santander_previous_balance_line_pattern(period)
 
     def flush() -> None:
         nonlocal current
@@ -856,9 +1455,12 @@ def extract_santander_words_statement(
         for line in page_lines:
             text = _word_line_text(line)
             normalized = normalize_name(text)
-            if re.search(r"\bSALDO EM 31 01\b", normalized):
+            if final_balance_pattern.search(normalized):
                 flush()
                 return records
+            if initial_balance_pattern.search(normalized) and current_date is None:
+                current_date = date(period[1], period[0], 1)
+                continue
             if _santander_informational_section_starts(normalized):
                 if in_movement_table and columns:
                     flush()
@@ -917,6 +1519,20 @@ def extract_santander_words_statement(
 
     flush()
     return records
+
+
+def _santander_balance_line_pattern(period: tuple[int, int]) -> re.Pattern[str]:
+    month, year = period
+    last_day = calendar.monthrange(year, month)[1]
+    return re.compile(rf"\bSALDO EM {last_day:02d} {month:02d}\b")
+
+
+def _santander_previous_balance_line_pattern(period: tuple[int, int]) -> re.Pattern[str]:
+    month, year = period
+    previous_month = month - 1 or 12
+    previous_year = year - 1 if month == 1 else year
+    previous_last_day = calendar.monthrange(previous_year, previous_month)[1]
+    return re.compile(rf"\bSALDO EM {previous_last_day:02d} {previous_month:02d}\b")
 
 
 def _pdf_words_to_lines(words: list[dict[str, object]]) -> list[list[dict[str, object]]]:
@@ -1098,10 +1714,20 @@ def _dedupe_santander_description(history: str) -> str:
 
 def _validate_santander_expected_statement(records: list[ParsedStatement], pages_text: list[str]) -> None:
     text = "\n".join(pages_text)
-    if "janeiro/2024" not in text.lower() or "47.224,73" not in text:
-        return
     credit = sum((record.valor or Decimal()) for record in records if record.natureza == "Crédito")
     debit = sum((record.valor or Decimal()) for record in records if record.natureza == "Débito")
+    summary_credit = _santander_summary_amount(text, r"Total de Cr[eé]ditos")
+    summary_debit = _santander_summary_amount(text, r"Total de D[eé]bitos")
+    summary_errors = []
+    if summary_credit is not None and credit != summary_credit:
+        summary_errors.append(f"créditos {credit} != {summary_credit}")
+    if summary_debit is not None and debit != summary_debit:
+        summary_errors.append(f"débitos {debit} != {summary_debit}")
+    if summary_errors:
+        raise ValueError("Falha de validação do extrato Santander: " + "; ".join(summary_errors))
+
+    if "janeiro/2024" not in text.lower() or "47.224,73" not in text:
+        return
     errors = []
     if len(records) != SANTANDER_EXPECTED_RECORDS:
         errors.append(f"quantidade {len(records)} != {SANTANDER_EXPECTED_RECORDS}")
@@ -1585,6 +2211,175 @@ def _extract_basa_statement(text: str, page_number: int) -> list[ParsedStatement
     return results
 
 
+def _statement_period(text: str) -> tuple[date, date] | None:
+    url_period = re.search(r"hdnDataInicio=(\d{2}/\d{2}/\d{4}).*?hdnDataFinal=(\d{2}/\d{2}/\d{4})", text, re.I | re.S)
+    if url_period:
+        start, _ = parse_date_time(url_period.group(1))
+        end, _ = parse_date_time(url_period.group(2))
+        if start and end:
+            return start, end
+    explicit_period = re.search(r"(?m)^\s*(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})\s*$", text)
+    if explicit_period:
+        start, _ = parse_date_time(explicit_period.group(1))
+        end, _ = parse_date_time(explicit_period.group(2))
+        if start and end:
+            return start, end
+    between_period = re.search(r"Entre\s+(\d{2}/\d{2}/\d{4})\s+e\s+(\d{2}/\d{2}/\d{4})", text, re.I)
+    if between_period:
+        start, _ = parse_date_time(between_period.group(1))
+        end, _ = parse_date_time(between_period.group(2))
+        if start and end:
+            return start, end
+    dates = [parse_date_time(match.group(0))[0] for match in re.finditer(DATE_RE, text)]
+    dates = [item for item in dates if item]
+    if len(dates) < 2:
+        return None
+    return dates[0], dates[1]
+
+
+def _in_statement_period(parsed_date: date | None, period: tuple[date, date] | None) -> bool:
+    return bool(parsed_date and (not period or period[0] <= parsed_date <= period[1]))
+
+
+def _extract_caixa_statement(text: str, page_number: int) -> list[ParsedStatement]:
+    normalized = normalize_name(text)
+    has_period_url = "hdnDataInicio=" in text and "hdnDataFinal=" in text
+    if "GERENCIADOR CAIXA" not in normalized or ("EXTRATO POR PERIODO" not in normalized and not has_period_url):
+        return []
+    lines = _lines(text)
+    period = _statement_period(text)
+    results: list[ParsedStatement] = []
+    index = 0
+    while index < len(lines) - 3:
+        parsed_date, _ = parse_date_time(lines[index])
+        if not parsed_date:
+            index += 1
+            continue
+        document = lines[index + 1].strip()
+        history = lines[index + 2].strip()
+        raw_value = lines[index + 3].strip()
+        if not re.fullmatch(r"\d+", document) or not amount_text(raw_value):
+            index += 1
+            continue
+        if _basa_should_skip_history(history) or not _in_statement_period(parsed_date, period):
+            index += 4
+            continue
+        amount = parse_brl(raw_value)
+        if amount is None:
+            index += 1
+            continue
+        nature = "Crédito" if raw_value.upper().endswith("C") else "Débito"
+        raw = "\n".join(lines[index:index + 5])
+        results.append(ParsedStatement(
+            data=parsed_date,
+            hora=None,
+            historico=history,
+            nome="",
+            valor=abs(amount),
+            natureza=nature,
+            texto_original=raw,
+            pagina_numero=page_number,
+            numero_documento=document,
+        ))
+        index += 5 if index + 4 < len(lines) and amount_text(lines[index + 4]) else 4
+    return results
+
+
+def _extract_bradesco_statement_pages(pages: list[str]) -> list[ParsedStatement]:
+    records: list[ParsedStatement] = []
+    current_date: date | None = None
+    period = _statement_period("\n".join(pages))
+    for page_number, text in enumerate(pages, 1):
+        page_records, current_date = _extract_bradesco_statement_page(text, page_number, current_date, period)
+        records.extend(page_records)
+    return records
+
+
+def _extract_bradesco_statement_page(text: str, page_number: int, initial_date: date | None = None, period: tuple[date, date] | None = None) -> tuple[list[ParsedStatement], date | None]:
+    normalized = normalize_name(text)
+    if "EXTRATO MENSAL POR PERIODO" not in normalized and "EXTRATO DE AG" not in normalized:
+        return [], initial_date
+    lines = _lines(text)
+    current_date = initial_date
+    results: list[ParsedStatement] = []
+    index = 0
+    while index < len(lines):
+        parsed_date, _ = parse_date_time(lines[index])
+        if parsed_date and re.fullmatch(DATE_RE, lines[index]):
+            current_date = parsed_date
+            index += 1
+            continue
+        if not current_date:
+            index += 1
+            continue
+        if _basa_should_skip_history(lines[index]) or _bradesco_should_skip_line(lines[index]):
+            index += 1
+            continue
+        if amount_text(lines[index]):
+            index += 1
+            continue
+        doc_index = -1
+        for candidate in range(index + 1, min(index + 5, len(lines) - 1)):
+            candidate_date, _ = parse_date_time(lines[candidate])
+            if candidate_date and re.fullmatch(DATE_RE, lines[candidate]):
+                doc_index = -2
+                break
+            if re.fullmatch(r"\d+", lines[candidate]) and amount_text(lines[candidate + 1]):
+                doc_index = candidate
+                break
+        if doc_index == -2:
+            index = candidate
+            continue
+        if doc_index < 0:
+            index += 1
+            continue
+        description = " ".join(lines[index:doc_index]).strip()
+        raw_value = lines[doc_index + 1].strip()
+        amount = parse_brl(raw_value)
+        if not description or amount is None or _basa_should_skip_history(description) or not _in_statement_period(current_date, period):
+            index = doc_index + 3
+            continue
+        nature = "Débito" if raw_value.startswith("-") else "Crédito"
+        name = _bradesco_statement_name(description)
+        results.append(ParsedStatement(
+            data=current_date,
+            hora=None,
+            historico=description,
+            nome=name,
+            valor=abs(amount),
+            natureza=nature,
+            texto_original="\n".join(lines[index:doc_index + 3]),
+            pagina_numero=page_number,
+            numero_documento=lines[doc_index],
+        ))
+        index = doc_index + 3
+    return results, current_date
+
+
+def _bradesco_should_skip_line(line: str) -> bool:
+    normalized = normalize_name(line)
+    return normalized in {
+        "DATA",
+        "LANCAMENTO",
+        "DCTO",
+        "CREDITO R",
+        "DEBITO R",
+        "SALDO R",
+        "TOTAL",
+        "FOLHA",
+        "EXTRATO MENSAL POR PERIODO",
+    } or normalized.startswith(("AGENCIA CONTA", "TOTAL DISPONIVEL", "NOME USUARIO", "DATA OPERACAO", "SAC SERVICO", "OUVIDORIA"))
+
+
+def _bradesco_statement_name(history: str) -> str:
+    parts = history.split()
+    if len(parts) > 1 and parts[0].upper().rstrip(":") in {"REM", "DES", "CONTR"}:
+        return " ".join(parts[1:]).strip()
+    if "\n" in history:
+        return history.splitlines()[-1].strip()
+    return history
+
+
 def _basa_should_skip_history(history: str) -> bool:
     return bool(re.search(r"\b(?:SALDO|TOTAL DE|LIMITE|VENCTO|TIPO CONTA)\b", normalize_name(history), re.I))
 
@@ -1610,7 +2405,7 @@ def _extract_banco_do_brasil_statement(text: str, page_number: int) -> list[Pars
         # BB codes identify the operation and counterparty. Keep them intact so
         # the extracted statement remains auditable and can be matched precisely.
         document = " ".join(match.group("documento").split())
-        full_document = document if re.search(r"\s", document) else ""
+        full_document = document if re.search(r"\s", document) or _banco_do_brasil_contract_history(match.group("historico")) else ""
         history = " ".join(part for part in [" ".join(match.group("historico").split()), full_document] if part)
         if re.search(r"\b(?:saldo anterior|saldo do dia|saldo final|limite|valor total devido|cheque especial)\b", history, re.I):
             continue
@@ -1632,8 +2427,14 @@ def _extract_banco_do_brasil_statement(text: str, page_number: int) -> list[Pars
             texto_original=match.group(0).strip(),
             pagina_numero=page_number,
             data_origem=data_origem,
+            numero_documento=document,
         ))
     return results
+
+
+def _banco_do_brasil_contract_history(history: str) -> bool:
+    normalized = normalize_name(history)
+    return bool(re.search(r"\b(?:CAP GIRO|AMORTIZACAO|EMPRESTIMO|FINANCIAMENTO|PARCELA|CONTRATO|OPERACAO|CREDITO RURAL|COMERCIAL)\b", normalized))
 
 
 def deduplicate_statement_records(records: list[ParsedStatement]) -> list[ParsedStatement]:

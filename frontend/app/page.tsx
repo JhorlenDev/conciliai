@@ -6,7 +6,8 @@ import { ArrowRight, Building2, Clock3, FileText, ListFilter, Plus, RefreshCw, T
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 type Client = { id: string; nome: string };
-type BankReconciliation = { id: string; banco: string; status: string };
+type BankProgress = { total: number; cobertos: number; percentual: number };
+type BankReconciliation = { id: string; banco: string; status: string; progresso_regras?: BankProgress };
 type Process = {
   id: string;
   cliente_id: string;
@@ -19,12 +20,31 @@ type Process = {
 };
 
 const yearFromDate = (value: string) => value.match(/\d{4}/)?.[0] ?? "";
+const bankLogos: Record<string, string> = {
+  "Banco do Brasil": "/bancos/banco-do-brasil.png",
+  Santander: "/bancos/santander.png",
+  BASA: "/bancos/basa.png",
+  Bradesco: "/bancos/bradesco.png",
+  Caixa: "/bancos/caixa.png",
+  "Conta Caixa": "/bancos/conta-caixa.svg",
+  Notas: "/bancos/notas.svg",
+  Apropriações: "/bancos/apropriacoes.png",
+  "Empréstimos/Financeiro": "/bancos/emprestimos.svg",
+  "Empréstimos/Financiamentos": "/bancos/emprestimos.svg",
+};
+const processProgressBanks = ["Banco do Brasil", "Santander", "BASA", "Bradesco", "Caixa"];
 
 const periodTouchesYear = (process: Process, year: string) => {
   const selectedYear = Number(year);
   const startYear = Number(yearFromDate(process.data_inicio));
   const endYear = Number(yearFromDate(process.data_fim) || yearFromDate(process.data_inicio));
   return startYear <= selectedYear && selectedYear <= endYear;
+};
+
+const progressColor = (percent: number) => {
+  if (percent >= 60) return "text-emerald-700";
+  if (percent >= 10) return "text-orange-600";
+  return "text-red-700";
 };
 
 export default function EntryPage() {
@@ -146,7 +166,7 @@ export default function EntryPage() {
           {now && <div className="hidden items-center gap-2 rounded-md border border-emerald-700 bg-emerald-900/30 px-3 py-1.5 text-right leading-tight text-emerald-50 sm:flex"><Clock3 size={20}/><span><strong className="block text-sm font-semibold">{now.toLocaleDateString("pt-BR", { weekday: "short", day: "numeric", month: "short", year: "numeric" })}</strong><span className="text-xs">{now.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span></span></div>}
         </div>
       </header>
-      <div className="mx-auto grid max-w-6xl gap-6 px-5 py-7 lg:grid-cols-[360px_1fr]">
+      <div className="mx-auto grid max-w-[96rem] gap-5 px-5 py-7 lg:grid-cols-[320px_1fr]">
         <form
           onSubmit={create}
           className="h-fit rounded-xl border border-emerald-200 bg-white p-5 shadow-sm"
@@ -280,10 +300,26 @@ export default function EntryPage() {
                        {date(process.data_inicio)} - {date(process.data_fim)}
                      </p>
                      <p className="mt-0.5 truncate text-[10px] text-slate-400">Criado: {dateTime(process.criado_em)}</p>
+                     <div className="mt-2 grid max-w-full grid-cols-5 gap-1">
+                         {processProgressBanks.map((bankName) => {
+                           const bank = process.bancos.find((item) => item.banco === bankName);
+                           const progress = bank?.progresso_regras ?? { total: 0, cobertos: 0, percentual: 0 };
+                           return (
+                             <span
+                               className="inline-flex min-w-0 items-center justify-center gap-0.5 rounded border border-slate-200 bg-slate-50 px-1 py-0.5"
+                               title={`${bankName}: ${progress.cobertos} de ${progress.total} lançamentos cobertos por regras salvas`}
+                               key={bankName}
+                             >
+                               <img src={bankLogos[bankName] ?? "/bancos/apropriacoes.png"} alt="" className="h-3.5 w-3.5 shrink-0 rounded-sm object-contain" />
+                               <span className={`text-[10px] font-bold leading-none tabular-nums ${progressColor(progress.percentual)}`}>{progress.percentual}%</span>
+                             </span>
+                           );
+                         })}
+                       </div>
                    </div>
                    <ArrowRight size={14} className="shrink-0 text-emerald-800" aria-hidden="true" />
                    </button>
-                  <button type="button" onClick={() => setProcessToDelete(process)} aria-label={`Excluir processo de ${process.cliente_nome}`} title="Excluir processo" className="mr-1.5 self-center rounded-md p-1.5 text-slate-500 hover:bg-red-50 hover:text-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600"><Trash2 size={14}/></button>
+                  <button type="button" onClick={() => setProcessToDelete(process)} aria-label={`Excluir processo de ${process.cliente_nome}`} title="Excluir processo" className="mr-1.5 self-center rounded-md p-1.5 text-red-600 hover:bg-red-50 hover:text-red-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600"><Trash2 size={14}/></button>
                 </article>
             ))}
             {!processes.length && (

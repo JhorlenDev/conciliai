@@ -5,7 +5,7 @@ import pytest
 
 from app.services.normalization import accounting_nature, names_similar, normalize_statement_nature
 from app.services.matching import invoice_is_candidate
-from app.services.parsers import ParsedStatement, _validate_santander_expected_statement, deduplicate_statement_records, extract_financial_values, extract_receipts, extract_santander_words_statement, extract_statement, extract_statement_pages, parse_brl, parse_date_time
+from app.services.parsers import ParsedStatement, _validate_santander_expected_statement, deduplicate_statement_records, extract_financial_values, extract_invoices, extract_loan_receipts, extract_receipts, extract_santander_words_statement, extract_statement, extract_statement_pages, parse_brl, parse_date_time
 from app.api.routes import receipt_match_criterion
 from app.models import Comprovante
 
@@ -14,6 +14,102 @@ def test_receipt_is_one_line_even_with_institutional_text():
     records = extract_receipts("VALOR: 520,52\nPAGO PARA: Lia Silva\nDATA: 02/01/2024 - 09:40:01\nSAC 0800\nOUVIDORIA", 1)
     assert len(records) == 1
     assert records[0].favorecido == "Lia Silva"
+
+
+def test_loan_receipt_extracts_contract_principal_interest_and_total():
+    text = """COMPROVANTE DE EMPRÉSTIMO / FINANCIAMENTO
+CONTRATO: 57.709.569
+DATA DO DÉBITO: 15/01/2024
+VALOR PRINCIPAL: 2.083,33
+JUROS: 733,67
+VALOR TOTAL: 2.817,00
+"""
+    records = extract_loan_receipts(text, 1)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.data == date(2024, 1, 15)
+    assert record.numero_documento == "57.709.569"
+    assert record.valor == Decimal("2817.00")
+    assert record.financeiros.valor_original == Decimal("2083.33")
+    assert record.financeiros.valor_juros == Decimal("733.67")
+    assert record.tipo_operacao == "EMPRÉSTIMO/FINANCIAMENTO"
+
+
+def test_banco_do_brasil_loan_schedule_groups_interest_and_capital_by_date():
+    text = """SISBB - Sistema de Informacoes do Banco do Brasil
+Credito Rural e Comercial
+Cronograma Reposicao Exigivel
+Mutuario . . . : CENTRO ODONTOLOGICO FIGUEIRO LTDA ME     Operacao: 057.709.569
+Vencimento Parcela                         Previsto      Realizado      Exigivel
+15.01.2024 JUROS                             733,67        733,67         0,00
+15.01.2024 CAPITAL                         2.083,33      2.083,33         0,00
+15.02.2024 JUROS                             672,53        672,53         0,00
+15.02.2024 CAPITAL                         2.083,33      2.083,33         0,00
+"""
+    records = extract_loan_receipts(text, 1)
+
+    january = records[0]
+    assert january.data == date(2024, 1, 15)
+    assert january.numero_documento == "057.709.569"
+    assert january.valor == Decimal("2817.00")
+    assert january.financeiros.valor_original == Decimal("2083.33")
+    assert january.financeiros.valor_juros == Decimal("733.67")
+    assert january.financeiros.valor_encargos is None
+    assert records[1].valor == Decimal("2755.86")
+
+
+def test_invoice_extracts_supplier_number_date_and_total():
+    text = """NOTA FISCAL DE SERVIÇOS ELETRÔNICA
+NÚMERO DA NOTA: 12345
+DATA DE EMISSÃO: 10/01/2024
+PRESTADOR: CLINICA EXEMPLO LTDA
+CNPJ: 12.345.678/0001-90
+VALOR TOTAL DA NOTA: 1.250,75
+"""
+    records = extract_invoices(text, 1)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.data_emissao == date(2024, 1, 10)
+    assert record.numero_nota == "12345"
+    assert record.fornecedor == "CLINICA EXEMPLO LTDA"
+    assert record.cpf_cnpj == "12.345.678/0001-90"
+    assert record.valor_total == Decimal("1250.75")
+
+
+def test_tefe_nfse_extracts_number_taker_total_and_payment_data():
+    text = """PM DE TEFE - AM
+NOTA FISCAL DE SERVIÇOS ELETRÔNICA - NFS-e
+Número da NFS-e
+512932
+Data e Hora de Emissão da NFS-e
+31/01/2024 às 16:48:55
+PRESTADOR DE SERVIÇOS
+CPF/CNPJ RG/Inscrição Estadual Inscrição Municipal Cadastro Nome/Razão Social
+08.695.575/0001-88 01010240237001 000200437 CENTRO ODONTOLOGICO FIGUEIRO LTDA - ME
+TOMADOR DE SERVIÇOS
+CPF/CNPJ/Documento RG/Inscrição Estadual Inscrição Municipal Nome/Razão Social
+014.782.102-90 KARLA DANIELY DE AMORIM PEREIRA
+Discriminação dos Serviços
+1.0 UN PRESTAÇÃO DE SERVIÇOS ODONTOLÓGICOS 120.0 R$ 120,00
+Valor Líquido da NFS-e: R$ 120,00
+FATURAS: PIX Venc: 27/01/2024 R$ 120,00 Doc: 1434 Obs: null
+"""
+    records = extract_invoices(text, 3)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.pagina_numero == 3
+    assert record.numero_nota == "512932"
+    assert record.data_emissao == date(2024, 1, 31)
+    assert record.fornecedor == "KARLA DANIELY DE AMORIM PEREIRA"
+    assert record.cpf_cnpj == "014.782.102-90"
+    assert record.valor_total == Decimal("120.00")
+    assert record.dados["prestador"] == "CENTRO ODONTOLOGICO FIGUEIRO LTDA - ME"
+    assert record.dados["forma_pagamento"] == "PIX"
+    assert record.dados["data_pagamento"] == "2024-01-27"
+    assert record.dados["documento_pagamento"] == "1434"
 
 
 def test_pix_receipt_extracts_its_separate_tariff():
@@ -702,6 +798,29 @@ def test_santander_words_ignore_summary_before_table_and_read_split_header():
     ]
 
 
+def test_santander_words_do_not_stop_on_previous_month_balance_for_february():
+    pages_words = [[
+        *word_line(10, [("Conta Corrente", 40)]),
+        *word_line(20, [("Movimentação", 40)]),
+        *santander_split_header(30),
+        *word_line(50, [("SALDO EM 31/01", 34), ("0,00", 508)]),
+        *word_line(60, [("PAGAMENTO CARTAO DE DEBITO", 65), ("289884", 296), ("415,80", 385)]),
+        *word_line(70, [("ANTECIPACAO GETNET", 65), ("065118", 296), ("140,04", 385)]),
+        *word_line(80, [("02/02", 34), ("PAGAMENTO CARTAO DE DEBITO", 65), ("289884", 296), ("39,60", 385)]),
+        *word_line(90, [("SALDO EM 29/02", 34), ("0,00", 508)]),
+        *word_line(100, [("TRANSFERENCIAS ENTRE CONTAS", 65), ("999,00", 385)]),
+    ]]
+    pages_text = ["EXTRATO CONSOLIDADO INTELIGENTE\nSantander\nfevereiro/2024\nConta Corrente\nMovimentação\nMovimentos (R$)"]
+
+    records = extract_santander_words_statement(pages_words, pages_text)
+
+    assert [(item.data, item.historico, item.valor, item.natureza, item.numero_documento) for item in records] == [
+        (date(2024, 2, 1), "PAGAMENTO CARTAO DE DEBITO", Decimal("415.80"), "Crédito", "289884"),
+        (date(2024, 2, 1), "ANTECIPACAO GETNET", Decimal("140.04"), "Crédito", "065118"),
+        (date(2024, 2, 2), "PAGAMENTO CARTAO DE DEBITO", Decimal("39.60"), "Crédito", "289884"),
+    ]
+
+
 def test_santander_words_keep_first_description_word_with_float_coordinate_noise():
     pages_words = [[
         *word_line(10, [("Conta Corrente", 40)]),
@@ -842,6 +961,13 @@ def test_santander_expected_file_validation_fails_when_count_or_totals_do_not_ma
         _validate_santander_expected_statement(records, ["janeiro/2024\nTotal de Créditos 47.224,73\nSaldo de Conta Corrente em 31/12 0,00\nSaldo de Conta Corrente em 31/01 0,00"])
 
 
+def test_santander_summary_validation_fails_for_any_month_when_totals_do_not_match():
+    records: list[ParsedStatement] = []
+
+    with pytest.raises(ValueError, match=r"créditos 0 != 42820.93"):
+        _validate_santander_expected_statement(records, ["fevereiro/2024\nTotal de Créditos 42.820,93\nTotal de Débitos 42.820,93"])
+
+
 def test_banco_do_brasil_uses_first_cd_value_and_ignores_balance_rows():
     text = """02/01/2024
 0000
@@ -978,6 +1104,22 @@ def test_banco_do_brasil_keeps_ted_codes_and_full_counterparty_text():
     assert record.historico == "438 TED 033 2478 008695575000188 CENTRO ODONTO"
     assert record.nome == ""
     assert f"{record.historico} {record.nome}".strip() == "438 TED 033 2478 008695575000188 CENTRO ODONTO"
+
+
+def test_banco_do_brasil_keeps_contract_operation_number_for_safe_rules():
+    text = """15/01/2024
+0000
+13128 500 Cap Giro Dig Amortização
+57.709.569.000.109
+2.817,00 D
+"""
+
+    record = extract_statement(text, 1, "Banco do Brasil")[0]
+
+    assert record.historico == "13128 500 Cap Giro Dig Amortização 57.709.569.000.109"
+    assert record.numero_documento == "57.709.569.000.109"
+    assert record.valor == Decimal("2817.00")
+    assert record.natureza == "Débito"
 
 
 def test_payment_receipt_uses_beneficiario_final_and_valor_documento():
@@ -1205,3 +1347,124 @@ VALOR: 520,52
     assert financial.valor_desconto is None
     assert financial.valor_juros is None
     assert financial.valor_multa is None
+
+
+def test_caixa_statement_extracts_movements_and_skips_daily_balances():
+    text = """01/02/2024, 08:10
+Ge:renCia:dor CAiXA
+https://gerenciador.caixa.gov.br/SIIBC/imprime_ext_periodo.processa?hdnDataInicio=01/01/2024&hdnDataFinal=31/01/2024
+Extrato por período
+02/01/2024
+291156
+ENVIO TEV
+1.000,00 D
+1.000,00 D
+02/01/2024
+727220
+RESG AUTOM
+1.000,00 C
+0,00 C
+02/01/2024
+000000
+SALDO DIA
+0,00 C
+"""
+    records = extract_statement(text, 1, "Caixa")
+    assert [(item.numero_documento, item.historico, item.valor, item.natureza) for item in records] == [
+        ("291156", "ENVIO TEV", Decimal("1000.00"), "Débito"),
+        ("727220", "RESG AUTOM", Decimal("1000.00"), "Crédito"),
+    ]
+    assert [item.nome for item in records] == ["", ""]
+
+
+def test_bradesco_statement_inherits_date_between_pages_and_skips_previous_balance():
+    first_page = """Extrato Mensal / Por Período
+01/01/2024 31/01/2024
+Data
+Lançamento
+Dcto.
+Crédito (R$)
+Débito (R$)
+Saldo (R$)
+29/12/2023
+SALDO ANTERIOR
+25.151,62
+02/01/2024
+CARTAO VISA ELECTRON
+CIELO S.A - INSTITUICAO DE PAG
+3723000
+672,74
+25.824,36
+"""
+    second_page = """Extrato Mensal / Por Período
+PAGTO ELETRON COBRANCA
+DISTR DE MEDI SANTA CRUZ LTDA
+4518
+-3.034,57
+1.958,09
+"""
+    records = extract_statement_pages([first_page, second_page], "Bradesco")
+    assert [(item.data, item.historico, item.valor, item.natureza, item.pagina_numero) for item in records] == [
+        (date(2024, 1, 2), "CARTAO VISA ELECTRON CIELO S.A - INSTITUICAO DE PAG", Decimal("672.74"), "Crédito", 1),
+        (date(2024, 1, 2), "PAGTO ELETRON COBRANCA DISTR DE MEDI SANTA CRUZ LTDA", Decimal("3034.57"), "Débito", 2),
+    ]
+
+
+def test_caixa_boleto_receipt_extracts_fields_from_two_page_text():
+    text = """2ª Via - Comprovante de Pagamento de Boleto
+Via Internet Banking CAIXA
+Beneficiário original / Cedente
+Nome Fantasia:
+MAPEMI BRASIL MATERIAIS MEDICOS E ODONTO
+Nome/Razão Social:
+MAPEMI BRASIL MATERIAIS MEDICOS E ODONTO
+CPF/CNPJ:
+84.487.131/0001-35
+Valor Nominal do Boleto:
+1.710,87
+Valor Pago (R$):
+1.710,87
+Data/hora da operação:
+25/01/2024 10:35:36
+Código da operação:
+025084072
+"""
+    record = extract_receipts(text, 1)[0]
+    assert record.data == date(2024, 1, 25)
+    assert record.hora == "10:35:36"
+    assert record.favorecido == "MAPEMI BRASIL MATERIAIS MEDICOS E ODONTO"
+    assert record.cnpj_beneficiario == "84.487.131/0001-35"
+    assert record.numero_documento == "025084072"
+    assert record.valor == Decimal("1710.87")
+
+
+def test_bradesco_boleto_receipt_extracts_reversed_label_layout():
+    text = """PGTO BOLETO STA CRUZ
+Descrição:
+R$ 105,17
+Valor total:
+R$ 104,65
+Valor
+11/01/2024
+Data de débito:
+061.940.292/0001-37
+CPF/CNPJ Beneficiário:
+DISTR DE MEDI SANTA CRUZ LTDA
+Nome Fantasia
+Beneficiário:
+DISTR DE MEDI SANTA CRUZ LTDA
+Razão Social
+Beneficiário:
+Comprovante de Transação Bancária
+Boleto de Cobrança
+Data da operação: 11/01/2024
+0004519
+Documento:
+"""
+    record = extract_receipts(text, 1)[0]
+    assert record.data == date(2024, 1, 11)
+    assert record.favorecido == "DISTR DE MEDI SANTA CRUZ LTDA"
+    assert record.cnpj_beneficiario == "061.940.292/0001-37"
+    assert record.numero_documento == "0004519"
+    assert record.valor == Decimal("105.17")
+    assert record.financeiros.valor_original == Decimal("104.65")

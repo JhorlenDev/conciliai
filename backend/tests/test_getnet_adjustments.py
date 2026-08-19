@@ -4,13 +4,13 @@ from decimal import Decimal
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.api.routes import RegraContabilInput, accounting_csv, accounting_integrity, accounting_rules, create_accounting_rule
+from app.api.routes import RegraContabilInput, RegraFonteInput, accounting_csv, accounting_integrity, accounting_rules, create_accounting_rule, create_source_accounting_rule, source_accounting_csv, source_accounting_rules
 from app.core.database import Base
 from app.models import Arquivo, Cliente, Comprovante, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato
 from app.services.getnet_adjustments import GETNET_ADJUSTMENT_ORIGIN, GETNET_ADJUSTMENT_STATUS, sync_getnet_anticipation_adjustments
 
 
-def adjustment_session(bank="Santander", start=date(2024, 1, 1), end=date(2024, 1, 31)):
+def adjustment_session(bank="Santander", start=date(2024, 1, 1), end=date(2024, 1, 31), getnet_type="getnet_vendas"):
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine)()
@@ -21,7 +21,7 @@ def adjustment_session(bank="Santander", start=date(2024, 1, 1), end=date(2024, 
     session.add(reconciliation)
     session.flush()
     statement_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado=bank, nome_original="extrato.pdf", caminho="/tmp/extrato.pdf", paginas=3)
-    getnet_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="getnet_vendas", banco_selecionado=bank, nome_original="getnet.pdf", caminho="/tmp/getnet.pdf")
+    getnet_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento=getnet_type, banco_selecionado=bank, nome_original="getnet.pdf", caminho="/tmp/getnet.pdf")
     session.add_all([statement_file, getnet_file, ContaBancaria(cliente_id=client.id, banco="Santander", conta_contabil="219 - Banco Santander")])
     session.flush()
     return session, reconciliation, statement_file, getnet_file
@@ -81,6 +81,51 @@ def test_getnet_net_greater_than_santander_generates_anticipation_expense_and_cs
     assert sync_getnet_anticipation_adjustments(reconciliation, session)[0]["situacao"] == "Ajuste lançado"
     csv = accounting_csv(reconciliation.id, session).body.decode("utf-8-sig")
     assert "Juros Getnet;100.00;DIFERENÇA ENTRE GETNET E RECEBIMENTOS NO SANTANDER" in csv
+
+
+def test_getnet_statement_upload_type_replaces_separate_sales_and_commission_types():
+    session, reconciliation, statement_file, getnet_file = adjustment_session(getnet_type="getnet_extrato")
+    add_getnet_net(session, reconciliation, getnet_file, "1100.00")
+    add_santander_getnet(session, reconciliation, statement_file, "1000.00")
+
+    summary = sync_getnet_anticipation_adjustments(reconciliation, session)
+
+    assert summary[0]["total_getnet"] == "1100.00"
+    assert summary[0]["total_santander"] == "1000.00"
+    assert summary[0]["diferenca"] == "100.00"
+    assert summary[0]["situacao"] == "Pendente em regras"
+
+
+def test_generic_machine_statement_type_keeps_santander_getnet_adjustment_flow():
+    session, reconciliation, statement_file, machine_file = adjustment_session(getnet_type="maquininha_extrato")
+    add_getnet_net(session, reconciliation, machine_file, "1100.00")
+    add_santander_getnet(session, reconciliation, statement_file, "1000.00")
+
+    summary = sync_getnet_anticipation_adjustments(reconciliation, session)
+
+    assert summary[0]["total_getnet"] == "1100.00"
+    assert summary[0]["total_santander"] == "1000.00"
+    assert summary[0]["diferenca"] == "100.00"
+    assert summary[0]["situacao"] == "Pendente em regras"
+
+
+def test_machine_rules_are_independent_and_export_original_value_csv():
+    session, reconciliation, _, machine_file = adjustment_session(getnet_type="maquininha_extrato")
+    add_getnet_net(session, reconciliation, machine_file, "970.00")
+    receipt = session.query(Comprovante).one()
+    receipt.valor_original = Decimal("1000.00")
+    receipt.favorecido = "GETNET - VISA DÉBITO"
+    receipt.beneficiario = "GETNET - VISA DÉBITO"
+    session.commit()
+
+    initial = source_accounting_rules(reconciliation.id, "maquininha", session)
+    assert initial["resumo"] == {"total": 1, "classificados": 0, "pendentes": 1}
+
+    created = create_source_accounting_rule(reconciliation.id, "maquininha", RegraFonteInput(gatilho="visa debito", conta_debito="112 - Cartões", conta_credito="311 - Receita", historico="Venda cartão", complemento="Extrato Getnet"), session)
+
+    assert created["regras"]["resumo"] == {"total": 1, "classificados": 1, "pendentes": 0}
+    csv = source_accounting_csv(reconciliation.id, "maquininha", session).body.decode("utf-8-sig")
+    assert "112;311;Venda cartão;1000.00;Extrato Getnet" in csv
 
 
 def test_equal_values_do_not_generate_adjustment():

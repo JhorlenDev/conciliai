@@ -4,9 +4,9 @@ from decimal import Decimal
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.api.routes import ContaBancariaClienteInput, accounting_rules, apply_accounting_rules, banks, client_bank_accounts, create_reconciliation_process, delete_client_bank_account, delete_reconciliation_process, reconcile, reprocess_document, result, resume_process_bank, save_client_bank_account, unused_documents
+from app.api.routes import ContaBancariaClienteInput, RegraFonteInput, accounting_rules, apply_accounting_rules, banks, client_bank_accounts, create_reconciliation_process, create_source_accounting_rule, delete_client_bank_account, delete_reconciliation_process, list_reconciliation_processes, reconcile, reprocess_document, result, resume_process_bank, save_client_bank_account, source_accounting_csv, source_accounting_rules, unused_documents
 from app.core.database import Base
-from app.models import Arquivo, Cliente, Comprovante, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, ProcessoConciliacao, RegraContabil, RegraContabilExcecao
+from app.models import Arquivo, Cliente, Comprovante, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, NotaFiscal, ProcessoConciliacao, RegraContabil, RegraContabilExcecao
 from app.services.normalization import normalize_name
 from app.api.routes import ProcessoBancoInput, ProcessoConciliacaoInput
 
@@ -21,6 +21,7 @@ def test_getnet_is_hidden_from_new_bank_list_but_legacy_processes_still_work():
     assert "Santander" in banks()
     assert "Vendas com Cartão" not in banks()
     assert "Comissões Getnet" not in banks()
+    assert "Notas" in banks()
 
     process = create_reconciliation_process(ProcessoConciliacaoInput(cliente_id=client.id, data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31)), session)
     legacy = resume_process_bank(process["id"], ProcessoBancoInput(banco="Comissões Getnet"), session)
@@ -50,6 +51,32 @@ def test_process_resumes_the_same_bank_without_cross_bank_rule_source():
     rules = accounting_rules(bradesco["id"], session)
     assert rules["pendentes"][0].get("regra_compartilhada") is None
     assert rules["salvas"] == []
+
+
+def test_process_list_includes_compact_rule_progress_by_bank():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.commit()
+    process = create_reconciliation_process(ProcessoConciliacaoInput(cliente_id=client.id, data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31), banco="Banco do Brasil"), session)
+    reconciliation_id = process["bancos"][0]["id"]
+    file = Arquivo(conciliacao_id=reconciliation_id, tipo_documento="extrato", banco_selecionado="Banco do Brasil", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    session.add(file); session.flush()
+    covered = MovimentoExtrato(conciliacao_id=reconciliation_id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 2), historico="PIX", natureza="Crédito")
+    pending = MovimentoExtrato(conciliacao_id=reconciliation_id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 3), historico="TED", natureza="Débito")
+    session.add_all([covered, pending]); session.flush()
+    match = Correspondencia(conciliacao_id=reconciliation_id, movimento_extrato_id=covered.id)
+    session.add(match); session.flush()
+    rule = RegraContabil(cliente_id=client.id, conciliacao_id=reconciliation_id, banco="Banco do Brasil", tipo_fonte="extrato", tipo_operacao="Crédito", favorecido_normalizado=normalize_name("PIX"), conta_debito="Banco", conta_credito="Receita", historico="Receita")
+    session.add(rule); session.flush()
+    session.add(LancamentoContabil(correspondencia_id=match.id, regra_contabil_id=rule.id, valor=Decimal("10.00"), status="aplicado_por_regra"))
+    session.commit()
+
+    data = list_reconciliation_processes(db=session)
+    progress = data[0]["bancos"][0]["progresso_regras"]
+
+    assert progress == {"total": 2, "cobertos": 1, "percentual": 50}
 
 
 def test_client_bank_account_crud_preserves_accounting_account():
@@ -155,6 +182,77 @@ def test_boleto_matches_paid_value_once_and_creates_component_items():
     assert [(item.componente, item.valor, item.efeito_no_total) for item in items] == [("VALOR_COBRADO", Decimal("493.14"), "SOMA"), ("DESCONTO_ABATIMENTO", Decimal("54.79"), "OUTROS")]
     row = result(reconciliation.id, session)[0]
     assert (row["total_lancamentos"], row["diferenca"]) == ("R$ 493,14", "R$ 0,00")
+
+
+def test_caixa_generic_boleto_matches_receipt_by_partial_document_number():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Caixa", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    statement_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Caixa", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    receipt_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="comprovante", banco_selecionado="Caixa", nome_original="boleto.pdf", caminho="/tmp/boleto.pdf")
+    session.add_all([statement_file, receipt_file]); session.flush()
+    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=statement_file.id, pagina_numero=2, data=date(2024, 1, 25), historico="PAG BOLETO", valor=Decimal("1710.87"), natureza="Débito", dados_originais={"numero_documento": "084072"})
+    receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=receipt_file.id, pagina_numero=1, data=date(2024, 1, 25), hora="10:35:36", favorecido="MAPEMI BRASIL MATERIAIS MEDICOS E ODONTO", beneficiario="MAPEMI BRASIL MATERIAIS MEDICOS E ODONTO", numero_documento="025084072", valor=Decimal("1710.87"), valor_original=Decimal("1710.87"), valor_pago=Decimal("1710.87"), tipo_operacao="BOLETO")
+    session.add_all([movement, receipt]); session.commit()
+
+    reconcile(reconciliation.id, session)
+
+    match = session.query(Correspondencia).filter_by(movimento_extrato_id=movement.id).one()
+    assert match.comprovante_id == receipt.id
+    assert match.criterio_correspondencia == "Correspondência pelo código Caixa sem prefixo do dia"
+    assert unused_documents(reconciliation.id, session)["comprovantes"] == []
+
+
+def test_bradesco_boleto_matches_receipt_by_document_number_with_leading_zeroes():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Bradesco", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    statement_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Bradesco", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    receipt_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="comprovante", banco_selecionado="Bradesco", nome_original="boleto.pdf", caminho="/tmp/boleto.pdf")
+    session.add_all([statement_file, receipt_file]); session.flush()
+    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=statement_file.id, pagina_numero=1, data=date(2024, 1, 11), historico="PAGTO ELETRON COBRANCA PGTO BOLETO STA CRUZ", valor=Decimal("105.17"), natureza="Débito", dados_originais={"numero_documento": "4519"})
+    receipt = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=receipt_file.id, pagina_numero=1, data=date(2024, 1, 11), favorecido="DISTR DE MEDI SANTA CRUZ LTDA", beneficiario="DISTR DE MEDI SANTA CRUZ LTDA", numero_documento="0004519", valor=Decimal("105.17"), valor_original=Decimal("104.65"), valor_pago=Decimal("105.17"), tipo_operacao="BOLETO")
+    session.add_all([movement, receipt]); session.commit()
+
+    reconcile(reconciliation.id, session)
+
+    match = session.query(Correspondencia).filter_by(movimento_extrato_id=movement.id).one()
+    assert match.comprovante_id == receipt.id
+    assert match.criterio_correspondencia == "Correspondência pelo número do documento"
+    assert unused_documents(reconciliation.id, session)["comprovantes"] == []
+
+
+def test_generic_boleto_fallback_does_not_guess_ambiguous_same_day_value_receipts():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Caixa", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    statement_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Caixa", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    receipt_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="comprovante", banco_selecionado="Caixa", nome_original="boleto.pdf", caminho="/tmp/boleto.pdf")
+    session.add_all([statement_file, receipt_file]); session.flush()
+    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=statement_file.id, pagina_numero=2, data=date(2024, 1, 25), historico="PAG BOLETO", valor=Decimal("1710.87"), natureza="Débito")
+    receipts = [
+        Comprovante(conciliacao_id=reconciliation.id, arquivo_id=receipt_file.id, pagina_numero=1, data=date(2024, 1, 25), favorecido="Fornecedor A", valor=Decimal("1710.87"), valor_pago=Decimal("1710.87"), tipo_operacao="BOLETO"),
+        Comprovante(conciliacao_id=reconciliation.id, arquivo_id=receipt_file.id, pagina_numero=2, data=date(2024, 1, 25), favorecido="Fornecedor B", valor=Decimal("1710.87"), valor_pago=Decimal("1710.87"), tipo_operacao="BOLETO"),
+    ]
+    session.add(movement); session.add_all(receipts); session.commit()
+
+    reconcile(reconciliation.id, session)
+
+    match = session.query(Correspondencia).filter_by(movimento_extrato_id=movement.id).one()
+    assert match.comprovante_id is None
+    assert len(unused_documents(reconciliation.id, session)["comprovantes"]) == 2
 
 
 def test_accounting_rules_do_not_show_stale_principal_duplicate_for_discounted_boleto():
@@ -423,3 +521,61 @@ def test_ted_matches_abbreviated_and_truncated_counterparty_name():
     match = session.query(Correspondencia).filter_by(movimento_extrato_id=movement.id).one()
     assert match.comprovante_id == receipt.id
     assert match.criterio_correspondencia == "Correspondência pelo beneficiário"
+
+
+def test_loan_document_matches_statement_by_contract_and_creates_components():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    statement_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Banco do Brasil", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    loan_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="emprestimo", banco_selecionado="Banco do Brasil", nome_original="emprestimo.pdf", caminho="/tmp/emprestimo.pdf")
+    session.add_all([statement_file, loan_file]); session.flush()
+    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=statement_file.id, pagina_numero=1, data=date(2024, 1, 15), historico="13128 500 Cap Giro Dig Amortização 57.709.569.000.109", valor=Decimal("2817.00"), natureza="saída")
+    loan = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=loan_file.id, pagina_numero=1, data=date(2024, 1, 15), favorecido="Empréstimo/Financiamento 057.709.569", beneficiario="Empréstimo/Financiamento 057.709.569", numero_documento="057.709.569", valor=Decimal("2817.00"), valor_original=Decimal("2083.33"), valor_juros=Decimal("733.67"), valor_pago=Decimal("2817.00"), tipo_operacao="EMPRÉSTIMO/FINANCIAMENTO")
+    session.add_all([movement, loan]); session.commit()
+
+    reconcile(reconciliation.id, session)
+
+    match = session.query(Correspondencia).filter_by(movimento_extrato_id=movement.id).one()
+    assert match.comprovante_id == loan.id
+    assert match.criterio_correspondencia == "Correspondência pelo número do documento"
+    entries = session.query(LancamentoContabil).filter_by(correspondencia_id=match.id).order_by(LancamentoContabil.ordem).all()
+    assert [(entry.componente, entry.valor, entry.origem) for entry in entries] == [
+        ("PRINCIPAL", Decimal("2083.33"), "emprestimo"),
+        ("JUROS", Decimal("733.67"), "emprestimo"),
+    ]
+    unused = unused_documents(reconciliation.id, session)
+    assert unused["emprestimos"] == []
+    rows = result(reconciliation.id, session)
+    assert rows[0]["comprovante_tipo"] == "emprestimo"
+    rules = accounting_rules(reconciliation.id, session)
+    loan_pending = [item for item in rules["pendentes"] if item["comprovante_tipo"] == "emprestimo"]
+    assert {item["tipo_componente"] for item in loan_pending} == {"PRINCIPAL", "JUROS"}
+    assert all("Comprovante de empréstimo/financiamento" in item["composicao_simples"] for item in loan_pending)
+
+
+def test_invoice_rules_are_independent_and_export_own_csv():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Notas", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="nota", banco_selecionado="Notas", nome_original="nota.pdf", caminho="/tmp/nota.pdf")
+    session.add(file); session.flush()
+    invoice = NotaFiscal(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data_emissao=date(2024, 1, 10), fornecedor="CLINICA EXEMPLO LTDA", cpf_cnpj="12.345.678/0001-90", numero_nota="12345", valor_total=Decimal("1250.75"))
+    session.add(invoice); session.commit()
+
+    initial = source_accounting_rules(reconciliation.id, "nota", session)
+    assert initial["resumo"] == {"total": 1, "classificados": 0, "pendentes": 1}
+
+    created = create_source_accounting_rule(reconciliation.id, "nota", RegraFonteInput(gatilho="clinica exemplo", conta_debito="401 - Serviços", conta_credito="221 - Fornecedores", historico="Serviços tomados", complemento="Conforme nota fiscal"), session)
+
+    assert created["regras"]["resumo"] == {"total": 1, "classificados": 1, "pendentes": 0}
+    csv = source_accounting_csv(reconciliation.id, "nota", session).body.decode("utf-8-sig")
+    assert "401;221;Serviços tomados;1250.75;Conforme nota fiscal" in csv

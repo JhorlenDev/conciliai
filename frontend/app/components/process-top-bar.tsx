@@ -12,8 +12,9 @@ const banks = [
   "Bradesco",
   "Caixa",
   "Conta Caixa",
+  "Notas",
   "Apropriações",
-  "Empréstimos/Financeiro",
+  "Empréstimos/Financiamentos",
 ];
 const bankLogos: Record<string, string> = {
   "Banco do Brasil": "/bancos/banco-do-brasil.png",
@@ -22,9 +23,15 @@ const bankLogos: Record<string, string> = {
   Bradesco: "/bancos/bradesco.png",
   Caixa: "/bancos/caixa.png",
   "Conta Caixa": "/bancos/conta-caixa.svg",
+  Notas: "/bancos/notas.svg",
   Apropriações: "/bancos/apropriacoes.png",
   "Empréstimos/Financeiro": "/bancos/emprestimos.svg",
+  "Empréstimos/Financiamentos": "/bancos/emprestimos.svg",
 };
+
+function visibleBankName(value: string) {
+  return value === "Empréstimos/Financeiro" ? "Empréstimos/Financiamentos" : value;
+}
 
 function CurrentDateTime() {
   const [now, setNow] = useState<Date | null>(null);
@@ -74,7 +81,8 @@ export function ProcessTopBar({
   onSelectBank: (bank: string) => void;
   isSwitching: boolean;
 }) {
-  const linkedBanks = new Map(processBanks.map((item) => [item.banco, item]));
+  const linkedBanks = new Map(processBanks.map((item) => [visibleBankName(item.banco), item]));
+  const visibleActiveBank = visibleBankName(activeBank);
   return (
     <header className="border-b border-slate-200 bg-white shadow-sm">
       <div className="mx-auto flex max-w-none items-center gap-2 px-3 py-1.5 sm:px-4">
@@ -116,7 +124,7 @@ export function ProcessTopBar({
         <div className="mx-auto flex max-w-none justify-center overflow-x-auto px-3 sm:px-4">
           {banks.map((bank) => {
             const linked = linkedBanks.get(bank);
-            const active = bank === activeBank;
+            const active = bank === visibleActiveBank;
             return (
               <button
                 type="button"

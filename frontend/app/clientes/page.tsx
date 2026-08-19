@@ -7,7 +7,7 @@ import { Building2, Pencil, Plus, Trash2, X } from "lucide-react";
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 type Client = { id: string; nome: string; documento: string | null };
 type BankAccount = { id: string; banco: string; agencia: string; conta: string; titular: string; conta_contabil: string };
-const banks = ["Banco do Brasil", "Santander", "BASA", "Bradesco", "Caixa", "Conta Caixa", "Apropriações", "Empréstimos/Financeiro"];
+const banks = ["Banco do Brasil", "Santander", "BASA", "Bradesco", "Caixa", "Conta Caixa", "Apropriações", "Empréstimos/Financiamentos"];
 
 export default function ClientesPage() {
   const [clients, setClients] = useState<Client[]>([]),

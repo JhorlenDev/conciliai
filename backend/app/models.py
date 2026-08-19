@@ -92,6 +92,7 @@ class MovimentoExtrato(RegistroBase, Base):
     valor: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
     natureza: Mapped[str] = mapped_column(String(10), default="Débito")
     data_origem: Mapped[str] = mapped_column(String(10), default="")
+    ignorado_no_periodo: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class Comprovante(RegistroBase, Base):

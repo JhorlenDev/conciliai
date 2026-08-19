@@ -31,8 +31,9 @@ const banks = [
   "Bradesco",
   "Caixa",
   "Conta Caixa",
+  "Notas",
   "Apropriações",
-  "Empréstimos/Financeiro",
+  "Empréstimos/Financiamentos",
 ];
 type Client = { id: string; nome: string };
 type Row = Record<string, string | null>;
@@ -56,10 +57,39 @@ type AccountingItem = {
   origem: string;
   status: string;
 };
-type ResultRow = Row & { lancamentos?: AccountingItem[] };
+type ResultRow = {
+  id: string;
+  data: string;
+  tipo_pagamento: string;
+  natureza?: string | null;
+  natureza_contabil?: string | null;
+  extrato: string;
+  comprovante_bancario?: string | null;
+  comprovante_rfb?: string | null;
+  extrato_arquivo_id?: string | null;
+  extrato_pagina?: string | number | null;
+  comprovante_arquivo_id?: string | null;
+  comprovante_pagina?: string | number | null;
+  rfb_arquivo_id?: string | null;
+  rfb_pagina?: string | number | null;
+  valor: string;
+  fonte_regra?: string | null;
+  total_lancamentos?: string | null;
+  diferenca?: string | null;
+  confianca?: string | null;
+  situacao: string;
+  lancamentos?: AccountingItem[];
+  movimento_id?: string | null;
+  usado_no_periodo?: boolean;
+  comprovante_tipo?: string | null;
+  comprovante_composicao?: Record<string, string | boolean>;
+};
 type Review = {
   extratos: Row[];
   comprovantes: Row[];
+  maquininhas?: Row[];
+  emprestimos?: Row[];
+  notas?: Row[];
   rfb: Row[];
   ajustes_getnet?: GetnetAdjustment[];
   arquivos: {
@@ -88,31 +118,42 @@ type GetnetAdjustment = {
 };
 type Unused = {
   comprovantes: Row[];
+  emprestimos?: Row[];
   rfb: Row[];
-  resumo: { comprovantes: Record<string, number>; rfb: Record<string, number> };
+  resumo: { comprovantes: Record<string, number>; emprestimos?: Record<string, number>; rfb: Record<string, number> };
 };
 type Viewer = { arquivoId: string; pagina: number; titulo: string };
 const getnetDocumentLabels: Record<string, string> = {
-  getnet_vendas: "Getnet - Vendas",
-  getnet_comissoes: "Getnet - Comissões",
+  maquininha_extrato: "Extrato de maquininha",
+  getnet_extrato: "Extrato Getnet",
+  getnet_vendas: "Extrato Getnet",
+  getnet_comissoes: "Extrato Getnet",
 };
 const documentTypeLabels: Record<string, string> = {
   extrato: "Extrato",
   comprovante: "Comprovante bancário",
   rfb: "Comprovante RFB",
+  emprestimo: "Empréstimos/Financiamentos",
+  nota: "Notas fiscais",
 };
 
-function isGetnetDocumentType(type: string | null | undefined) {
+function isMachineDocumentType(type: string | null | undefined) {
   return Boolean(type && getnetDocumentLabels[type]);
 }
 
-function documentTypeLabel(type: string | null | undefined) {
+function machineDocumentLabel(selectedBank: string) {
+  return selectedBank === "Santander" ? "Extrato Getnet" : "Extrato de maquininha";
+}
+
+function documentTypeLabel(type: string | null | undefined, selectedBank = "") {
   if (!type) return "—";
+  if (type === "maquininha_extrato") return machineDocumentLabel(selectedBank);
   return getnetDocumentLabels[type] ?? documentTypeLabels[type] ?? type;
 }
 
 function visibleBank(value: string | null | undefined) {
   if (value === "Vendas com Cartão" || value === "Comissões Getnet") return "Santander";
+  if (value === "Empréstimos/Financeiro") return "Empréstimos/Financiamentos";
   return value && banks.includes(value) ? value : banks[0];
 }
 
@@ -343,10 +384,9 @@ function formatPeriodCard(start: string, end: string) {
     "Dezembro",
   ];
   const monthName = months[Number(startDate.month) - 1] ?? startDate.month;
-  if (startDate.month === endDate.month && startDate.year === endDate.year) {
-    return `${monthName} ${startDate.year} (${startDate.day}-${endDate.day}/${startDate.month})`;
-  }
-  return `${monthName} ${startDate.year} (${startDate.day}/${startDate.month}-${endDate.day}/${endDate.month})`;
+  const startShortYear = startDate.year.slice(-2);
+  const endShortYear = endDate.year.slice(-2);
+  return `${monthName} ${startDate.year} · ${startDate.day}/${startDate.month}/${startShortYear} a ${endDate.day}/${endDate.month}/${endShortYear}`;
 }
 
 function useAutoDismissMessage(message: string, setMessage: (value: string) => void) {
@@ -436,6 +476,8 @@ function AdvancedOverview({
 
 type PendingRule = {
   id: string;
+  movimento_id?: string;
+  usado_no_periodo?: boolean;
   data: string;
   historico: string;
   valor: string;
@@ -459,11 +501,49 @@ type PendingRule = {
   comprovante_pagina?: number | null;
   comprovante_rfb_arquivo_id?: string | null;
   comprovante_rfb_pagina?: number | null;
+  comprovante_tipo?: string | null;
   comprovante_confere?: boolean;
   ajuste_getnet?: boolean;
   gatilho_sugerido?: string;
   complemento_sugerido?: string;
 };
+
+function LoanReceiptNotice({ compact = false }: { compact?: boolean }) {
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded border border-amber-200 bg-amber-50 font-semibold text-amber-800 ${compact ? "px-1.5 py-0.5 text-[10px]" : "px-2 py-1 text-xs"}`}
+    >
+      <FileText size={compact ? 12 : 14} />
+      Comprovante de empréstimos/financiamentos
+    </span>
+  );
+}
+
+function MovementUsageToggle({
+  used,
+  busy = false,
+  onToggle,
+}: {
+  used: boolean;
+  busy?: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={used}
+      title={used ? "Usar neste período" : "Não usar neste período"}
+      disabled={busy}
+      onClick={onToggle}
+      className={`inline-flex items-center gap-1.5 rounded-full border px-1.5 py-1 text-[10px] font-semibold transition disabled:cursor-wait disabled:opacity-60 ${used ? "border-teal-200 bg-teal-50 text-teal-800" : "border-slate-300 bg-slate-100 text-slate-500"}`}
+    >
+      <span className={`flex h-3.5 w-6 items-center rounded-full px-0.5 ${used ? "justify-end bg-teal-700" : "justify-start bg-slate-400"}`}>
+        <span className="h-2.5 w-2.5 rounded-full bg-white" />
+      </span>
+      {used ? "Usar" : "Ignorar"}
+    </button>
+  );
+}
 type SavedRule = {
   id: string;
   gatilho: string;
@@ -515,6 +595,202 @@ type CoverageModal = {
   preview: RulePreview;
   existing: boolean;
 };
+
+type IndependentRuleRow = {
+  id: string;
+  data: string;
+  texto: string;
+  documento: string;
+  forma_pagamento?: string;
+  valor: string;
+  arquivo_id?: string;
+  pagina?: number;
+  regra_id?: string;
+  conta_debito?: string;
+  conta_credito?: string;
+  historico_contabil?: string;
+  complemento?: string;
+};
+type IndependentRule = {
+  id: string;
+  gatilho: string;
+  conta_debito: string;
+  conta_credito: string;
+  historico: string;
+  complemento: string;
+  cobertos: number;
+};
+type IndependentRulesData = {
+  pendentes: IndependentRuleRow[];
+  classificados: IndependentRuleRow[];
+  salvas: IndependentRule[];
+  resumo: { total: number; classificados: number; pendentes: number };
+};
+
+function IndependentRulesPanel({
+  reconciliationId,
+  source,
+  title,
+  triggerLabel,
+  onView,
+}: {
+  reconciliationId: string;
+  source: "maquininha" | "nota";
+  title: string;
+  triggerLabel: string;
+  onView: (viewer: Viewer) => void;
+}) {
+  const [data, setData] = useState<IndependentRulesData>({ pendentes: [], classificados: [], salvas: [], resumo: { total: 0, classificados: 0, pendentes: 0 } });
+  const [drafts, setDrafts] = useState<Record<string, Record<string, string>>>({});
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState("");
+  useAutoDismissMessage(message, setMessage);
+  async function load() {
+    const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-fonte/${source}`, { cache: "no-store" });
+    if (response.ok) setData(await response.json());
+  }
+  useEffect(() => {
+    load();
+  }, [reconciliationId, source]);
+  const value = (id: string, field: string, fallback = "") => drafts[id]?.[field] ?? fallback;
+  const change = (id: string, field: string, input: string) => setDrafts((current) => ({ ...current, [id]: { ...current[id], [field]: input } }));
+  async function save(row: IndependentRuleRow) {
+    const body = {
+      gatilho: value(row.id, "gatilho", row.texto),
+      conta_debito: value(row.id, "debito"),
+      conta_credito: value(row.id, "credito"),
+      historico: value(row.id, "historico"),
+      complemento: value(row.id, "complemento", source === "maquininha" ? "Conforme extrato de maquininha" : "Conforme nota fiscal"),
+      escopo: "global",
+    };
+    if (!body.gatilho.trim() || !body.conta_debito.trim() || !body.conta_credito.trim() || !body.historico.trim()) {
+      setMessage("Preencha gatilho, débito, crédito e histórico.");
+      return;
+    }
+    setBusy(row.id);
+    try {
+      const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-fonte/${source}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(result?.detail ?? "Não foi possível salvar a regra.");
+      setData(result.regras);
+      setDrafts((current) => ({ ...current, [row.id]: {} }));
+      setMessage("Regra salva nesta aba.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Não foi possível salvar a regra.");
+    } finally {
+      setBusy("");
+    }
+  }
+  async function remove(rule: IndependentRule) {
+    setBusy(rule.id);
+    try {
+      const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-fonte/${source}/${rule.id}`, { method: "DELETE" });
+      const result = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(result?.detail ?? "Não foi possível excluir a regra.");
+      setData(result.regras);
+      setMessage(result.message ?? "Regra excluída.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Não foi possível excluir a regra.");
+    } finally {
+      setBusy("");
+    }
+  }
+  const money = (value: string) => formatMoney(value);
+  const RowFileButton = ({ row }: { row: IndependentRuleRow }) =>
+    row.arquivo_id ? (
+      <button
+        onClick={() => onView({ arquivoId: String(row.arquivo_id), pagina: Number(row.pagina || 1), titulo: title })}
+        title="Visualizar arquivo"
+        aria-label="Visualizar arquivo"
+        className="rounded p-1 text-slate-700 hover:bg-slate-100"
+      >
+        <Eye size={15} />
+      </button>
+    ) : null;
+  return (
+    <section className="rounded-xl border border-slate-200 bg-white p-5">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="font-semibold">Regras de {title}</h2>
+          <p className="text-sm text-slate-500">Classificação independente e CSV próprio desta aba.</p>
+        </div>
+        <div className="flex items-center gap-2 text-xs">
+          <span className="rounded-full bg-slate-100 px-3 py-1 font-semibold text-slate-700">{data.resumo.classificados}/{data.resumo.total} classificados</span>
+          <a href={`${API}/api/conciliacoes/${reconciliationId}/regras-fonte/${source}/csv`} className="inline-flex items-center gap-1 rounded bg-teal-700 px-3 py-1.5 font-semibold text-white">
+            <Download size={14} />
+            Gerar CSV
+          </a>
+        </div>
+      </div>
+      {message && <p className="mb-3 rounded bg-teal-50 p-2 text-xs text-teal-900">{message}</p>}
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[980px] text-left text-xs">
+          <thead className="bg-slate-50 text-[10px] uppercase text-slate-500">
+            <tr>
+              {["Data", triggerLabel, "Valor original", "Gatilho", "Débito", "Crédito", "Histórico", "Complemento", "Ação"].map((column) => (
+                <th className="px-2 py-2" key={column}>{column}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {data.pendentes.map((row) => (
+              <tr className="border-t align-top" key={row.id}>
+                <td className="px-2 py-2">{row.data}</td>
+                <td className="px-2 py-2"><span className="block font-medium text-slate-800">{row.texto}</span><span className="text-slate-500">{[row.documento, row.forma_pagamento && row.forma_pagamento !== "—" ? row.forma_pagamento : ""].filter(Boolean).join(" · ")}</span></td>
+                <td className="px-2 py-2 font-semibold">{money(row.valor)}</td>
+                <td className="px-2 py-1"><input value={value(row.id, "gatilho", row.texto)} onChange={(event) => change(row.id, "gatilho", event.target.value)} className="w-36 rounded border px-2 py-1" /></td>
+                <td className="px-2 py-1"><input value={value(row.id, "debito")} onChange={(event) => change(row.id, "debito", event.target.value)} className="w-36 rounded border px-2 py-1" /></td>
+                <td className="px-2 py-1"><input value={value(row.id, "credito")} onChange={(event) => change(row.id, "credito", event.target.value)} className="w-36 rounded border px-2 py-1" /></td>
+                <td className="px-2 py-1"><input value={value(row.id, "historico")} onChange={(event) => change(row.id, "historico", event.target.value)} className="w-40 rounded border px-2 py-1" /></td>
+                <td className="px-2 py-1"><input value={value(row.id, "complemento", source === "maquininha" ? "Conforme extrato de maquininha" : "Conforme nota fiscal")} onChange={(event) => change(row.id, "complemento", event.target.value)} className="w-48 rounded border px-2 py-1" /></td>
+                <td className="whitespace-nowrap px-2 py-1"><button disabled={busy === row.id} onClick={() => save(row)} className="rounded bg-teal-700 px-2 py-1 text-white disabled:opacity-60">{busy === row.id ? "Salvando..." : "Salvar"}</button><RowFileButton row={row} /></td>
+              </tr>
+            ))}
+            {!data.pendentes.length && (
+              <tr><td className="px-2 py-6 text-center text-slate-500" colSpan={9}>Nenhum registro pendente nesta aba.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      <div className="mt-5 grid gap-4 lg:grid-cols-2">
+        <div className="rounded-lg border">
+          <div className="border-b bg-slate-50 px-3 py-2 text-xs font-semibold">Regras salvas ({data.salvas.length})</div>
+          <div className="max-h-64 overflow-auto">
+            {data.salvas.map((rule) => (
+              <div className="flex items-center gap-2 border-b px-3 py-2 text-xs" key={rule.id}>
+                <div className="min-w-0 flex-1">
+                  <strong className="block truncate">{rule.gatilho}</strong>
+                  <span className="text-slate-500">{rule.cobertos} cobertos · {rule.conta_debito} → {rule.conta_credito}</span>
+                </div>
+                <button disabled={busy === rule.id} onClick={() => remove(rule)} className="rounded p-1 text-red-600 hover:bg-red-50" title="Excluir regra"><Trash2 size={15} /></button>
+              </div>
+            ))}
+            {!data.salvas.length && <p className="px-3 py-5 text-center text-xs text-slate-500">Nenhuma regra salva.</p>}
+          </div>
+        </div>
+        <div className="rounded-lg border">
+          <div className="border-b bg-slate-50 px-3 py-2 text-xs font-semibold">Classificados ({data.classificados.length})</div>
+          <div className="max-h-64 overflow-auto">
+            {data.classificados.map((row) => (
+              <div className="flex items-center gap-2 border-b px-3 py-2 text-xs" key={row.id}>
+                <div className="min-w-0 flex-1">
+                  <strong className="block truncate">{row.texto}</strong>
+                  <span className="text-slate-500">{row.data} · {money(row.valor)} · {row.historico_contabil}</span>
+                </div>
+                <RowFileButton row={row} />
+              </div>
+            ))}
+            {!data.classificados.length && <p className="px-3 py-5 text-center text-xs text-slate-500">Nenhum registro classificado.</p>}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
 
 function LegacyAdvancedRulesPanel({
   reconciliationId,
@@ -943,15 +1219,21 @@ function AdvancedRulesPanel({
       return;
     }
     setBusyRuleId(item.id);
+    setMessage("Calculando cobertura da regra...");
     try {
-      const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/previa`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), cache: "no-store" });
-      if (!response.ok) return setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Não foi possível validar o gatilho.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante, texto_exclusao: body.texto_exclusao } }));
+      const response = await requestWithTimeout(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/previa`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), cache: "no-store" }, "A validação da regra");
+      if (!response.ok) {
+        const message = await errorMessage(response, "Não foi possível validar o gatilho.");
+        setMessage(message);
+        return setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: message, gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante, texto_exclusao: body.texto_exclusao } }));
+      }
       const result = await response.json();
       setPreviews((current) => ({ ...current, [item.id]: { ...result, gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante, texto_exclusao: body.texto_exclusao } }));
       setMessage(result.quantidade ? `Cobertura calculada: vai cobrir ${result.quantidade} lançamento(s).` : result.motivo || "Nenhum lançamento elegível corresponde ao gatilho informado.");
-    } catch {
-      setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: "Não foi possível validar o gatilho.", gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante, texto_exclusao: body.texto_exclusao } }));
-      setMessage("Não foi possível validar o gatilho.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Não foi possível validar o gatilho.";
+      setPreviews((current) => ({ ...current, [item.id]: { quantidade: 0, lancamentos: [], motivo: message, gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante, texto_exclusao: body.texto_exclusao } }));
+      setMessage(message);
     } finally {
       setBusyRuleId(null);
     }
@@ -991,6 +1273,30 @@ function AdvancedRulesPanel({
         : "Não foi possível salvar a conta bancária.",
     );
   }
+  const movementIdFor = (item: PendingRule | SavedRule) =>
+    "data" in item ? item.movimento_id || item.id.split(":")[0] : "";
+  async function setMovementUsage(item: PendingRule | SavedRule, usar: boolean) {
+    const movementId = movementIdFor(item);
+    if (!movementId) return;
+    setBusyRuleId(`movimento-${movementId}`);
+    try {
+      const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/movimentos-extrato/${movementId}/uso`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ usar }),
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+        throw new Error(data?.detail ?? "Não foi possível atualizar o lançamento.");
+      }
+      setMessage(usar ? "Lançamento voltou a ser usado neste período." : "Lançamento marcado para não usar neste período.");
+      onRulesChanged();
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : "Não foi possível atualizar o lançamento.");
+    } finally {
+      setBusyRuleId(null);
+    }
+  }
   function buildRuleBody(item: PendingRule | SavedRule, existing = false): RuleSaveBody {
     const fields = defaults(item);
     return {
@@ -1006,8 +1312,17 @@ function AdvancedRulesPanel({
       complemento: value(item.id, "complemento", fields.complemento),
     };
   }
+  function ruleValidationMessage(body: RuleSaveBody) {
+    const missing = [
+      !body.gatilho.trim() && !body.gatilho_comprovante.trim() ? "gatilho" : "",
+      !body.conta_debito.trim() ? "débito" : "",
+      !body.conta_credito.trim() ? "crédito" : "",
+      !body.historico.trim() ? "histórico contábil" : "",
+    ].filter(Boolean);
+    return missing.length ? `Preencha ${missing.join(", ")} antes de salvar a regra.` : "";
+  }
   async function loadRulePreview(item: PendingRule | SavedRule, body: RuleSaveBody, existing = false) {
-    const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/previa`, {
+    const response = await requestWithTimeout(`${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/previa`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1019,7 +1334,7 @@ function AdvancedRulesPanel({
         regra_id: existing && "gatilho" in item ? item.id : "",
       }),
       cache: "no-store",
-    });
+    }, "A validação da regra");
     if (!response.ok) throw new Error(await errorMessage(response, "Não foi possível calcular a cobertura da regra."));
     const result = await response.json();
     const preview = { ...result, gatilho: body.gatilho, gatilho_comprovante: body.gatilho_comprovante, texto_exclusao: body.texto_exclusao } as RulePreview;
@@ -1029,18 +1344,18 @@ function AdvancedRulesPanel({
   async function submitRule(item: PendingRule | SavedRule, body: RuleSaveBody, existing = false) {
     if (busyRuleId) return;
     setBusyRuleId(item.id);
+    setMessage(existing ? "Atualizando regra..." : "Salvando regra...");
     const url = existing
       ? `${API}/api/conciliacoes/${reconciliationId}/regras-contabeis/${item.id}`
       : `${API}/api/conciliacoes/${reconciliationId}/regras-contabeis`;
     try {
-      const response = await fetch(url, {
+      const response = await requestWithTimeout(url, {
         method: existing ? "PATCH" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-      });
+      }, existing ? "A atualização da regra" : "O salvamento da regra");
       if (!response.ok) {
-        const error = await response.json();
-        return setMessage(error.detail ?? "Não foi possível salvar a regra.");
+        return setMessage(await errorMessage(response, "Não foi possível salvar a regra."));
       }
       const result = await response.json();
       const topRuleId = !existing ? String(result.id || "") : "";
@@ -1067,12 +1382,14 @@ function AdvancedRulesPanel({
   async function saveRule(item: PendingRule | SavedRule, existing = false) {
     if (busyRuleId) return;
     const body = buildRuleBody(item, existing);
-    if (existing) return submitRule(item, body, true);
-    if (!body.gatilho.trim() && !body.gatilho_comprovante.trim()) {
-      setMessage("Informe um gatilho antes de salvar a regra.");
+    const validationMessage = ruleValidationMessage(body);
+    if (validationMessage) {
+      setMessage(validationMessage);
       return;
     }
+    if (existing) return submitRule(item, body, true);
     setBusyRuleId(item.id);
+    setMessage("Validando cobertura antes de salvar...");
     try {
       const storedPreview = previews[item.id];
       const preview = storedPreview?.gatilho === body.gatilho && storedPreview.gatilho_comprovante === body.gatilho_comprovante && storedPreview.texto_exclusao === body.texto_exclusao
@@ -1223,10 +1540,26 @@ function AdvancedRulesPanel({
     return (
       <tr className="border-t align-top" key={item.id}>
         <td className="px-2 py-2">
-          {"data" in item ? item.data : `${item.cobertos} cobertos`}
+          {"data" in item ? (
+            <>
+              <span>{item.data}</span>
+              <span className="mt-1 block">
+                <MovementUsageToggle
+                  used={item.usado_no_periodo !== false}
+                  busy={busyRuleId === `movimento-${movementIdFor(item)}`}
+                  onToggle={() => setMovementUsage(item, item.usado_no_periodo === false)}
+                />
+              </span>
+            </>
+          ) : `${item.cobertos} cobertos`}
         </td>
         <td className="max-w-64 px-2 py-2">
           <p>{"gatilho" in item ? item.gatilho : item.historico}</p>
+          {pendingItem?.comprovante_tipo === "emprestimo" && (
+            <div className="mt-1">
+              <LoanReceiptNotice compact />
+            </div>
+          )}
           {pendingItem?.comprovante_confere && (
             <div className="mt-1 flex items-center gap-1 text-[10px] text-emerald-700">
               <button
@@ -1381,7 +1714,7 @@ function AdvancedRulesPanel({
       "cobertos" in item && keyword === fields.gatilho && receiptKeyword === fields.gatilhoComprovante && exclusionKeyword === fields.textoExclusao
         ? item.cobertos
         : preview?.quantidade ?? 0;
-    const canSave = existing || Boolean((keyword.trim() || receiptKeyword.trim()) && debitValue.trim() && creditValue.trim() && historyValue.trim());
+    const saveIssue = ruleValidationMessage(buildRuleBody(item, existing));
     const isRecent = "gatilho" in item && recentRuleId === item.id;
     const coverageMessage = existing
       ? coveredCount
@@ -1414,7 +1747,18 @@ function AdvancedRulesPanel({
         ) : (
           <>
             <td className={`${existing ? "w-[8%]" : ""} px-2 py-2`}>
-              {"data" in item ? item.data : <><span>{item.cobertos} cobertos</span>{isRecent && <span className="mt-1 block rounded bg-teal-700 px-1.5 py-0.5 text-[10px] font-semibold text-white">Criada agora há pouco</span>}</>}
+              {"data" in item ? (
+                <>
+                  <span>{item.data}</span>
+                  <span className="mt-1 block">
+                    <MovementUsageToggle
+                      used={item.usado_no_periodo !== false}
+                      busy={busyRuleId === `movimento-${movementIdFor(item)}`}
+                      onToggle={() => setMovementUsage(item, item.usado_no_periodo === false)}
+                    />
+                  </span>
+                </>
+              ) : <><span>{item.cobertos} cobertos</span>{isRecent && <span className="mt-1 block rounded bg-teal-700 px-1.5 py-0.5 text-[10px] font-semibold text-white">Criada agora há pouco</span>}</>}
             </td>
             <td className={`${existing ? "w-[14%]" : "w-64 max-w-64"} px-2 py-2`}>
               <p className="line-clamp-2 break-words leading-4" title={"gatilho" in item ? item.gatilho : item.historico}>{"gatilho" in item ? item.gatilho : item.historico}</p>
@@ -1423,6 +1767,11 @@ function AdvancedRulesPanel({
               {pendingItem?.tarifa_no_extrato && <p className="mt-1 text-[10px] text-sky-700">Tarifa do comprovante está presente no extrato.</p>}
               {pendingItem?.tarifa_referente_ao_comprovante && <p className="mt-1 text-[10px] text-slate-500">Esta tarifa é referente ao comprovante de {pendingItem.tarifa_referencia_nome}, R$ {Number(pendingItem.tarifa_referencia_valor || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2 })} em {pendingItem.tarifa_referencia_data}.</p>}
               {pendingItem?.composicao_simples && <p className="mt-1 whitespace-pre-line text-[10px] text-slate-500">{pendingItem.composicao_simples}</p>}
+              {pendingItem?.comprovante_tipo === "emprestimo" && (
+                <div className="mt-1">
+                  <LoanReceiptNotice compact />
+                </div>
+              )}
               {(pendingItem?.comprovante_arquivo_id || pendingItem?.comprovante_rfb_arquivo_id) && (
                 <div className="mt-1 flex items-center gap-1 text-[10px] text-emerald-700">
                   {pendingItem.comprovante_arquivo_id && <button
@@ -1675,9 +2024,9 @@ function AdvancedRulesPanel({
         </td>
         {showAction && <td className={`${existing ? "w-[6%]" : "w-px"} whitespace-nowrap px-2 py-1`}>
           {!existing && <button title="Ver cobertura" aria-label="Ver cobertura" disabled={busyRuleId === item.id} onClick={() => previewRule(item)} className="inline-flex h-7 w-7 items-center justify-center rounded border border-teal-700 text-teal-800 hover:bg-teal-50 disabled:cursor-wait disabled:opacity-60">{busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : <Gauge size={14} />}</button>}
-          {canSave && <button title={existing ? "Atualizar regra" : "Salvar regra"} aria-label={existing ? "Atualizar regra" : "Salvar regra"} disabled={busyRuleId === item.id} onClick={() => saveRule(item, existing)} className="ml-1 inline-flex h-7 w-7 items-center justify-center rounded bg-teal-700 text-white disabled:cursor-wait disabled:opacity-60">
+          <button title={saveIssue || (existing ? "Atualizar regra" : "Salvar regra")} aria-label={existing ? "Atualizar regra" : "Salvar regra"} disabled={busyRuleId === item.id} onClick={() => saveRule(item, existing)} className={`ml-1 inline-flex h-7 w-7 items-center justify-center rounded text-white disabled:cursor-wait disabled:opacity-60 ${saveIssue ? "bg-slate-400 hover:bg-slate-500" : "bg-teal-700 hover:bg-teal-800"}`}>
             {busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : existing ? <RefreshCw size={14} /> : <CheckCircle2 size={14} />}
-          </button>}
+          </button>
           {existing && <button title="Excluir regra" aria-label="Excluir regra" disabled={busyRuleId === item.id} onClick={() => setDeleteTarget(item as SavedRule)} className="ml-1 rounded border border-red-200 px-2 py-1 text-red-700 disabled:cursor-wait disabled:opacity-60">{busyRuleId === item.id ? <RefreshCw className="animate-spin" size={14} /> : <Trash2 size={14} />}</button>}
         </td>}
       </tr>
@@ -1866,6 +2215,11 @@ function AdvancedRulesPanel({
                         >
                           <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                             <strong>{movement.data}</strong>
+                            <MovementUsageToggle
+                              used={movement.usado_no_periodo !== false}
+                              busy={busyRuleId === `movimento-${movementIdFor(movement)}`}
+                              onToggle={() => setMovementUsage(movement, movement.usado_no_periodo === false)}
+                            />
                             <span className="max-w-96 truncate font-medium text-slate-800" title={movement.historico}>
                               {movement.historico}
                             </span>
@@ -1879,6 +2233,9 @@ function AdvancedRulesPanel({
                               <span className="text-[10px] text-emerald-700">
                                 ✓ Confere com o extrato
                               </span>
+                            )}
+                            {movement.comprovante_tipo === "emprestimo" && (
+                              <LoanReceiptNotice compact />
                             )}
                             {movement.comprovante_arquivo_id && (
                               <button
@@ -2150,7 +2507,7 @@ function LegacyResultTable({
       ];
     return null;
   };
-  const eye = (file: string | null, page: string | null, title: string) =>
+  const eye = (file: string | null | undefined, page: string | number | null | undefined, title: string) =>
     file && (
       <button
         aria-label="Visualizar documento original"
@@ -2216,6 +2573,11 @@ function LegacyResultTable({
                     </td>
                     <td className="whitespace-pre-line px-3 py-3">
                       {row.comprovante_bancario}
+                      {row.comprovante_tipo === "emprestimo" && (
+                        <span className="mt-2 block">
+                          <LoanReceiptNotice compact />
+                        </span>
+                      )}
                       {eye(
                         row.comprovante_arquivo_id,
                         row.comprovante_pagina,
@@ -2348,6 +2710,7 @@ function EditableResultTable({
   >({});
   const [extras, setExtras] = useState<Record<string, AccountingItem[]>>({});
   const [saving, setSaving] = useState<string | null>(null);
+  const [usageSaving, setUsageSaving] = useState<string | null>(null);
   const [error, setError] = useState("");
   const value = (
     rowId: string,
@@ -2439,6 +2802,29 @@ function EditableResultTable({
       setSaving(null);
     }
   }
+  async function setMovementUsage(row: ResultRow, usar: boolean) {
+    const movementId = row.movimento_id;
+    if (!movementId) return;
+    setUsageSaving(String(row.id));
+    setError("");
+    try {
+      const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/movimentos-extrato/${movementId}/uso`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ usar }),
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+        throw new Error(data?.detail ?? "Não foi possível atualizar o lançamento.");
+      }
+      if (!usar) setExpanded((current) => current === String(row.id) ? null : current);
+      onSaved();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível atualizar o lançamento.");
+    } finally {
+      setUsageSaving(null);
+    }
+  }
   return (
     <section className="overflow-hidden rounded-xl border border-slate-200 bg-white">
       <div className="flex items-center justify-between border-b px-5 py-4">
@@ -2457,6 +2843,7 @@ function EditableResultTable({
           <thead className="bg-slate-50 text-[10px] uppercase text-slate-500">
             <tr>
               {[
+                "Uso",
                 "Data",
                 "Tipo de pagamento",
                 "Extrato",
@@ -2473,15 +2860,28 @@ function EditableResultTable({
           <tbody>
             {rows.map((row) => {
               const rowId = String(row.id);
+              const usedInPeriod = row.usado_no_periodo !== false;
               return (
                 <Fragment key={rowId}>
-                  <tr className="border-t align-top">
+                  <tr className={`border-t align-top ${usedInPeriod ? "" : "bg-slate-50 text-slate-500"}`}>
+                    <td className="whitespace-nowrap px-3 py-3">
+                      <MovementUsageToggle
+                        used={usedInPeriod}
+                        busy={usageSaving === rowId}
+                        onToggle={() => setMovementUsage(row, !usedInPeriod)}
+                      />
+                    </td>
                     <td className="whitespace-nowrap px-3 py-3 font-medium">
                       {row.data}
                     </td>
                     <td className="px-3 py-3">{row.tipo_pagamento}</td>
                     <td className="whitespace-pre-line px-3 py-3">
                       {row.extrato}
+                      {row.comprovante_tipo === "emprestimo" && (
+                        <span className="mt-2 block whitespace-normal">
+                          <LoanReceiptNotice compact />
+                        </span>
+                      )}
                       {row.extrato_arquivo_id && (
                         <button
                           aria-label="Visualizar extrato bancário"
@@ -2502,10 +2902,11 @@ function EditableResultTable({
                     <td className="px-3 py-3">{row.situacao}</td>
                     <td className="px-3 py-3">
                       <button
+                        disabled={!usedInPeriod}
                         onClick={() =>
                           setExpanded(expanded === rowId ? null : rowId)
                         }
-                        className="rounded border border-slate-300 bg-white/70 px-2 py-1"
+                        className="rounded border border-slate-300 bg-white/70 px-2 py-1 disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         {expanded === rowId ? "Fechar" : "Configurar"}
                       </button>
@@ -2513,11 +2914,16 @@ function EditableResultTable({
                   </tr>
                   {expanded === rowId && (
                     <tr className="border-t bg-slate-50">
-                      <td colSpan={6} className="px-3 py-3">
+                      <td colSpan={7} className="px-3 py-3">
                         <p className="text-slate-600">
                           Confiança: {row.confianca} | Total dos lançamentos:{" "}
                           {row.total_lancamentos} | Diferença: {row.diferenca}
                         </p>
+                        {row.comprovante_tipo === "emprestimo" && (
+                          <div className="mt-2">
+                            <LoanReceiptNotice />
+                          </div>
+                        )}
                         {(() => {
                           const composition = (
                             row as unknown as {
@@ -3042,7 +3448,7 @@ function ConciliacaoFlow({
             ? "Comprovantes bancários"
             : type === "rfb"
               ? "Comprovantes RFB"
-              : documentTypeLabel(type);
+              : documentTypeLabel(type, bank);
       setMessage(
         `${documentName} disponível. Continue na aba Início para enviar os demais documentos.`,
       );
@@ -3181,25 +3587,34 @@ function ConciliacaoFlow({
   const rulesToCreate =
     results?.filter((item) => item.fonte_regra === "extrato").length ?? 0;
   const isSantander = bank === "Santander";
-  const getnetFiles = review.arquivos.filter((file) => isGetnetDocumentType(file.tipo));
-  const getnetFileIds = new Set(getnetFiles.map((file) => file.id));
-  const getnetReceipts = review.comprovantes.filter((row) => getnetFileIds.has(String(row.arquivo_id || "")));
+  const isNotesArea = bank === "Notas";
+  const machineTabLabel = isSantander ? "Getnet" : "Maquininhas";
+  const machineUploadLabel = machineDocumentLabel(bank);
+  const machineFiles = review.arquivos.filter((file) => isMachineDocumentType(file.tipo));
+  const loanFiles = review.arquivos.filter((file) => file.tipo === "emprestimo");
+  const noteFiles = review.arquivos.filter((file) => file.tipo === "nota");
+  const machineReceipts = review.maquininhas ?? [];
+  const loanReceipts = review.emprestimos ?? [];
+  const invoiceRows = review.notas ?? [];
   const getnetAdjustments = review.ajustes_getnet ?? [];
-  const bankReceipts = isSantander ? review.comprovantes.filter((row) => !getnetFileIds.has(String(row.arquivo_id || ""))) : review.comprovantes;
+  const bankReceipts = review.comprovantes;
   const navigationTabs = [
     "Início",
-    ...(review.arquivos.length
+    ...(isNotesArea
+      ? review.arquivos.length
+        ? ["Notas"]
+        : []
+      : review.arquivos.length
       ? [
           "Extrato",
           "Comprovantes bancários",
-          ...(isSantander ? ["Getnet"] : []),
+          machineTabLabel,
           "Comprovantes RFB",
+          "Empréstimos/Financiamentos",
           "Conciliação",
           "Conciliação Avançada",
         ]
-      : isSantander && reconciliationId
-        ? ["Getnet"]
-        : []),
+      : []),
   ];
   function downloadCsv() {
     if (!reconciliationId) return;
@@ -3237,8 +3652,8 @@ function ConciliacaoFlow({
             ))}
           </div>
           {periodCard && (
-            <div className="mb-1 inline-flex shrink-0 items-center gap-1 rounded-md border border-teal-200 bg-teal-50 px-2.5 py-1 text-[11px] font-semibold text-teal-800">
-              <CalendarDays size={12} />
+            <div className="mb-1 inline-flex shrink-0 items-center gap-1.5 rounded-md border border-emerald-300 bg-emerald-50 px-3 py-1.5 text-xs font-bold text-emerald-900 shadow-sm">
+              <CalendarDays className="text-emerald-700" size={14} />
               {periodCard}
             </div>
           )}
@@ -3260,7 +3675,7 @@ function ConciliacaoFlow({
                   </strong>
                 </div>
                 <div className="rounded-md border bg-slate-50 p-2">
-                  <span className="block text-xs text-slate-500">Banco</span>
+                  <span className="block text-xs text-slate-500">{isNotesArea ? "Área" : "Banco"}</span>
                   <strong className="text-sm">{bank}</strong>
                 </div>
                 <label className="text-xs text-slate-500">
@@ -3288,32 +3703,34 @@ function ConciliacaoFlow({
                   >
                     Iniciar conciliação
                   </button>
-                  <span className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-900" title={`Titular: ${selectedBankAccount?.titular || "Não informado"}`}>Agência: <strong>{selectedBankAccount?.agencia || "—"}</strong> · Conta: <strong>{selectedBankAccount?.conta || "Sem conta"}</strong></span>
+                  {!isNotesArea && (
+                    <span className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-900" title={`Titular: ${selectedBankAccount?.titular || "Não informado"}`}>Agência: <strong>{selectedBankAccount?.agencia || "—"}</strong> · Conta: <strong>{selectedBankAccount?.conta || "Sem conta"}</strong></span>
+                  )}
                 </div>
               </div>
             </section>
             {reconciliationId && (
               <section className="my-6 grid gap-4 md:grid-cols-3 xl:grid-cols-5">
                 {[
-                  ["extrato", "Extrato bancário", false],
-                  ["comprovante", "Comprovantes bancários", true],
-                  ["rfb", "Comprovantes da Receita Federal", true],
-                  ...(isSantander
-                    ? [
-                        ["getnet_vendas", "Getnet - Vendas", true],
-                        ["getnet_comissoes", "Getnet - Comissões", true],
-                      ]
-                    : []),
+                  ...(isNotesArea
+                    ? [["nota", "Notas fiscais", true]]
+                    : [
+                        ["extrato", "Extrato bancário", false],
+                        ["comprovante", "Comprovantes bancários", true],
+                        ["rfb", "Comprovantes da Receita Federal", true],
+                        ["maquininha_extrato", machineUploadLabel, true],
+                        ["emprestimo", "Empréstimos/Financiamentos", true],
+                      ]),
                 ].map(([type, label, multiple]) => (
                   <label
                     className={`cursor-pointer rounded-xl border-2 border-dashed bg-white p-5 text-center ${
-                      isGetnetDocumentType(String(type))
+                      isMachineDocumentType(String(type))
                         ? "border-red-200 hover:border-red-700"
                         : "border-slate-300 hover:border-teal-600"
                     }`}
                     key={String(type)}
                   >
-                    <Upload className={`mx-auto mb-2 ${isGetnetDocumentType(String(type)) ? "text-red-700" : "text-teal-700"}`} />
+                    <Upload className={`mx-auto mb-2 ${isMachineDocumentType(String(type)) ? "text-red-700" : "text-teal-700"}`} />
                     <strong className="block">{String(label)}</strong>
                     <input
                       className="hidden"
@@ -3350,8 +3767,22 @@ function ConciliacaoFlow({
                   >
                     <span className="min-w-0 truncate">{file.nome}</span>
                     <span className="ml-auto shrink-0 text-slate-500">
-                      {documentTypeLabel(file.tipo)} · {file.status}
+                      {documentTypeLabel(file.tipo, bank)} · {file.status}
                     </span>
+                    <button
+                      onClick={() =>
+                        setViewer({
+                          arquivoId: file.id,
+                          pagina: 1,
+                          titulo: documentTypeLabel(file.tipo, bank),
+                        })
+                      }
+                      title="Visualizar arquivo"
+                      aria-label={`Visualizar ${file.nome}`}
+                      className="shrink-0 rounded p-1 text-slate-700 hover:bg-slate-100"
+                    >
+                      <Eye size={15} />
+                    </button>
                     <button
                       onClick={() => reprocessDocument(file.id)}
                       title="Reprocessar arquivo"
@@ -3379,6 +3810,89 @@ function ConciliacaoFlow({
             {message}
           </p>
         )}
+        {reconciliationId && activeTab === "Notas" && (
+          <div className="space-y-5">
+            <section className="rounded-xl border border-slate-200 bg-white p-5">
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="font-semibold">Notas fiscais</h2>
+                  <p className="text-sm text-slate-500">
+                    PDFs enviados no início do processo para leitura e criação das regras.
+                  </p>
+                </div>
+                <span className="rounded-full bg-sky-50 px-3 py-1 text-xs font-semibold text-sky-800">
+                  {noteFiles.length} arquivo(s)
+                </span>
+              </div>
+              {noteFiles.length > 0 ? (
+                <ul className="divide-y rounded-md border text-sm">
+                  {noteFiles.map((file) => (
+                    <li className="flex items-center justify-between gap-3 px-3 py-2" key={file.id}>
+                      <span className="min-w-0 truncate">{file.nome}</span>
+                      <span className="ml-auto shrink-0 text-slate-500">{documentTypeLabel(file.tipo, bank)} · {file.status}</span>
+                      <button
+                        onClick={() =>
+                          setViewer({
+                            arquivoId: file.id,
+                            pagina: 1,
+                            titulo: documentTypeLabel(file.tipo, bank),
+                          })
+                        }
+                        title="Visualizar arquivo"
+                        aria-label={`Visualizar ${file.nome}`}
+                        className="shrink-0 rounded p-1 text-slate-700 hover:bg-slate-100"
+                      >
+                        <Eye size={15} />
+                      </button>
+                      <button
+                        onClick={() => reprocessDocument(file.id)}
+                        title="Reprocessar arquivo"
+                        aria-label={`Reprocessar ${file.nome}`}
+                        className="shrink-0 rounded p-1 text-teal-700 hover:bg-teal-50"
+                      >
+                        <RefreshCw size={15} />
+                      </button>
+                      <button
+                        onClick={() => deleteDocument(file.id)}
+                        title="Excluir arquivo"
+                        aria-label={`Excluir ${file.nome}`}
+                        className="shrink-0 rounded p-1 text-red-600 hover:bg-red-50"
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <div className="rounded-lg border border-dashed border-slate-200 px-3 py-6 text-center text-sm text-slate-500">
+                  Nenhuma nota enviada.
+                </div>
+              )}
+            </section>
+            <Table
+              title="Notas fiscais extraídas"
+              columns={[
+                "Data emissao",
+                "Fornecedor",
+                "Cpf cnpj",
+                "Numero nota",
+                "Forma pagamento",
+                "Data pagamento",
+                "Valor total",
+                "Situacao",
+              ]}
+              rows={invoiceRows}
+              onView={setViewer}
+            />
+            <IndependentRulesPanel
+              reconciliationId={reconciliationId}
+              source="nota"
+              title="Notas"
+              triggerLabel="Tomador, forma ou serviço"
+              onView={setViewer}
+            />
+          </div>
+        )}
         {reconciliationId && activeTab === "Extrato" && (
           <Table
             title="Lançamentos do extrato"
@@ -3404,45 +3918,40 @@ function ConciliacaoFlow({
             onView={setViewer}
           />
         )}
-        {reconciliationId && activeTab === "Getnet" && isSantander && (
+        {reconciliationId && activeTab === machineTabLabel && (
           <div className="space-y-5">
             <section className="rounded-xl border border-slate-200 bg-white p-5">
               <div className="mb-4 flex items-center justify-between gap-3">
                 <div>
-                  <h2 className="font-semibold">Getnet</h2>
-                  <p className="text-sm text-slate-500">Envie os documentos da Getnet dentro do processo Santander.</p>
+                  <h2 className="font-semibold">{isSantander ? "Getnet" : "Maquininhas"}</h2>
+                  <p className="text-sm text-slate-500">
+                    {isSantander ? "Extratos Getnet enviados no início do processo." : "Extratos de maquininha enviados no início do processo."}
+                  </p>
                 </div>
                 <span className="rounded-full bg-red-50 px-3 py-1 text-xs font-semibold text-red-800">
-                  {getnetFiles.length} arquivo(s)
+                  {machineFiles.length} arquivo(s)
                 </span>
               </div>
-              <div className="grid gap-4 md:grid-cols-2">
-                {[
-                  ["getnet_vendas", "Vendas Getnet"],
-                  ["getnet_comissoes", "Comissões Getnet"],
-                ].map(([type, label]) => (
-                  <label
-                    className="cursor-pointer rounded-xl border-2 border-dashed border-red-200 bg-red-50 p-5 text-center hover:border-red-700"
-                    key={String(type)}
-                  >
-                    <Upload className="mx-auto mb-2 text-red-700" />
-                    <strong className="block">{String(label)}</strong>
-                    <input
-                      className="hidden"
-                      type="file"
-                      accept="application/pdf"
-                      multiple
-                      onChange={(event) => upload(String(type), event)}
-                    />
-                  </label>
-                ))}
-              </div>
-              {getnetFiles.length > 0 && (
-                <ul className="mt-4 divide-y rounded-md border text-sm">
-                  {getnetFiles.map((file) => (
+              {machineFiles.length > 0 && (
+                <ul className="divide-y rounded-md border text-sm">
+                  {machineFiles.map((file) => (
                     <li className="flex items-center justify-between gap-3 px-3 py-2" key={file.id}>
                       <span className="min-w-0 truncate">{file.nome}</span>
-                      <span className="ml-auto shrink-0 text-slate-500">{documentTypeLabel(file.tipo)} · {file.status}</span>
+                      <span className="ml-auto shrink-0 text-slate-500">{documentTypeLabel(file.tipo, bank)} · {file.status}</span>
+                      <button
+                        onClick={() =>
+                          setViewer({
+                            arquivoId: file.id,
+                            pagina: 1,
+                            titulo: documentTypeLabel(file.tipo, bank),
+                          })
+                        }
+                        title="Visualizar arquivo"
+                        aria-label={`Visualizar ${file.nome}`}
+                        className="shrink-0 rounded p-1 text-slate-700 hover:bg-slate-100"
+                      >
+                        <Eye size={15} />
+                      </button>
                       <button
                         onClick={() => reprocessDocument(file.id)}
                         title="Reprocessar arquivo"
@@ -3464,6 +3973,7 @@ function ConciliacaoFlow({
                 </ul>
               )}
             </section>
+            {isSantander && (
             <section className="rounded-xl border border-red-200 bg-white p-5">
               <div className="mb-4 flex items-center justify-between gap-3">
                 <div>
@@ -3526,8 +4036,9 @@ function ConciliacaoFlow({
                 </div>
               )}
             </section>
+            )}
             <Table
-              title="Registros Getnet"
+              title={isSantander ? "Registros Getnet" : "Registros de maquininha"}
               columns={[
                 "Data",
                 "Hora",
@@ -3538,7 +4049,14 @@ function ConciliacaoFlow({
                 "Valor pago",
                 "Tipo",
               ]}
-              rows={getnetReceipts}
+              rows={machineReceipts}
+              onView={setViewer}
+            />
+            <IndependentRulesPanel
+              reconciliationId={reconciliationId}
+              source="maquininha"
+              title={isSantander ? "Getnet" : "Maquininha"}
+              triggerLabel="Favorecido"
               onView={setViewer}
             />
           </div>
@@ -3561,6 +4079,82 @@ function ConciliacaoFlow({
             onView={setViewer}
           />
         )}
+        {reconciliationId && activeTab === "Empréstimos/Financiamentos" && (
+          <div className="space-y-5">
+            <section className="rounded-xl border border-slate-200 bg-white p-5">
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="font-semibold">Empréstimos/Financiamentos</h2>
+                  <p className="text-sm text-slate-500">
+                    Contratos enviados no início do processo e usados na conciliação.
+                  </p>
+                </div>
+                <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-800">
+                  {loanFiles.length} arquivo(s)
+                </span>
+              </div>
+              {loanFiles.length > 0 ? (
+                <ul className="divide-y rounded-md border text-sm">
+                  {loanFiles.map((file) => (
+                    <li className="flex items-center justify-between gap-3 px-3 py-2" key={file.id}>
+                      <span className="min-w-0 truncate">{file.nome}</span>
+                      <span className="ml-auto shrink-0 text-slate-500">{documentTypeLabel(file.tipo, bank)} · {file.status}</span>
+                      <button
+                        onClick={() =>
+                          setViewer({
+                            arquivoId: file.id,
+                            pagina: 1,
+                            titulo: documentTypeLabel(file.tipo, bank),
+                          })
+                        }
+                        title="Visualizar arquivo"
+                        aria-label={`Visualizar ${file.nome}`}
+                        className="shrink-0 rounded p-1 text-slate-700 hover:bg-slate-100"
+                      >
+                        <Eye size={15} />
+                      </button>
+                      <button
+                        onClick={() => reprocessDocument(file.id)}
+                        title="Reprocessar arquivo"
+                        aria-label={`Reprocessar ${file.nome}`}
+                        className="shrink-0 rounded p-1 text-teal-700 hover:bg-teal-50"
+                      >
+                        <RefreshCw size={15} />
+                      </button>
+                      <button
+                        onClick={() => deleteDocument(file.id)}
+                        title="Excluir arquivo"
+                        aria-label={`Excluir ${file.nome}`}
+                        className="shrink-0 rounded p-1 text-red-600 hover:bg-red-50"
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <div className="rounded-lg border border-dashed border-slate-200 px-3 py-6 text-center text-sm text-slate-500">
+                  Nenhum contrato enviado.
+                </div>
+              )}
+            </section>
+            <Table
+              title="Registros de empréstimos/financiamentos"
+              columns={[
+                "Data",
+                "Hora",
+                "Documento",
+                "Favorecido",
+                "Valor original",
+                "Ajustes",
+                "Valor pago",
+                "Tipo",
+              ]}
+              rows={loanReceipts}
+              onView={setViewer}
+            />
+          </div>
+        )}
         {reconciliationId && activeTab === "Conciliação Avançada" && (
           <div className="space-y-3">
             <AdvancedOverview
@@ -3580,7 +4174,7 @@ function ConciliacaoFlow({
         )}
         {reconciliationId && activeTab === "Conciliação" && (
           <div className="space-y-5">
-            <section className="grid gap-4 md:grid-cols-3">
+            <section className="grid gap-4 md:grid-cols-4">
               <div className="rounded-xl border border-sky-200 bg-sky-50 p-5">
                 <p className="text-sm font-medium text-sky-900">
                   Lançamentos do extrato
@@ -3614,6 +4208,17 @@ function ConciliacaoFlow({
                   registros disponíveis
                 </p>
               </div>
+              <div className="rounded-xl border border-amber-200 bg-amber-50 p-5">
+                <p className="text-sm font-medium text-amber-900">
+                  Empréstimos/Financiamentos
+                </p>
+                <strong className="mt-2 block text-3xl text-amber-950">
+                  {loanReceipts.length}
+                </strong>
+                <p className="mt-1 text-sm text-amber-800">
+                  registros disponíveis
+                </p>
+              </div>
             </section>
             {review.extratos.length > 0 && (
               <button
@@ -3629,7 +4234,7 @@ function ConciliacaoFlow({
                   setRulesVersion((version) => version + 1);
                   setResultsVersion((version) => version + 1);
                 }} />
-                <section className="grid gap-3 md:grid-cols-2">
+                <section className="grid gap-3 md:grid-cols-3">
                   <div className="rounded-xl border bg-white p-4 text-sm">
                     <strong>Resumo dos comprovantes bancários</strong>
                     <p>
@@ -3638,6 +4243,16 @@ function ConciliacaoFlow({
                       Não utilizados:{" "}
                       {unused.resumo.comprovantes.nao_utilizados ?? 0} | Fora do
                       período: {unused.resumo.comprovantes.fora_periodo ?? 0}
+                    </p>
+                  </div>
+                  <div className="rounded-xl border bg-white p-4 text-sm">
+                    <strong>Resumo dos empréstimos/financiamentos</strong>
+                    <p>
+                      Total: {unused.resumo.emprestimos?.total ?? 0} |
+                      Utilizados: {unused.resumo.emprestimos?.utilizados ?? 0} |
+                      Não utilizados:{" "}
+                      {unused.resumo.emprestimos?.nao_utilizados ?? 0} | Fora do
+                      período: {unused.resumo.emprestimos?.fora_periodo ?? 0}
                     </p>
                   </div>
                   <div className="rounded-xl border bg-white p-4 text-sm">
@@ -3661,6 +4276,19 @@ function ConciliacaoFlow({
                     "Situacao",
                   ]}
                   rows={unused.comprovantes}
+                  showOrigin={false}
+                />
+                <Table
+                  title="Empréstimos/financiamentos não utilizados"
+                  columns={[
+                    "Data",
+                    "Documento",
+                    "Favorecido",
+                    "Valor pago",
+                    "Tipo",
+                    "Situacao",
+                  ]}
+                  rows={unused.emprestimos ?? []}
                   showOrigin={false}
                 />
                 <Table

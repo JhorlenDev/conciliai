@@ -1,7 +1,10 @@
 import csv
 import io
+import os
 import shutil
 import re
+import subprocess
+import tempfile
 import textwrap
 import zipfile
 import logging
@@ -25,7 +28,7 @@ from app.core.database import get_db
 from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, ComprovanteRfbItem, Conciliacao, ContaBancaria, Correspondencia, DocumentoImportante, LancamentoContabil, MovimentoExtrato, NotaFiscal, ProcessoConciliacao, RegraContabil, RegraContabilExcecao
 from app.services.normalization import accounting_nature, is_statement_debit, normalize_name, normalize_rule_accounting_nature, normalize_statement_nature
 from app.services.matching import names_similar
-from app.services.parsers import deduplicate_statement_records, extract_basa_pdfplumber_pages, extract_getnet_pdfplumber_pages, extract_invoices, extract_loan_receipts, extract_receipts, extract_santander_pdfplumber_statement, extract_statement_pages
+from app.services.parsers import deduplicate_statement_records, extract_basa_pdfplumber_pages, extract_getnet_pdfplumber_pages, extract_invoices, extract_loan_receipts, extract_receipts, extract_santander_pdfplumber_statement, extract_statement_pages, parse_brl
 from app.services.getnet_adjustments import GETNET_ADJUSTMENT_COMPONENT, GETNET_ADJUSTMENT_DESCRIPTION, is_getnet_adjustment_movement, is_santander_getnet_credit, sync_getnet_anticipation_adjustments
 from app.services.rfb import belongs_to_selected_bank, extract_competence, parse_rfb_page
 from app.services.rule_source import choose_rule_source
@@ -40,6 +43,31 @@ INVOICE_DOCUMENT_TYPE = "nota"
 RECEIPT_DOCUMENT_TYPES = {"comprovante", LOAN_DOCUMENT_TYPE, *MACHINE_STATEMENT_DOCUMENT_TYPES}
 DOCUMENT_TYPES = {"extrato", *RECEIPT_DOCUMENT_TYPES, INVOICE_DOCUMENT_TYPE, "rfb"}
 logger = logging.getLogger(__name__)
+SCANNED_PDF_OCR_MESSAGE = "PDF escaneado sem texto pesquisável. Instale o OCR Tesseract (tesseract-ocr e tesseract-ocr-por) para extrair este documento."
+
+
+def extract_basa_initial_balance(text: str) -> Decimal | None:
+    match = re.search(r"Saldo Dispon[ií]vel Inicial:\s*([+-]?\d{1,3}(?:\.\d{3})*,\d{2})", text, re.I)
+    if match:
+        return parse_brl(match.group(1))
+
+    lines = [line.strip() for line in text.splitlines()]
+    for index, line in enumerate(lines):
+        if "SALDO DISPONIVEL INICIAL" not in normalize_name(line):
+            continue
+        window = " ".join(lines[index : index + 4])
+        amount_match = re.search(r"([+-]?\d{1,3}(?:\.\d{3})*,\d{2})", window)
+        if amount_match:
+            return parse_brl(amount_match.group(1))
+    return None
+
+
+def statement_initial_balance(reconciliation: Conciliacao, db: Session) -> Decimal:
+    if reconciliation.banco != "BASA":
+        return Decimal("0.00")
+    files = db.query(Arquivo).filter_by(conciliacao_id=reconciliation.id, tipo_documento="extrato", ativo=True).all()
+    text = "\n".join(item.texto_bruto or "" for item in files)
+    return extract_basa_initial_balance(text) or Decimal("0.00")
 
 
 @router.get("/arquivos/{arquivo_id}/visualizar")
@@ -257,8 +285,72 @@ def extract_pdf_pages(path: Path, bank: str, document_type: str) -> list[str]:
             return pages
     with fitz.open(path) as document:
         pages = [page.get_text() for page in document]
+    if document_type == LOAN_DOCUMENT_TYPE and not any(page.strip() for page in pages):
+        pages = extract_scanned_pdf_pages(path)
+    if document_type == LOAN_DOCUMENT_TYPE and any("Cronograma Reposicao Exigivel" in page or "Cronograma Reposição Exigível" in page for page in pages):
+        return ["\n".join(pages)]
     if document_type == "comprovante" and bank == "Caixa" and any("Comprovante de Pagamento de Boleto" in page for page in pages):
         return ["\n".join(pages)]
+    return pages
+
+
+def available_tesseract_languages(tesseract: str) -> set[str]:
+    try:
+        result = subprocess.run([tesseract, "--list-langs"], capture_output=True, text=True, timeout=10, check=False, env=tesseract_environment())
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {line.strip() for line in result.stdout.splitlines() if line.strip() and not line.lower().startswith("list of")}
+
+
+def tesseract_language_argument(languages: set[str]) -> str:
+    selected = [language for language in ("por", "eng") if language in languages]
+    return "+".join(selected) if selected else "por+eng"
+
+
+def local_tesseract_path() -> str | None:
+    local = Path.cwd() / ".local" / "ocr" / "root" / "usr" / "bin" / "tesseract"
+    return str(local) if local.is_file() else None
+
+
+def tesseract_environment() -> dict[str, str]:
+    env = dict(os.environ)
+    local_root = Path.cwd() / ".local" / "ocr" / "root"
+    tessdata = local_root / "usr" / "share" / "tesseract-ocr" / "5" / "tessdata"
+    local_lib = local_root / "usr" / "lib" / "x86_64-linux-gnu"
+    if tessdata.is_dir():
+        env["TESSDATA_PREFIX"] = str(tessdata)
+    if local_lib.is_dir():
+        current = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"{local_lib}:{current}" if current else str(local_lib)
+    return env
+
+
+def extract_scanned_pdf_pages(path: Path) -> list[str]:
+    tesseract = shutil.which("tesseract") or local_tesseract_path()
+    if not tesseract:
+        raise ValueError(SCANNED_PDF_OCR_MESSAGE)
+    languages = available_tesseract_languages(tesseract)
+    language = tesseract_language_argument(languages)
+    env = tesseract_environment()
+    pages: list[str] = []
+    with fitz.open(path) as document, tempfile.TemporaryDirectory() as tmpdir:
+        for number, page in enumerate(document, 1):
+            image_path = Path(tmpdir) / f"page-{number}.png"
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
+            pixmap.save(image_path)
+            result = subprocess.run(
+                [tesseract, str(image_path), "stdout", "-l", language, "--psm", "6"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+                env=env,
+            )
+            if result.returncode != 0:
+                raise ValueError(f"OCR falhou na página {number}: {result.stderr.strip() or 'erro desconhecido'}")
+            pages.append(result.stdout)
+    if not any(page.strip() for page in pages):
+        raise ValueError("OCR executado, mas nenhum texto foi reconhecido no PDF.")
     return pages
 
 
@@ -705,10 +797,17 @@ def preferred_accounting_entry(existing: LancamentoContabil, candidate: Lancamen
     return existing
 
 
+def accounting_entry_unique_key(entry: LancamentoContabil) -> str:
+    component = rule_component_key(entry.componente)
+    if entry.status == "editado_manual" and entry.origem == "manual" and component != "PRINCIPAL":
+        return f"manual:{entry.id}"
+    return component
+
+
 def unique_accounting_entries(entries: list[LancamentoContabil]) -> list[LancamentoContabil]:
     selected: dict[str, LancamentoContabil] = {}
     for entry in sorted(entries, key=accounting_entry_order):
-        key = rule_component_key(entry.componente)
+        key = accounting_entry_unique_key(entry)
         selected[key] = preferred_accounting_entry(selected[key], entry) if key in selected else entry
     return sorted(selected.values(), key=accounting_entry_order)
 
@@ -1422,6 +1521,7 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
     if response:
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     saved_payloads = [rule_payload(rule, movements, receipts, covered_by_rule[rule.id]) for rule in same_bank_rules]
+    initial_balance = statement_initial_balance(reconciliation, db)
     def saved_rule_order(item: dict):
         entry_order = min((accounting_entry_order(entry) for _, entry in covered_by_rule[item["id"]]), default=(10**9, 10**9, ""))
         return ((item.get("criada_em") or "")[:19], -entry_order[0], -entry_order[1])
@@ -1449,6 +1549,7 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
         "ignoradas": ignored,
         "resumo": {
             "extrato": {
+                "saldo_anterior": str(initial_balance),
                 "debito": str(sum((item.valor or 0 for item in movements if item.ativo and is_statement_debit(item.natureza)), 0)),
                 "credito": str(sum((item.valor or 0 for item in movements if item.ativo and not is_statement_debit(item.natureza)), 0)),
                 "outros": "0.00",
@@ -2362,6 +2463,13 @@ def review(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPI
         except ValueError:
             return value or "—"
 
+    def statement_balances():
+        if not reconciliation or reconciliation.banco != "BASA":
+            return {}
+        text = "\n".join(item.texto_bruto or "" for item in files.values() if item.tipo_documento == "extrato")
+        initial_balance = extract_basa_initial_balance(text)
+        return {"saldo_anterior": money(initial_balance)} if initial_balance is not None else {}
+
     def adjustments(item):
         fields = (("Desconto", item.valor_desconto), ("Abatimento", item.valor_abatimento), ("Desconto/abatimento", item.valor_desconto_abatimento), ("Taxa/tarifa", item.valor_tarifa), ("Juros", item.valor_juros), ("Multa", item.valor_multa), ("Encargos", item.valor_encargos))
         values = [f"{label}: {money(value)}" for label, value in fields if value is not None and value > 0]
@@ -2396,4 +2504,5 @@ def review(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPI
         "rfb": [base(x, {"tipo": x.tipo, "competencia_apuracao": x.competencia or x.periodo_apuracao or "—", "data_arrecadacao": display_date(x.data_arrecadacao), "documento": x.numero_documento, "banco": x.nome_banco, "principal": money(x.valor_principal), "multa_juros": "Sem acréscimos" if not ((x.valor_multa or 0) + (x.valor_juros or 0)) else f"Multa: {money(x.valor_multa)} + Juros: {money(x.valor_juros)}", "total": money(x.valor_total), "situacao": x.status}) for x in rfb_records],
         "arquivos": [{"id": x.id, "nome": x.nome_original, "tipo": x.tipo_documento, "status": x.status_processamento, "erro": x.mensagem_erro} for x in files.values()],
         "ajustes_getnet": getnet_adjustments,
+        "saldos": statement_balances(),
     }

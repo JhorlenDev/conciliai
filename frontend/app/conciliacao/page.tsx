@@ -91,6 +91,9 @@ type Review = {
   emprestimos?: Row[];
   notas?: Row[];
   rfb: Row[];
+  saldos?: {
+    saldo_anterior?: string;
+  };
   ajustes_getnet?: GetnetAdjustment[];
   arquivos: {
     id: string;
@@ -305,11 +308,13 @@ function Table({
 
 function AdvancedSummary({
   label,
+  previous,
   debit,
   credit,
   current,
 }: {
   label: string;
+  previous: number;
   debit: number;
   credit: number;
   current: number;
@@ -320,7 +325,7 @@ function AdvancedSummary({
       maximumFractionDigits: 2,
     });
   const cells = [
-    ["Anterior", 0, "border-slate-200 bg-slate-50"],
+    ["Anterior", previous, "border-slate-200 bg-slate-50"],
     ["Débito", debit, "border-blue-200 bg-blue-50 text-blue-800"],
     ["Crédito", credit, "border-red-200 bg-red-50 text-red-800"],
     ["Atual", current, "border-slate-200 bg-slate-50"],
@@ -408,7 +413,7 @@ function AdvancedOverview({
     pendentes: unknown[];
     salvas: unknown[];
     resumo: {
-      extrato: { debito: string; credito: string; outros: string; outros_debito: string; outros_credito: string };
+      extrato: { saldo_anterior?: string; debito: string; credito: string; outros: string; outros_debito: string; outros_credito: string };
       razao: { debito: string; credito: string; outros: string; outros_debito: string; outros_credito: string };
     };
     integridade: { csv_permitido: boolean; diferenca: string; movimentos_incompletos: { data: string; historico: string }[] };
@@ -426,6 +431,7 @@ function AdvancedOverview({
     return () => controller.abort();
   }, [reconciliationId, version]);
   const summary = data?.resumo;
+  const statementPrevious = Number(summary?.extrato.saldo_anterior ?? 0);
   const csvBlocked = data?.integridade && !data.integridade.csv_permitido;
   return (
     <section className="flex flex-wrap items-center gap-3 rounded-xl border border-slate-200 bg-white p-2.5">
@@ -448,15 +454,18 @@ function AdvancedOverview({
       <div className="min-w-[560px] flex-[1.5] space-y-1">
         <AdvancedSummary
           label="Extrato"
+          previous={statementPrevious}
           debit={Number(summary?.extrato.debito ?? 0)}
           credit={Number(summary?.extrato.credito ?? 0)}
           current={
+            statementPrevious +
             Number(summary?.extrato.credito ?? 0) -
             Number(summary?.extrato.debito ?? 0)
           }
         />
         <AdvancedSummary
           label="Razão"
+          previous={0}
           debit={Number(summary?.razao.debito ?? 0)}
           credit={Number(summary?.razao.credito ?? 0)}
           current={
@@ -642,8 +651,13 @@ function IndependentRulesPanel({
 }) {
   const [data, setData] = useState<IndependentRulesData>({ pendentes: [], classificados: [], salvas: [], resumo: { total: 0, classificados: 0, pendentes: 0 } });
   const [drafts, setDrafts] = useState<Record<string, Record<string, string>>>({});
+  const [activeView, setActiveView] = useState<"pending" | "saved" | "classified">("pending");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState("");
+  const [catalog, setCatalog] = useState<{
+    contas: string[];
+    historicos: string[];
+  }>({ contas: [], historicos: [] });
   useAutoDismissMessage(message, setMessage);
   async function load() {
     const response = await fetch(`${API}/api/conciliacoes/${reconciliationId}/regras-fonte/${source}`, { cache: "no-store" });
@@ -651,8 +665,14 @@ function IndependentRulesPanel({
   }
   useEffect(() => {
     load();
+    fetch(`${API}/api/documentos-importantes/catalogo`)
+      .then((response) => (response.ok ? response.json() : null))
+      .then((loadedCatalog) => {
+        if (loadedCatalog) setCatalog(loadedCatalog);
+      });
   }, [reconciliationId, source]);
   const value = (id: string, field: string, fallback = "") => drafts[id]?.[field] ?? fallback;
+  const defaultComplement = (row: IndependentRuleRow) => source === "maquininha" ? "Conforme extrato de maquininha" : row.documento && row.documento !== "—" ? row.documento : "Conforme nota fiscal";
   const change = (id: string, field: string, input: string) => setDrafts((current) => ({ ...current, [id]: { ...current[id], [field]: input } }));
   async function save(row: IndependentRuleRow) {
     const body = {
@@ -660,7 +680,7 @@ function IndependentRulesPanel({
       conta_debito: value(row.id, "debito"),
       conta_credito: value(row.id, "credito"),
       historico: value(row.id, "historico"),
-      complemento: value(row.id, "complemento", source === "maquininha" ? "Conforme extrato de maquininha" : "Conforme nota fiscal"),
+      complemento: value(row.id, "complemento", defaultComplement(row)),
       escopo: "global",
     };
     if (!body.gatilho.trim() || !body.conta_debito.trim() || !body.conta_credito.trim() || !body.historico.trim()) {
@@ -700,6 +720,12 @@ function IndependentRulesPanel({
     }
   }
   const money = (value: string) => formatMoney(value);
+  const isNoteSource = source === "nota";
+  const tabs = [
+    { id: "pending" as const, label: "Regras a criar", count: data.pendentes.length },
+    { id: "saved" as const, label: "Regras criadas", count: data.salvas.length },
+    { id: "classified" as const, label: "Classificados", count: data.classificados.length },
+  ];
   const RowFileButton = ({ row }: { row: IndependentRuleRow }) =>
     row.arquivo_id ? (
       <button
@@ -713,6 +739,16 @@ function IndependentRulesPanel({
     ) : null;
   return (
     <section className="rounded-xl border border-slate-200 bg-white p-5">
+      <datalist id="catalogo-contas">
+        {catalog.contas.map((option) => (
+          <option value={option} key={option} />
+        ))}
+      </datalist>
+      <datalist id="catalogo-historicos">
+        {catalog.historicos.map((option) => (
+          <option value={option} key={option} />
+        ))}
+      </datalist>
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="font-semibold">Regras de {title}</h2>
@@ -727,67 +763,142 @@ function IndependentRulesPanel({
         </div>
       </div>
       {message && <p className="mb-3 rounded bg-teal-50 p-2 text-xs text-teal-900">{message}</p>}
-      <div className="overflow-x-auto">
-        <table className="w-full min-w-[980px] text-left text-xs">
-          <thead className="bg-slate-50 text-[10px] uppercase text-slate-500">
-            <tr>
-              {["Data", triggerLabel, "Valor original", "Gatilho", "Débito", "Crédito", "Histórico", "Complemento", "Ação"].map((column) => (
-                <th className="px-2 py-2" key={column}>{column}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {data.pendentes.map((row) => (
-              <tr className="border-t align-top" key={row.id}>
-                <td className="px-2 py-2">{row.data}</td>
-                <td className="px-2 py-2"><span className="block font-medium text-slate-800">{row.texto}</span><span className="text-slate-500">{[row.documento, row.forma_pagamento && row.forma_pagamento !== "—" ? row.forma_pagamento : ""].filter(Boolean).join(" · ")}</span></td>
-                <td className="px-2 py-2 font-semibold">{money(row.valor)}</td>
-                <td className="px-2 py-1"><input value={value(row.id, "gatilho", row.texto)} onChange={(event) => change(row.id, "gatilho", event.target.value)} className="w-36 rounded border px-2 py-1" /></td>
-                <td className="px-2 py-1"><input value={value(row.id, "debito")} onChange={(event) => change(row.id, "debito", event.target.value)} className="w-36 rounded border px-2 py-1" /></td>
-                <td className="px-2 py-1"><input value={value(row.id, "credito")} onChange={(event) => change(row.id, "credito", event.target.value)} className="w-36 rounded border px-2 py-1" /></td>
-                <td className="px-2 py-1"><input value={value(row.id, "historico")} onChange={(event) => change(row.id, "historico", event.target.value)} className="w-40 rounded border px-2 py-1" /></td>
-                <td className="px-2 py-1"><input value={value(row.id, "complemento", source === "maquininha" ? "Conforme extrato de maquininha" : "Conforme nota fiscal")} onChange={(event) => change(row.id, "complemento", event.target.value)} className="w-48 rounded border px-2 py-1" /></td>
-                <td className="whitespace-nowrap px-2 py-1"><button disabled={busy === row.id} onClick={() => save(row)} className="rounded bg-teal-700 px-2 py-1 text-white disabled:opacity-60">{busy === row.id ? "Salvando..." : "Salvar"}</button><RowFileButton row={row} /></td>
+      <div className="mb-3 flex flex-wrap gap-2">
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveView(tab.id)}
+            className={`rounded-md border px-3 py-2 text-xs font-semibold ${activeView === tab.id ? "border-teal-700 bg-teal-700 text-white" : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"}`}
+          >
+            {tab.label} ({tab.count})
+          </button>
+        ))}
+      </div>
+      {activeView === "pending" && (
+        <div className="max-h-[calc(100dvh-360px)] overflow-auto rounded-lg border">
+          <table className={`w-full text-left text-xs ${isNoteSource ? "min-w-[1120px]" : "min-w-[980px]"}`}>
+            <thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase text-slate-500">
+              <tr>
+                {["Data", triggerLabel, ...(isNoteSource ? ["Forma pgto."] : []), "Valor original", "Gatilho", "Débito", "Crédito", "Histórico", "Complemento", "Ação"].map((column) => (
+                  <th className="px-2 py-2" key={column}>{column}</th>
+                ))}
               </tr>
-            ))}
-            {!data.pendentes.length && (
-              <tr><td className="px-2 py-6 text-center text-slate-500" colSpan={9}>Nenhum registro pendente nesta aba.</td></tr>
-            )}
-          </tbody>
-        </table>
-      </div>
-      <div className="mt-5 grid gap-4 lg:grid-cols-2">
-        <div className="rounded-lg border">
-          <div className="border-b bg-slate-50 px-3 py-2 text-xs font-semibold">Regras salvas ({data.salvas.length})</div>
-          <div className="max-h-64 overflow-auto">
-            {data.salvas.map((rule) => (
-              <div className="flex items-center gap-2 border-b px-3 py-2 text-xs" key={rule.id}>
-                <div className="min-w-0 flex-1">
-                  <strong className="block truncate">{rule.gatilho}</strong>
-                  <span className="text-slate-500">{rule.cobertos} cobertos · {rule.conta_debito} → {rule.conta_credito}</span>
-                </div>
-                <button disabled={busy === rule.id} onClick={() => remove(rule)} className="rounded p-1 text-red-600 hover:bg-red-50" title="Excluir regra"><Trash2 size={15} /></button>
-              </div>
-            ))}
-            {!data.salvas.length && <p className="px-3 py-5 text-center text-xs text-slate-500">Nenhuma regra salva.</p>}
-          </div>
+            </thead>
+            <tbody>
+              {data.pendentes.map((row) => (
+                <tr className="border-t align-top" key={row.id}>
+                  <td className="px-2 py-2">{row.data}</td>
+                  <td className="px-2 py-2">
+                    <span className="block font-medium text-slate-800">{row.texto}</span>
+                    <span className="text-slate-500">{row.documento}</span>
+                  </td>
+                  {isNoteSource && (
+                    <td className="px-2 py-2">
+                      <span className={`inline-flex rounded-full px-2 py-1 text-[11px] font-semibold ${row.forma_pagamento && row.forma_pagamento !== "—" ? "bg-amber-50 text-amber-800" : "bg-slate-100 text-slate-500"}`}>
+                        {row.forma_pagamento || "—"}
+                      </span>
+                    </td>
+                  )}
+                  <td className="px-2 py-2 font-semibold">{money(row.valor)}</td>
+                  <td className="px-2 py-1"><input value={value(row.id, "gatilho", row.texto)} onChange={(event) => change(row.id, "gatilho", event.target.value)} className="w-36 rounded border px-2 py-1" /></td>
+                  <td className="px-2 py-1">
+                    <input
+                      list="catalogo-contas"
+                      value={value(row.id, "debito")}
+                      onChange={(event) => {
+                        change(row.id, "debito", event.target.value);
+                        showInputStart(event.currentTarget);
+                      }}
+                      onBlur={(event) => showInputStart(event.currentTarget)}
+                      className="w-36 rounded border px-2 py-1 pr-5 text-left"
+                      placeholder="Selecionar"
+                    />
+                  </td>
+                  <td className="px-2 py-1">
+                    <input
+                      list="catalogo-contas"
+                      value={value(row.id, "credito")}
+                      onChange={(event) => {
+                        change(row.id, "credito", event.target.value);
+                        showInputStart(event.currentTarget);
+                      }}
+                      onBlur={(event) => showInputStart(event.currentTarget)}
+                      className="w-36 rounded border px-2 py-1 pr-5 text-left"
+                      placeholder="Selecionar"
+                    />
+                  </td>
+                  <td className="px-2 py-1">
+                    <input
+                      list="catalogo-historicos"
+                      value={value(row.id, "historico")}
+                      onChange={(event) => {
+                        change(row.id, "historico", event.target.value);
+                        showInputStart(event.currentTarget);
+                      }}
+                      onBlur={(event) => showInputStart(event.currentTarget)}
+                      className="w-40 rounded border px-2 py-1 pr-5 text-left"
+                      placeholder="Selecionar"
+                    />
+                  </td>
+                  <td className="px-2 py-1"><input value={value(row.id, "complemento", defaultComplement(row))} onChange={(event) => change(row.id, "complemento", event.target.value)} className="w-48 rounded border px-2 py-1" /></td>
+                  <td className="whitespace-nowrap px-2 py-1"><button disabled={busy === row.id} onClick={() => save(row)} className="rounded bg-teal-700 px-2 py-1 text-white disabled:opacity-60">{busy === row.id ? "Salvando..." : "Salvar"}</button><RowFileButton row={row} /></td>
+                </tr>
+              ))}
+              {!data.pendentes.length && (
+                <tr><td className="px-2 py-6 text-center text-slate-500" colSpan={isNoteSource ? 10 : 9}>Nenhum registro pendente nesta aba.</td></tr>
+              )}
+            </tbody>
+          </table>
         </div>
-        <div className="rounded-lg border">
-          <div className="border-b bg-slate-50 px-3 py-2 text-xs font-semibold">Classificados ({data.classificados.length})</div>
-          <div className="max-h-64 overflow-auto">
-            {data.classificados.map((row) => (
-              <div className="flex items-center gap-2 border-b px-3 py-2 text-xs" key={row.id}>
-                <div className="min-w-0 flex-1">
-                  <strong className="block truncate">{row.texto}</strong>
-                  <span className="text-slate-500">{row.data} · {money(row.valor)} · {row.historico_contabil}</span>
-                </div>
-                <RowFileButton row={row} />
-              </div>
-            ))}
-            {!data.classificados.length && <p className="px-3 py-5 text-center text-xs text-slate-500">Nenhum registro classificado.</p>}
-          </div>
+      )}
+      {activeView === "saved" && (
+        <div className="max-h-[calc(100dvh-360px)] overflow-auto rounded-lg border">
+          <table className="w-full min-w-[820px] text-left text-xs">
+            <thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase text-slate-500">
+              <tr>{["Gatilho", "Cobertos", "Débito", "Crédito", "Histórico", "Complemento", "Ação"].map((column) => <th className="px-3 py-2" key={column}>{column}</th>)}</tr>
+            </thead>
+            <tbody>
+              {data.salvas.map((rule) => (
+                <tr className="border-t" key={rule.id}>
+                  <td className="px-3 py-2 font-semibold text-slate-800">{rule.gatilho}</td>
+                  <td className="px-3 py-2">{rule.cobertos}</td>
+                  <td className="px-3 py-2">{rule.conta_debito}</td>
+                  <td className="px-3 py-2">{rule.conta_credito}</td>
+                  <td className="px-3 py-2">{rule.historico}</td>
+                  <td className="px-3 py-2">{rule.complemento}</td>
+                  <td className="px-3 py-2"><button disabled={busy === rule.id} onClick={() => remove(rule)} className="rounded p-1 text-red-600 hover:bg-red-50" title="Excluir regra"><Trash2 size={15} /></button></td>
+                </tr>
+              ))}
+              {!data.salvas.length && <tr><td className="px-3 py-6 text-center text-slate-500" colSpan={7}>Nenhuma regra criada.</td></tr>}
+            </tbody>
+          </table>
         </div>
-      </div>
+      )}
+      {activeView === "classified" && (
+        <div className="max-h-[calc(100dvh-360px)] overflow-auto rounded-lg border">
+          <table className={`w-full text-left text-xs ${isNoteSource ? "min-w-[960px]" : "min-w-[820px]"}`}>
+            <thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase text-slate-500">
+              <tr>{["Data", triggerLabel, ...(isNoteSource ? ["Forma pgto."] : []), "Valor", "Débito", "Crédito", "Histórico", "Complemento", "Arquivo"].map((column) => <th className="px-3 py-2" key={column}>{column}</th>)}</tr>
+            </thead>
+            <tbody>
+              {data.classificados.map((row) => (
+                <tr className="border-t" key={row.id}>
+                  <td className="px-3 py-2">{row.data}</td>
+                  <td className="px-3 py-2"><span className="block font-semibold text-slate-800">{row.texto}</span><span className="text-slate-500">{row.documento}</span></td>
+                  {isNoteSource && <td className="px-3 py-2">{row.forma_pagamento || "—"}</td>}
+                  <td className="px-3 py-2 font-semibold">{money(row.valor)}</td>
+                  <td className="px-3 py-2">{row.conta_debito}</td>
+                  <td className="px-3 py-2">{row.conta_credito}</td>
+                  <td className="px-3 py-2">{row.historico_contabil}</td>
+                  <td className="px-3 py-2">{row.complemento}</td>
+                  <td className="px-3 py-2"><RowFileButton row={row} /></td>
+                </tr>
+              ))}
+              {!data.classificados.length && <tr><td className="px-3 py-6 text-center text-slate-500" colSpan={isNoteSource ? 9 : 8}>Nenhum registro classificado.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      )}
     </section>
   );
 }
@@ -2752,6 +2863,55 @@ function EditableResultTable({
     ...(row.lancamentos ?? []),
     ...(extras[String(row.id)] ?? []),
   ];
+  const newComplementaryItem = (): AccountingItem => ({
+    id: `novo-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    componente: "OUTRO",
+    categoria: "OUTRO",
+    tributo: "",
+    codigo_receita: "",
+    descricao: "Lançamento complementar",
+    efeito_no_total: "SOMA",
+    valor: "R$ 0,00",
+    conta_debito: "",
+    conta_credito: "",
+    historico: "",
+    complemento: "",
+    origem: "manual",
+    status: "novo",
+  });
+  function addComplementary(row: ResultRow) {
+    const rowId = String(row.id);
+    const item = newComplementaryItem();
+    setExpanded(rowId);
+    setExtras((current) => ({
+      ...current,
+      [rowId]: [...(current[rowId] ?? []), item],
+    }));
+    setDrafts((current) => ({
+      ...current,
+      [rowId]: {
+        ...current[rowId],
+        [item.id]: {
+          valor: "",
+          conta_debito: "",
+          conta_credito: "",
+          historico: "",
+          complemento: "",
+        },
+      },
+    }));
+  }
+  function removeUnsavedComplementary(rowId: string, itemId: string) {
+    setExtras((current) => ({
+      ...current,
+      [rowId]: (current[rowId] ?? []).filter((item) => item.id !== itemId),
+    }));
+    setDrafts((current) => {
+      const rowDrafts = { ...(current[rowId] ?? {}) };
+      delete rowDrafts[itemId];
+      return { ...current, [rowId]: rowDrafts };
+    });
+  }
   async function save(row: ResultRow, selected?: AccountingItem) {
     const rowId = String(row.id);
     const items = selected ? [selected] : itemsFor(row);
@@ -2901,15 +3061,26 @@ function EditableResultTable({
                     <td className="whitespace-nowrap px-3 py-3">{row.valor}</td>
                     <td className="px-3 py-3">{row.situacao}</td>
                     <td className="px-3 py-3">
-                      <button
-                        disabled={!usedInPeriod}
-                        onClick={() =>
-                          setExpanded(expanded === rowId ? null : rowId)
-                        }
-                        className="rounded border border-slate-300 bg-white/70 px-2 py-1 disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {expanded === rowId ? "Fechar" : "Configurar"}
-                      </button>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          disabled={!usedInPeriod}
+                          onClick={() =>
+                            setExpanded(expanded === rowId ? null : rowId)
+                          }
+                          className="rounded border border-slate-300 bg-white/70 px-2 py-1 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {expanded === rowId ? "Fechar" : "Configurar"}
+                        </button>
+                        <button
+                          disabled={!usedInPeriod}
+                          onClick={() => addComplementary(row)}
+                          title="Adicionar lançamento complementar"
+                          aria-label="Adicionar lançamento complementar"
+                          className="rounded border border-teal-700 bg-teal-50 p-1.5 text-teal-800 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <Plus size={14} />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                   {expanded === rowId && (
@@ -2961,44 +3132,20 @@ function EditableResultTable({
                             )
                           );
                         })()}
-                        {itemsFor(row).length ? (
-                          <div className="mt-3 overflow-x-auto rounded border bg-white">
+                        <div className="mt-3 overflow-x-auto rounded border bg-white">
                             <div className="flex items-center justify-between border-b bg-slate-50 px-3 py-2">
                               <h3 className="text-xs font-semibold text-slate-700">
                                 Detalhamento dos lançamentos
                               </h3>
                               <div className="flex gap-2">
                                 <button
-                                  onClick={() =>
-                                    setExtras((current) => ({
-                                      ...current,
-                                      [rowId]: [
-                                        ...(current[rowId] ?? []),
-                                        {
-                                          id: `novo-${Date.now()}`,
-                                          componente: "OUTRO",
-                                          categoria: "OUTRO",
-                                          tributo: "",
-                                          codigo_receita: "",
-                                          descricao: "Lançamento manual",
-                                          efeito_no_total: "SOMA",
-                                          valor: "R$ 0,00",
-                                           conta_debito: "",
-                                           conta_credito: "",
-                                           historico: "",
-                                           complemento: "",
-                                           origem: "manual",
-                                          status: "novo",
-                                        },
-                                      ],
-                                    }))
-                                  }
+                                  onClick={() => addComplementary(row)}
                                   className="rounded border border-teal-700 px-2 py-1 text-xs font-semibold text-teal-800"
                                 >
-                                  Adicionar lançamento
+                                  Adicionar complementar
                                 </button>
                                 <button
-                                  disabled={saving === rowId}
+                                  disabled={saving === rowId || !itemsFor(row).length}
                                   onClick={() => save(row)}
                                   className="rounded bg-teal-700 px-2 py-1 text-xs font-semibold text-white disabled:opacity-60"
                                 >
@@ -3008,6 +3155,7 @@ function EditableResultTable({
                                 </button>
                               </div>
                             </div>
+                            {itemsFor(row).length ? (
                             <table className="w-full min-w-[900px] text-left text-xs">
                               <thead className="bg-slate-50 text-[10px] uppercase text-slate-500">
                                 <tr>
@@ -3133,20 +3281,37 @@ function EditableResultTable({
                                       {item.imposto && <p className={`mt-1 text-[10px] ${item.competencia_nao_identificada ? "text-amber-700" : "text-emerald-700"}`}>{item.imposto}{item.competencia ? ` · Competência ${item.competencia}` : " · Competência não identificada"}{item.comprovante_origem ? ` · ${item.comprovante_origem}` : ""}</p>}
                                     </td>
                                     <td className="px-3 py-1">
-                                      <button
-                                        disabled={saving === rowId}
-                                        onClick={() => save(row, item)}
-                                        className="rounded border border-teal-700 px-2 py-1 text-teal-800"
-                                      >
-                                        Salvar
-                                      </button>
+                                      <div className="flex items-center gap-1">
+                                        <button
+                                          disabled={saving === rowId}
+                                          onClick={() => save(row, item)}
+                                          className="rounded border border-teal-700 px-2 py-1 text-teal-800"
+                                        >
+                                          Salvar
+                                        </button>
+                                        {item.id.startsWith("novo-") && (
+                                          <button
+                                            disabled={saving === rowId}
+                                            onClick={() => removeUnsavedComplementary(rowId, item.id)}
+                                            title="Remover"
+                                            aria-label="Remover lançamento complementar"
+                                            className="rounded border border-red-200 p-1 text-red-600"
+                                          >
+                                            <Trash2 size={13} />
+                                          </button>
+                                        )}
+                                      </div>
                                     </td>
                                   </tr>
                                 ))}
                               </tbody>
                             </table>
+                            ) : (
+                              <p className="px-3 py-4 text-xs text-slate-500">
+                                Nenhum lançamento contábil neste registro.
+                              </p>
+                            )}
                           </div>
-                        ) : null}
                       </td>
                     </tr>
                   )}
@@ -3602,7 +3767,7 @@ function ConciliacaoFlow({
     "Início",
     ...(isNotesArea
       ? review.arquivos.length
-        ? ["Notas"]
+        ? ["Notas Extraídas", "Regras"]
         : []
       : review.arquivos.length
       ? [
@@ -3810,65 +3975,8 @@ function ConciliacaoFlow({
             {message}
           </p>
         )}
-        {reconciliationId && activeTab === "Notas" && (
+        {reconciliationId && isNotesArea && activeTab === "Notas Extraídas" && (
           <div className="space-y-5">
-            <section className="rounded-xl border border-slate-200 bg-white p-5">
-              <div className="mb-4 flex items-center justify-between gap-3">
-                <div>
-                  <h2 className="font-semibold">Notas fiscais</h2>
-                  <p className="text-sm text-slate-500">
-                    PDFs enviados no início do processo para leitura e criação das regras.
-                  </p>
-                </div>
-                <span className="rounded-full bg-sky-50 px-3 py-1 text-xs font-semibold text-sky-800">
-                  {noteFiles.length} arquivo(s)
-                </span>
-              </div>
-              {noteFiles.length > 0 ? (
-                <ul className="divide-y rounded-md border text-sm">
-                  {noteFiles.map((file) => (
-                    <li className="flex items-center justify-between gap-3 px-3 py-2" key={file.id}>
-                      <span className="min-w-0 truncate">{file.nome}</span>
-                      <span className="ml-auto shrink-0 text-slate-500">{documentTypeLabel(file.tipo, bank)} · {file.status}</span>
-                      <button
-                        onClick={() =>
-                          setViewer({
-                            arquivoId: file.id,
-                            pagina: 1,
-                            titulo: documentTypeLabel(file.tipo, bank),
-                          })
-                        }
-                        title="Visualizar arquivo"
-                        aria-label={`Visualizar ${file.nome}`}
-                        className="shrink-0 rounded p-1 text-slate-700 hover:bg-slate-100"
-                      >
-                        <Eye size={15} />
-                      </button>
-                      <button
-                        onClick={() => reprocessDocument(file.id)}
-                        title="Reprocessar arquivo"
-                        aria-label={`Reprocessar ${file.nome}`}
-                        className="shrink-0 rounded p-1 text-teal-700 hover:bg-teal-50"
-                      >
-                        <RefreshCw size={15} />
-                      </button>
-                      <button
-                        onClick={() => deleteDocument(file.id)}
-                        title="Excluir arquivo"
-                        aria-label={`Excluir ${file.nome}`}
-                        className="shrink-0 rounded p-1 text-red-600 hover:bg-red-50"
-                      >
-                        <Trash2 size={15} />
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <div className="rounded-lg border border-dashed border-slate-200 px-3 py-6 text-center text-sm text-slate-500">
-                  Nenhuma nota enviada.
-                </div>
-              )}
-            </section>
             <Table
               title="Notas fiscais extraídas"
               columns={[
@@ -3884,6 +3992,10 @@ function ConciliacaoFlow({
               rows={invoiceRows}
               onView={setViewer}
             />
+          </div>
+        )}
+        {reconciliationId && isNotesArea && activeTab === "Regras" && (
+          <div className="space-y-5">
             <IndependentRulesPanel
               reconciliationId={reconciliationId}
               source="nota"
@@ -3894,12 +4006,29 @@ function ConciliacaoFlow({
           </div>
         )}
         {reconciliationId && activeTab === "Extrato" && (
-          <Table
-            title="Lançamentos do extrato"
-            columns={["Data", "Hora", "Historico", "Valor", "Natureza"]}
-            rows={review.extratos}
-            onView={setViewer}
-          />
+          <div className="space-y-4">
+            {review.saldos?.saldo_anterior && (
+              <section className="flex w-full flex-wrap items-center justify-between gap-3 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3">
+                <div>
+                  <p className="text-xs font-semibold uppercase text-emerald-700">
+                    Saldo anterior
+                  </p>
+                  <strong className="text-lg text-emerald-950">
+                    {review.saldos.saldo_anterior}
+                  </strong>
+                </div>
+                <span className="text-sm font-medium text-emerald-800">
+                  Saldo Disponível Inicial
+                </span>
+              </section>
+            )}
+            <Table
+              title="Lançamentos do extrato"
+              columns={["Data", "Hora", "Historico", "Valor", "Natureza"]}
+              rows={review.extratos}
+              onView={setViewer}
+            />
+          </div>
         )}
         {reconciliationId && activeTab === "Comprovantes bancários" && (
           <Table

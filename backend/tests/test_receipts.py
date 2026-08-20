@@ -59,6 +59,24 @@ Vencimento Parcela                         Previsto      Realizado      Exigivel
     assert records[1].valor == Decimal("2755.86")
 
 
+def test_banco_do_brasil_loan_schedule_tolerates_ocr_amount_noise():
+    text = """Cronograma Reposicao Exigivel
+Operacao: 057.709.569
+Vencimento Parcela                         Previsto      Realizado      Exigivel
+15.07.2024 JUROS                             355,00        355,00         0,00
+15.07.2024 CAPITAL                         2.083, 33      2.083; 33      0,00
+15.08.2024 JUROS                             305,70        305,70         0,00
+15.08.2024 CAPITAL                         2.083,33      2:083,33       0,00
+"""
+    records = extract_loan_receipts(text, 1)
+
+    assert records[0].data == date(2024, 7, 15)
+    assert records[0].valor == Decimal("2438.33")
+    assert records[0].financeiros.valor_original == Decimal("2083.33")
+    assert records[0].financeiros.valor_juros == Decimal("355.00")
+    assert records[1].valor == Decimal("2389.03")
+
+
 def test_invoice_extracts_supplier_number_date_and_total():
     text = """NOTA FISCAL DE SERVIÇOS ELETRÔNICA
 NÚMERO DA NOTA: 12345

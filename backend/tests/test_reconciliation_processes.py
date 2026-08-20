@@ -1,10 +1,12 @@
 from datetime import date
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.api.routes import ContaBancariaClienteInput, RegraFonteInput, accounting_rules, apply_accounting_rules, banks, client_bank_accounts, create_reconciliation_process, create_source_accounting_rule, delete_client_bank_account, delete_reconciliation_process, list_reconciliation_processes, reconcile, reprocess_document, result, resume_process_bank, save_client_bank_account, source_accounting_csv, source_accounting_rules, unused_documents
+from app.api import routes
+from app.api.routes import ContaBancariaClienteInput, RegraFonteInput, accounting_integrity, accounting_rules, apply_accounting_rules, banks, client_bank_accounts, create_reconciliation_process, create_source_accounting_rule, delete_client_bank_account, delete_reconciliation_process, list_reconciliation_processes, reconcile, reprocess_document, result, resume_process_bank, review, save_client_bank_account, source_accounting_csv, source_accounting_rules, unused_documents
 from app.core.database import Base
 from app.models import Arquivo, Cliente, Comprovante, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, NotaFiscal, ProcessoConciliacao, RegraContabil, RegraContabilExcecao
 from app.services.normalization import normalize_name
@@ -28,6 +30,14 @@ def test_getnet_is_hidden_from_new_bank_list_but_legacy_processes_still_work():
 
     assert legacy["banco"] == "Comissões Getnet"
     assert legacy["processo_id"] == process["id"]
+
+
+def test_scanned_loan_pdf_without_tesseract_reports_ocr_requirement(monkeypatch, tmp_path):
+    monkeypatch.setattr(routes.shutil, "which", lambda command: None)
+    monkeypatch.setattr(routes, "local_tesseract_path", lambda: None)
+
+    with pytest.raises(ValueError, match="PDF escaneado sem texto pesquisável"):
+        routes.extract_scanned_pdf_pages(tmp_path / "emprestimo.pdf")
 
 
 def test_process_resumes_the_same_bank_without_cross_bank_rule_source():
@@ -77,6 +87,59 @@ def test_process_list_includes_compact_rule_progress_by_bank():
     progress = data[0]["bancos"][0]["progresso_regras"]
 
     assert progress == {"total": 2, "cobertos": 1, "percentual": 50}
+
+
+def test_basa_review_exposes_initial_available_balance_as_previous_balance():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.commit()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="BASA", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    file = Arquivo(
+        conciliacao_id=reconciliation.id,
+        tipo_documento="extrato",
+        banco_selecionado="BASA",
+        nome_original="01.24.pdf",
+        caminho="/tmp/01.24.pdf",
+        texto_bruto="Titular : CENTRO ODONTOLOGICO FIGUEIRO Saldo Disponível Inicial: 40.363,30",
+    )
+    session.add(file); session.commit()
+
+    data = review(reconciliation.id, session)
+    rules = accounting_rules(reconciliation.id, session)
+
+    assert routes.extract_basa_initial_balance(file.texto_bruto) == Decimal("40363.30")
+    assert data["saldos"] == {"saldo_anterior": "R$ 40.363,30"}
+    assert rules["resumo"]["extrato"]["saldo_anterior"] == "40363.30"
+
+
+def test_manual_complementary_entries_with_same_component_are_not_merged():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.commit()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Banco do Brasil", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    session.add(file); session.flush()
+    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data=date(2024, 1, 2), historico="AJUSTE", valor=Decimal("15.00"), natureza="Débito")
+    session.add(movement); session.flush()
+    match = Correspondencia(conciliacao_id=reconciliation.id, movimento_extrato_id=movement.id)
+    session.add(match); session.flush()
+    session.add_all([
+        LancamentoContabil(correspondencia_id=match.id, componente="OUTRO", origem="manual", valor=Decimal("10.00"), conta_debito="1", conta_credito="2", historico="Complementar A", status="editado_manual", ordem=1),
+        LancamentoContabil(correspondencia_id=match.id, componente="OUTRO", origem="manual", valor=Decimal("5.00"), conta_debito="1", conta_credito="2", historico="Complementar B", status="editado_manual", ordem=2),
+    ])
+    session.commit()
+
+    row = result(reconciliation.id, session)[0]
+    integrity = accounting_integrity(reconciliation, session)
+
+    assert [item["historico"] for item in row["lancamentos"]] == ["Complementar A", "Complementar B"]
+    assert len(integrity["lancamentos_validos"]) == 2
 
 
 def test_client_bank_account_crud_preserves_accounting_account():

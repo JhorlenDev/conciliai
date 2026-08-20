@@ -11,6 +11,7 @@ frontend/.next/
 frontend/node_modules/
 frontend/.turbo/
 frontend/.env.local
+.local/
  
 # Local scripts
 subir.sh

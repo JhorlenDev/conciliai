@@ -558,7 +558,20 @@ def _extract_banco_do_brasil_loan_schedule(text: str, page_number: int) -> list[
         fallback = re.search(r"\b\d{2,3}[.\s]\d{3}[.\s]\d{3}\b", text)
         contract = re.sub(r"\s+", "", fallback.group(0).strip(" .")) if fallback else ""
 
-    amount = r"\d{1,3}(?:\.\d{3})*,\d{2}"
+    amount = r"\d{1,3}(?:[.\s:;]\s*\d{3})*[,;:]\s*\d{2}"
+
+    def loan_amounts(value: str) -> list[Decimal]:
+        amounts: list[Decimal] = []
+        for raw in re.findall(amount, value):
+            normalized = re.sub(r"(?<=\d)[;:]\s*(?=\d{2}\b)", ",", raw)
+            normalized = re.sub(r"(?<=\d)[;:]\s*(?=\d{3})", ".", normalized)
+            normalized = re.sub(r"(?<=\d)\s+(?=\d{2}\b)", "", normalized)
+            normalized = re.sub(r"\s+", "", normalized)
+            parsed = parse_brl(normalized)
+            if parsed is not None:
+                amounts.append(parsed)
+        return amounts
+
     row_pattern = re.compile(
         rf"^\s*(?P<date>\d{{2}}[/.]\d{{2}}[/.]\d{{4}})\s+"
         rf"(?P<component>JUROS|CAPITAL|AMORTIZA[ÇC][AÃ]O|PRINCIPAL)\b"
@@ -571,8 +584,7 @@ def _extract_banco_do_brasil_loan_schedule(text: str, page_number: int) -> list[
         parsed_date, _ = parse_date_time(match.group("date"))
         if not parsed_date:
             continue
-        values = [parse_brl(value) for value in re.findall(amount, match.group("tail"))]
-        values = [value for value in values if value is not None]
+        values = loan_amounts(match.group("tail"))
         if not values:
             continue
         realized = values[1] if len(values) > 1 else values[0]

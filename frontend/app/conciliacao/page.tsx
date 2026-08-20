@@ -608,9 +608,21 @@ type CoverageModal = {
 type IndependentRuleRow = {
   id: string;
   data: string;
+  data_emissao?: string;
+  data_vencimento?: string;
+  data_pagamento?: string;
   texto: string;
   documento: string;
   forma_pagamento?: string;
+  tipo_pagamento?: string;
+  classificacao_antecipacao?: string;
+  motivo_antecipacao?: string;
+  gera_lancamento?: string;
+  destino_lancamento?: string;
+  modo_lancamento?: string;
+  linhas_csv?: string;
+  conta_antecipacao?: string;
+  motivo_nao_geracao?: string;
   valor: string;
   arquivo_id?: string;
   pagina?: number;
@@ -776,10 +788,10 @@ function IndependentRulesPanel({
       </div>
       {activeView === "pending" && (
         <div className="max-h-[calc(100dvh-360px)] overflow-auto rounded-lg border">
-          <table className={`w-full text-left text-xs ${isNoteSource ? "min-w-[1120px]" : "min-w-[980px]"}`}>
+          <table className={`w-full text-left text-xs ${isNoteSource ? "min-w-[1500px]" : "min-w-[980px]"}`}>
             <thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase text-slate-500">
               <tr>
-                {["Data", triggerLabel, ...(isNoteSource ? ["Forma pgto."] : []), "Valor original", "Gatilho", "Débito", "Crédito", "Histórico", "Complemento", "Ação"].map((column) => (
+                {["Data", triggerLabel, ...(isNoteSource ? ["Vencimento", "Pagamento", "Forma pgto.", "Classificação", "Gera CSV"] : []), "Valor original", "Gatilho", "Débito", "Crédito", "Histórico", "Complemento", "Ação"].map((column) => (
                   <th className="px-2 py-2" key={column}>{column}</th>
                 ))}
               </tr>
@@ -793,11 +805,30 @@ function IndependentRulesPanel({
                     <span className="text-slate-500">{row.documento}</span>
                   </td>
                   {isNoteSource && (
+                    <>
+                    <td className="px-2 py-2">{row.data_vencimento || "Não identificado"}</td>
+                    <td className="px-2 py-2">{row.data_pagamento || "Não identificado"}</td>
                     <td className="px-2 py-2">
                       <span className={`inline-flex rounded-full px-2 py-1 text-[11px] font-semibold ${row.forma_pagamento && row.forma_pagamento !== "—" ? "bg-amber-50 text-amber-800" : "bg-slate-100 text-slate-500"}`}>
-                        {row.forma_pagamento || "—"}
+                        {row.tipo_pagamento || row.forma_pagamento || "—"}
                       </span>
                     </td>
+                    <td className="px-2 py-2">
+                      <span title={row.motivo_antecipacao || ""} className={`inline-flex rounded-full px-2 py-1 text-[11px] font-semibold ${row.classificacao_antecipacao?.startsWith("ANTECIPACAO") ? "bg-violet-50 text-violet-800" : row.classificacao_antecipacao === "NORMAL" ? "bg-emerald-50 text-emerald-800" : "bg-amber-50 text-amber-800"}`}>
+                        {row.classificacao_antecipacao || "REVISAR"}
+                      </span>
+                    </td>
+                    <td className="px-2 py-2">
+                      <span title={row.motivo_nao_geracao || row.destino_lancamento || ""} className={`inline-flex rounded-full px-2 py-1 text-[11px] font-semibold ${row.gera_lancamento === "Antecipação + baixa" ? "bg-violet-50 text-violet-800" : row.gera_lancamento === "Sim" ? "bg-teal-50 text-teal-800" : "bg-slate-100 text-slate-600"}`}>
+                        {row.gera_lancamento || "—"}
+                      </span>
+                      {row.gera_lancamento === "Antecipação + baixa" && (
+                        <span className="mt-1 block text-[10px] font-medium text-violet-700">
+                          {row.linhas_csv || "2"} linhas no CSV
+                        </span>
+                      )}
+                    </td>
+                    </>
                   )}
                   <td className="px-2 py-2 font-semibold">{money(row.valor)}</td>
                   <td className="px-2 py-1"><input value={value(row.id, "gatilho", row.texto)} onChange={(event) => change(row.id, "gatilho", event.target.value)} className="w-36 rounded border px-2 py-1" /></td>
@@ -845,7 +876,7 @@ function IndependentRulesPanel({
                 </tr>
               ))}
               {!data.pendentes.length && (
-                <tr><td className="px-2 py-6 text-center text-slate-500" colSpan={isNoteSource ? 10 : 9}>Nenhum registro pendente nesta aba.</td></tr>
+                <tr><td className="px-2 py-6 text-center text-slate-500" colSpan={isNoteSource ? 14 : 9}>Nenhum registro pendente nesta aba.</td></tr>
               )}
             </tbody>
           </table>
@@ -876,16 +907,27 @@ function IndependentRulesPanel({
       )}
       {activeView === "classified" && (
         <div className="max-h-[calc(100dvh-360px)] overflow-auto rounded-lg border">
-          <table className={`w-full text-left text-xs ${isNoteSource ? "min-w-[960px]" : "min-w-[820px]"}`}>
+          <table className={`w-full text-left text-xs ${isNoteSource ? "min-w-[1280px]" : "min-w-[820px]"}`}>
             <thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase text-slate-500">
-              <tr>{["Data", triggerLabel, ...(isNoteSource ? ["Forma pgto."] : []), "Valor", "Débito", "Crédito", "Histórico", "Complemento", "Arquivo"].map((column) => <th className="px-3 py-2" key={column}>{column}</th>)}</tr>
+              <tr>{["Data", triggerLabel, ...(isNoteSource ? ["Forma pgto.", "Classificação", "Gera CSV"] : []), "Valor", "Débito", "Crédito", "Histórico", "Complemento", "Arquivo"].map((column) => <th className="px-3 py-2" key={column}>{column}</th>)}</tr>
             </thead>
             <tbody>
               {data.classificados.map((row) => (
                 <tr className="border-t" key={row.id}>
                   <td className="px-3 py-2">{row.data}</td>
                   <td className="px-3 py-2"><span className="block font-semibold text-slate-800">{row.texto}</span><span className="text-slate-500">{row.documento}</span></td>
-                  {isNoteSource && <td className="px-3 py-2">{row.forma_pagamento || "—"}</td>}
+                  {isNoteSource && <td className="px-3 py-2">{row.tipo_pagamento || row.forma_pagamento || "—"}</td>}
+                  {isNoteSource && <td className="px-3 py-2">{row.classificacao_antecipacao || "—"}</td>}
+                  {isNoteSource && (
+                    <td className="px-3 py-2">
+                      <span className={row.gera_lancamento === "Antecipação + baixa" ? "font-semibold text-violet-700" : ""}>
+                        {row.gera_lancamento || "—"}
+                      </span>
+                      {row.conta_antecipacao && row.conta_antecipacao !== "—" && (
+                        <span className="block text-[10px] text-slate-500">{row.conta_antecipacao}</span>
+                      )}
+                    </td>
+                  )}
                   <td className="px-3 py-2 font-semibold">{money(row.valor)}</td>
                   <td className="px-3 py-2">{row.conta_debito}</td>
                   <td className="px-3 py-2">{row.conta_credito}</td>
@@ -894,7 +936,7 @@ function IndependentRulesPanel({
                   <td className="px-3 py-2"><RowFileButton row={row} /></td>
                 </tr>
               ))}
-              {!data.classificados.length && <tr><td className="px-3 py-6 text-center text-slate-500" colSpan={isNoteSource ? 9 : 8}>Nenhum registro classificado.</td></tr>}
+              {!data.classificados.length && <tr><td className="px-3 py-6 text-center text-slate-500" colSpan={isNoteSource ? 11 : 8}>Nenhum registro classificado.</td></tr>}
             </tbody>
           </table>
         </div>
@@ -3981,11 +4023,21 @@ function ConciliacaoFlow({
               title="Notas fiscais extraídas"
               columns={[
                 "Data emissao",
+                "Data vencimento",
+                "Data pagamento",
                 "Fornecedor",
                 "Cpf cnpj",
                 "Numero nota",
                 "Forma pagamento",
-                "Data pagamento",
+                "Tipo pagamento",
+                "Classificacao",
+                "Motivo",
+                "Gera csv",
+                "Destino",
+                "Modo lancamento",
+                "Linhas csv",
+                "Conta antecipacao",
+                "Motivo nao geracao",
                 "Valor total",
                 "Situacao",
               ]}

@@ -44,6 +44,10 @@ RECEIPT_DOCUMENT_TYPES = {"comprovante", LOAN_DOCUMENT_TYPE, *MACHINE_STATEMENT_
 DOCUMENT_TYPES = {"extrato", *RECEIPT_DOCUMENT_TYPES, INVOICE_DOCUMENT_TYPE, "rfb"}
 logger = logging.getLogger(__name__)
 SCANNED_PDF_OCR_MESSAGE = "PDF escaneado sem texto pesquisável. Instale o OCR Tesseract (tesseract-ocr e tesseract-ocr-por) para extrair este documento."
+INVOICE_ANTICIPATION_ACCOUNT = "Antecipação de clientes"
+INVOICE_ANTICIPATION_HISTORY = "Antecipação de clientes"
+INVOICE_ANTICIPATION_CLEARING_HISTORY = "Baixa da antecipação de clientes"
+INVOICE_INTER_COMPETENCE_ANTICIPATIONS = {"ANTECIPACAO_EMISSAO_MES_SEGUINTE", "ANTECIPACAO_AMBAS_CONDICOES"}
 
 
 def extract_basa_initial_balance(text: str) -> Decimal | None:
@@ -68,6 +72,144 @@ def statement_initial_balance(reconciliation: Conciliacao, db: Session) -> Decim
     files = db.query(Arquivo).filter_by(conciliacao_id=reconciliation.id, tipo_documento="extrato", ativo=True).all()
     text = "\n".join(item.texto_bruto or "" for item in files)
     return extract_basa_initial_balance(text) or Decimal("0.00")
+
+
+def iso_date(value: object) -> date | None:
+    if isinstance(value, date):
+        return value
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def decimal_amount(value: object) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, Decimal):
+        return value
+    text = str(value).strip()
+    if re.fullmatch(r"-?\d+(?:\.\d{1,2})?", text):
+        return Decimal(text).quantize(Decimal("0.01"))
+    return parse_brl(text)
+
+
+def date_competence(value: date) -> tuple[int, int]:
+    return value.year, value.month
+
+
+def invoice_payment_type(value: str) -> str:
+    normalized = normalize_name(value)
+    if not normalized:
+        return "NAO_IDENTIFICADO"
+    if "PIX" in normalized or "INSTANTANEO" in normalized:
+        return "PIX"
+    if "DINHEIRO" in normalized or "ESPECIE" in normalized:
+        return "DINHEIRO"
+    if "BOLETO" in normalized:
+        return "BOLETO"
+    if "DEPOSITO" in normalized:
+        return "DEPOSITO"
+    if any(term in normalized for term in ("TRANSFERENCIA", "TED", "DOC")):
+        return "TRANSFERENCIA"
+    if "CARTAO" in normalized and "DEBITO" in normalized:
+        return "CARTAO_DEBITO"
+    if "CARTAO" in normalized and "CREDITO" in normalized:
+        return "CARTAO_CREDITO"
+    if normalized in {"DEBITO", "DEBITO A VISTA"}:
+        return "CARTAO_DEBITO"
+    if normalized in {"CREDITO", "CREDITO A VISTA", "CREDITO PARCELADO"}:
+        return "CARTAO_CREDITO"
+    return "OUTRO"
+
+
+def invoice_anticipation(emission: date | None, due: date | None, payment: date | None) -> tuple[str, str]:
+    if not payment:
+        return "REVISAR", "Data de pagamento não identificada."
+    by_due = bool(due and payment < due)
+    by_emission = bool(emission and payment < emission and date_competence(payment) < date_competence(emission))
+    if by_due and by_emission:
+        return "ANTECIPACAO_AMBAS_CONDICOES", "Pagamento antes do vencimento e em competência anterior à emissão."
+    if by_due:
+        return "ANTECIPACAO_VENCIMENTO", "Pagamento realizado antes do vencimento."
+    if by_emission:
+        return "ANTECIPACAO_EMISSAO_MES_SEGUINTE", "Pagamento realizado em competência anterior à emissão."
+    return "NORMAL", "Nenhuma condição de antecipação identificada."
+
+
+def invoice_generation_decision(payment_type: str) -> tuple[bool, str, str]:
+    if payment_type in {"CARTAO_DEBITO", "CARTAO_CREDITO"}:
+        return True, "CARTAO", "Venda em cartão deve ser lançada no fluxo de cartões."
+    if payment_type == "DINHEIRO":
+        return True, "CAIXA", "Venda em dinheiro deve ser lançada no caixa."
+    if payment_type == "PIX":
+        return False, "EXTRATO_BANCARIO", "Movimentação contabilizada pelo extrato bancário; lançamento da nota ignorado para evitar duplicidade."
+    if payment_type in {"DEPOSITO", "TRANSFERENCIA"}:
+        return False, "REVISAR_EXTRATO", "Depósito/transferência precisa ser conferido com o extrato antes de gerar lançamento."
+    if payment_type == "BOLETO":
+        return False, "REVISAR_BOLETO", "Boleto precisa ser conferido com o recebimento bancário antes de gerar lançamento."
+    return False, "REVISAR", "Forma de pagamento não identificada com segurança."
+
+
+def invoice_uses_anticipation_entries(classification: str, generates: bool) -> bool:
+    return generates and classification in INVOICE_INTER_COMPETENCE_ANTICIPATIONS
+
+
+def enrich_invoice_data(data: dict, emission: date | None, total: Decimal | None) -> dict:
+    enriched = dict(data or {})
+    payment_original = str(enriched.get("tipo_pagamento_original") or enriched.get("forma_pagamento") or "").strip()
+    payment_type = str(enriched.get("tipo_pagamento") or invoice_payment_type(payment_original))
+    due = iso_date(enriched.get("data_vencimento"))
+    payment = iso_date(enriched.get("data_pagamento"))
+    classification, reason = invoice_anticipation(emission, due, payment)
+    generates, destination, generation_reason = invoice_generation_decision(payment_type)
+
+    payment_amount = decimal_amount(enriched.get("valor_pagamento"))
+    split_payments = enriched.get("pagamentos")
+    if isinstance(split_payments, list) and len(split_payments) > 1:
+        split_total = sum((decimal_amount(item.get("valor")) or Decimal("0.00") for item in split_payments if isinstance(item, dict)), Decimal("0.00"))
+        enriched["pagamento_dividido"] = True
+        enriched["soma_pagamentos"] = str(split_total)
+        if total is not None and abs(split_total - total) > Decimal("0.01"):
+            classification = "REVISAR"
+            reason = "Soma das formas de pagamento diferente do valor total da nota."
+            generates = False
+            destination = "REVISAR"
+            generation_reason = "Pagamento dividido com diferença em relação ao total da nota."
+    elif payment_amount is not None and total is not None:
+        enriched["soma_pagamentos"] = str(payment_amount)
+        if abs(payment_amount - total) > Decimal("0.01"):
+            classification = "REVISAR"
+            reason = "Valor de pagamento diferente do valor total da nota."
+            generates = False
+            destination = "REVISAR"
+            generation_reason = "Valor identificado não fecha com o total da nota."
+
+    anticipation_entries = invoice_uses_anticipation_entries(classification, generates)
+    if anticipation_entries:
+        destination = "ANTECIPACAO_CLIENTES"
+        generation_reason = "Pagamento em competência anterior à emissão: gera entrada de antecipação e baixa na emissão."
+
+    enriched.update({
+        "data_emissao": emission.isoformat() if emission else "",
+        "data_vencimento": due.isoformat() if due else "",
+        "data_pagamento": payment.isoformat() if payment else "",
+        "tipo_pagamento": payment_type,
+        "tipo_pagamento_original": payment_original,
+        "forma_pagamento": payment_original or payment_type,
+        "classificacao_antecipacao": classification,
+        "motivo_antecipacao": reason,
+        "gera_lancamento": generates,
+        "destino_lancamento": destination,
+        "modo_lancamento": "ANTECIPACAO_CLIENTES" if anticipation_entries else destination,
+        "linhas_csv": 2 if anticipation_entries else (1 if generates else 0),
+        "conta_antecipacao": INVOICE_ANTICIPATION_ACCOUNT if anticipation_entries else "",
+        "motivo_nao_geracao": "" if generates else generation_reason,
+        "motivo_geracao": generation_reason if generates else "",
+    })
+    return enriched
 
 
 @router.get("/arquivos/{arquivo_id}/visualizar")
@@ -1230,6 +1372,68 @@ def source_rule_text(row) -> str:
     return " ".join(str(value or "") for value in [row.texto, row.documento, getattr(row, "forma_pagamento", ""), getattr(row, "servico", "")]).strip()
 
 
+def invoice_metadata(item: NotaFiscal) -> dict:
+    data = item.dados_originais if isinstance(item.dados_originais, dict) else {}
+    return enrich_invoice_data(data, item.data_emissao, item.valor_total)
+
+
+def invoice_display_date(item: NotaFiscal, data: dict) -> date | None:
+    return iso_date(data.get("data_pagamento")) or item.data_emissao
+
+
+def invoice_payment_value(item: NotaFiscal, data: dict) -> Decimal | None:
+    return decimal_amount(data.get("valor_pagamento")) or item.valor_total
+
+
+def invoice_generation_label(data: dict) -> str:
+    if not data.get("gera_lancamento"):
+        return "Não"
+    if data.get("modo_lancamento") == "ANTECIPACAO_CLIENTES":
+        return "Antecipação + baixa"
+    return "Sim"
+
+
+def source_note_csv_rows(row, rule: RegraContabil) -> list[list[str]]:
+    value = f"{Decimal(row.valor or 0):.2f}"
+    payment_type = getattr(row, "tipo_pagamento", "") or ""
+    complement = rule.complemento
+    if getattr(row, "modo_lancamento", "") == "ANTECIPACAO_CLIENTES":
+        payment_date = getattr(row, "data_pagamento", None) or getattr(row, "data", None)
+        emission_date = getattr(row, "data_emissao", None) or getattr(row, "data", None)
+        return [
+            [
+                payment_date.strftime("%d/%m/%Y") if payment_date else "",
+                accounting_code(rule.conta_debito),
+                accounting_code(INVOICE_ANTICIPATION_ACCOUNT),
+                accounting_code(INVOICE_ANTICIPATION_HISTORY),
+                value,
+                f"{complement} - antecipação" if complement else "Antecipação de cliente",
+                payment_type,
+                "ANTECIPACAO_CLIENTES",
+            ],
+            [
+                emission_date.strftime("%d/%m/%Y") if emission_date else "",
+                accounting_code(INVOICE_ANTICIPATION_ACCOUNT),
+                accounting_code(rule.conta_credito),
+                accounting_code(INVOICE_ANTICIPATION_CLEARING_HISTORY),
+                value,
+                f"{complement} - baixa da antecipação" if complement else "Baixa da antecipação de cliente",
+                payment_type,
+                "BAIXA_ANTECIPACAO",
+            ],
+        ]
+    return [[
+        row.data.strftime("%d/%m/%Y") if row.data else "",
+        accounting_code(rule.conta_debito),
+        accounting_code(rule.conta_credito),
+        accounting_code(rule.historico),
+        value,
+        complement,
+        payment_type,
+        getattr(row, "destino_lancamento", "") or "",
+    ]]
+
+
 def independent_source_rows(reconciliation: Conciliacao, source: str, db: Session) -> list[SimpleNamespace]:
     if source == "maquininha":
         files = {item.id: item for item in db.query(Arquivo).filter_by(conciliacao_id=reconciliation.id, ativo=True).all() if item.tipo_documento in MACHINE_STATEMENT_DOCUMENT_TYPES}
@@ -1250,22 +1454,36 @@ def independent_source_rows(reconciliation: Conciliacao, source: str, db: Sessio
         ]
     elif source == "nota":
         records = db.query(NotaFiscal).filter_by(conciliacao_id=reconciliation.id, ativo=True).all()
-        rows = [
-            SimpleNamespace(
+        rows = []
+        for item in records:
+            data = invoice_metadata(item)
+            row_date = invoice_display_date(item, data)
+            if not item.valor_total or (row_date and not (reconciliation.data_inicio <= row_date <= reconciliation.data_fim)):
+                continue
+            rows.append(SimpleNamespace(
                 id=item.id,
-                data=item.data_emissao,
+                data=row_date,
+                data_emissao=item.data_emissao,
+                data_vencimento=iso_date(data.get("data_vencimento")),
+                data_pagamento=iso_date(data.get("data_pagamento")),
                 texto=item.fornecedor,
                 documento=item.numero_nota,
-                valor=item.valor_total,
+                valor=invoice_payment_value(item, data),
                 arquivo_id=item.arquivo_id,
                 pagina=item.pagina_numero,
-                forma_pagamento=(item.dados_originais or {}).get("forma_pagamento", "") if isinstance(item.dados_originais, dict) else "",
-                servico=(item.dados_originais or {}).get("servico", "") if isinstance(item.dados_originais, dict) else "",
+                forma_pagamento=data.get("forma_pagamento", ""),
+                tipo_pagamento=data.get("tipo_pagamento", ""),
+                classificacao_antecipacao=data.get("classificacao_antecipacao", "REVISAR"),
+                motivo_antecipacao=data.get("motivo_antecipacao", ""),
+                gera_lancamento=bool(data.get("gera_lancamento")),
+                destino_lancamento=data.get("destino_lancamento", ""),
+                modo_lancamento=data.get("modo_lancamento", ""),
+                linhas_csv=int(data.get("linhas_csv") or 0),
+                conta_antecipacao=data.get("conta_antecipacao", ""),
+                motivo_nao_geracao=data.get("motivo_nao_geracao", ""),
+                servico=data.get("servico", ""),
                 fonte="nota",
-            )
-            for item in records
-            if item.valor_total and (not item.data_emissao or reconciliation.data_inicio <= item.data_emissao <= reconciliation.data_fim)
-        ]
+            ))
     else:
         raise HTTPException(404, "Fonte de regras não encontrada")
     return sorted(rows, key=lambda item: (item.data or date.max, item.texto or "", item.id))
@@ -1303,9 +1521,21 @@ def source_rule_match_payload(row, rule: RegraContabil | None = None) -> dict:
     return {
         "id": row.id,
         "data": row.data.strftime("%d/%m/%Y") if row.data else "—",
+        "data_emissao": row.data_emissao.strftime("%d/%m/%Y") if getattr(row, "data_emissao", None) else "—",
+        "data_vencimento": row.data_vencimento.strftime("%d/%m/%Y") if getattr(row, "data_vencimento", None) else "Não identificado",
+        "data_pagamento": row.data_pagamento.strftime("%d/%m/%Y") if getattr(row, "data_pagamento", None) else "Não identificado",
         "texto": row.texto or "—",
         "documento": row.documento or "—",
         "forma_pagamento": getattr(row, "forma_pagamento", "") or "—",
+        "tipo_pagamento": getattr(row, "tipo_pagamento", "") or "NAO_IDENTIFICADO",
+        "classificacao_antecipacao": getattr(row, "classificacao_antecipacao", "") or "REVISAR",
+        "motivo_antecipacao": getattr(row, "motivo_antecipacao", "") or "",
+        "gera_lancamento": "Antecipação + baixa" if getattr(row, "modo_lancamento", "") == "ANTECIPACAO_CLIENTES" else ("Sim" if getattr(row, "gera_lancamento", True) else "Não"),
+        "destino_lancamento": getattr(row, "destino_lancamento", "") or "—",
+        "modo_lancamento": getattr(row, "modo_lancamento", "") or "—",
+        "linhas_csv": str(getattr(row, "linhas_csv", "") or ""),
+        "conta_antecipacao": getattr(row, "conta_antecipacao", "") or "—",
+        "motivo_nao_geracao": getattr(row, "motivo_nao_geracao", "") or "",
         "valor": str(row.valor or 0),
         "arquivo_id": row.arquivo_id,
         "pagina": row.pagina,
@@ -1401,10 +1631,15 @@ def source_accounting_csv(conciliacao_id: str, fonte: str, db: Session = Depends
     rules = source_rules_for(reconciliation, fonte, db)
     output = io.StringIO(newline="")
     writer = csv.writer(output, delimiter=";", lineterminator="\n")
-    writer.writerow(["Data", "Debito", "Credito", "Historico", "Valor", "Complemento"])
+    writer.writerow(["Data", "Debito", "Credito", "Historico", "Valor", "Complemento", "Forma pagamento", "Destino"])
     for row in rows:
+        if fonte == "nota" and not getattr(row, "gera_lancamento", True):
+            continue
         rule = next((item for item in rules if source_rule_matches(item, row)), None)
         if not rule:
+            continue
+        if fonte == "nota":
+            writer.writerows(source_note_csv_rows(row, rule))
             continue
         writer.writerow([
             row.data.strftime("%d/%m/%Y") if row.data else "",
@@ -1413,6 +1648,8 @@ def source_accounting_csv(conciliacao_id: str, fonte: str, db: Session = Depends
             accounting_code(rule.historico),
             f"{Decimal(row.valor or 0):.2f}",
             rule.complemento,
+            "",
+            "",
         ])
     period = reconciliation.data_inicio.strftime("%m%y")
     filename = f"{period}_{fonte}.csv"
@@ -2055,7 +2292,8 @@ def upload(conciliacao_id: str, tipo_documento: str, file: UploadFile = File(...
                     db.add(ComprovanteRfbItem(comprovante_rfb_id=receipt.id, codigo=tax.codigo, descricao=tax.descricao, valor_principal=tax.valor_principal, valor_multa=tax.valor_multa, valor_juros=tax.valor_juros, valor_total=tax.valor_total))
                 continue
             if tipo_documento == INVOICE_DOCUMENT_TYPE:
-                db.add(NotaFiscal(conciliacao_id=conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, texto_original=item.texto_original, dados_originais={"tipo_documento": tipo_documento, **item.dados}, dados_normalizados={"nome": normalize_name(item.fornecedor)}, data_emissao=item.data_emissao, fornecedor=item.fornecedor, cpf_cnpj=item.cpf_cnpj, numero_nota=item.numero_nota, valor_total=item.valor_total))
+                invoice_data = enrich_invoice_data({"tipo_documento": tipo_documento, **item.dados}, item.data_emissao, item.valor_total)
+                db.add(NotaFiscal(conciliacao_id=conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, texto_original=item.texto_original, dados_originais=invoice_data, dados_normalizados={"nome": normalize_name(item.fornecedor)}, data_emissao=item.data_emissao, fornecedor=item.fornecedor, cpf_cnpj=item.cpf_cnpj, numero_nota=item.numero_nota, valor_total=item.valor_total))
                 continue
             original_data = {"origem_nome": item.origem_nome, "tipo_documento": tipo_documento} if tipo_documento in RECEIPT_DOCUMENT_TYPES else {}
             if tipo_documento == "extrato":
@@ -2173,7 +2411,8 @@ def reprocess_document(arquivo_id: str, db: Session = Depends(get_db)):
                 db.add(ComprovanteRfbItem(comprovante_rfb_id=receipt.id, codigo=tax.codigo, descricao=tax.descricao, valor_principal=tax.valor_principal, valor_multa=tax.valor_multa, valor_juros=tax.valor_juros, valor_total=tax.valor_total))
             continue
         if record.tipo_documento == INVOICE_DOCUMENT_TYPE:
-            db.add(NotaFiscal(conciliacao_id=record.conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, texto_original=item.texto_original, dados_originais={"tipo_documento": record.tipo_documento, **item.dados}, dados_normalizados={"nome": normalize_name(item.fornecedor)}, data_emissao=item.data_emissao, fornecedor=item.fornecedor, cpf_cnpj=item.cpf_cnpj, numero_nota=item.numero_nota, valor_total=item.valor_total))
+            invoice_data = enrich_invoice_data({"tipo_documento": record.tipo_documento, **item.dados}, item.data_emissao, item.valor_total)
+            db.add(NotaFiscal(conciliacao_id=record.conciliacao_id, arquivo_id=record.id, pagina_numero=item.pagina_numero, texto_original=item.texto_original, dados_originais=invoice_data, dados_normalizados={"nome": normalize_name(item.fornecedor)}, data_emissao=item.data_emissao, fornecedor=item.fornecedor, cpf_cnpj=item.cpf_cnpj, numero_nota=item.numero_nota, valor_total=item.valor_total))
             continue
         original_data = {"origem_nome": item.origem_nome, "tipo_documento": record.tipo_documento} if record.tipo_documento in RECEIPT_DOCUMENT_TYPES else {}
         if record.tipo_documento == "extrato":
@@ -2500,7 +2739,26 @@ def review(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPI
         "comprovantes": [item for item in receipt_payloads if receipt_type_by_id.get(item["id"]) == "comprovante"],
         "maquininhas": [item for item in receipt_payloads if receipt_type_by_id.get(item["id"]) in MACHINE_STATEMENT_DOCUMENT_TYPES],
         "emprestimos": [item for item in receipt_payloads if receipt_type_by_id.get(item["id"]) == LOAN_DOCUMENT_TYPE],
-        "notas": [base(x, {"data_emissao": display_date(x.data_emissao), "fornecedor": x.fornecedor or "—", "cpf_cnpj": x.cpf_cnpj or "—", "numero_nota": x.numero_nota or "—", "forma_pagamento": (x.dados_originais or {}).get("forma_pagamento", "—") if isinstance(x.dados_originais, dict) else "—", "data_pagamento": display_metadata_date((x.dados_originais or {}).get("data_pagamento", "")) if isinstance(x.dados_originais, dict) else "—", "valor_total": money(x.valor_total), "situacao": x.status_revisao}) for x in invoice_records],
+        "notas": [base(x, {
+            "data_emissao": display_date(x.data_emissao),
+            "data_vencimento": display_metadata_date(invoice_metadata(x).get("data_vencimento", "")),
+            "data_pagamento": display_metadata_date(invoice_metadata(x).get("data_pagamento", "")),
+            "fornecedor": x.fornecedor or "—",
+            "cpf_cnpj": x.cpf_cnpj or "—",
+            "numero_nota": x.numero_nota or "—",
+            "forma_pagamento": invoice_metadata(x).get("forma_pagamento", "—"),
+            "tipo_pagamento": invoice_metadata(x).get("tipo_pagamento", "NAO_IDENTIFICADO"),
+            "classificacao": invoice_metadata(x).get("classificacao_antecipacao", "REVISAR"),
+            "motivo": invoice_metadata(x).get("motivo_antecipacao", ""),
+            "gera_csv": invoice_generation_label(invoice_metadata(x)),
+            "destino": invoice_metadata(x).get("destino_lancamento", "—"),
+            "modo_lancamento": invoice_metadata(x).get("modo_lancamento", "—"),
+            "linhas_csv": str(invoice_metadata(x).get("linhas_csv", "")),
+            "conta_antecipacao": invoice_metadata(x).get("conta_antecipacao", "—"),
+            "motivo_nao_geracao": invoice_metadata(x).get("motivo_nao_geracao", ""),
+            "valor_total": money(x.valor_total),
+            "situacao": x.status_revisao,
+        }) for x in invoice_records],
         "rfb": [base(x, {"tipo": x.tipo, "competencia_apuracao": x.competencia or x.periodo_apuracao or "—", "data_arrecadacao": display_date(x.data_arrecadacao), "documento": x.numero_documento, "banco": x.nome_banco, "principal": money(x.valor_principal), "multa_juros": "Sem acréscimos" if not ((x.valor_multa or 0) + (x.valor_juros or 0)) else f"Multa: {money(x.valor_multa)} + Juros: {money(x.valor_juros)}", "total": money(x.valor_total), "situacao": x.status}) for x in rfb_records],
         "arquivos": [{"id": x.id, "nome": x.nome_original, "tipo": x.tipo_documento, "status": x.status_processamento, "erro": x.mensagem_erro} for x in files.values()],
         "ajustes_getnet": getnet_adjustments,

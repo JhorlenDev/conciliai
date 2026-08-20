@@ -742,8 +742,11 @@ def _extract_tefe_nfse_invoice(text: str, page_number: int) -> ParsedInvoice | N
     )
     if payment_match:
         payment_date, _ = parse_date_time(payment_match.group(2))
+        payment_type_original = " ".join(payment_match.group(1).split())
         payment = {
-            "forma_pagamento": " ".join(payment_match.group(1).split()),
+            "forma_pagamento": payment_type_original,
+            "tipo_pagamento_original": payment_type_original,
+            "data_vencimento": payment_date.isoformat() if payment_date else "",
             "data_pagamento": payment_date.isoformat() if payment_date else "",
             "valor_pagamento": str(parse_brl(payment_match.group(3)) or ""),
             "documento_pagamento": payment_match.group(4) or "",
@@ -838,6 +841,9 @@ def extract_invoices(text: str, page_number: int) -> list[ParsedInvoice]:
             if value
         )
     )
+    due_date, _ = parse_date_time(label_text("DATA DE VENCIMENTO", "VENCIMENTO", "VENC:"))
+    payment_date, _ = parse_date_time(label_text("DATA DE PAGAMENTO", "DATA DO PAGAMENTO", "PAGAMENTO EM", "PAGO EM"))
+    payment_original = label_text("FORMA DE PAGAMENTO", "MEIO DE PAGAMENTO", "TIPO DE PAGAMENTO", "PAGAMENTO")
     total = label_amount(
         "VALOR TOTAL DA NOTA",
         "VALOR TOTAL",
@@ -848,7 +854,13 @@ def extract_invoices(text: str, page_number: int) -> list[ParsedInvoice]:
     )
     if not supplier and not number and total is None:
         return []
-    return [ParsedInvoice(parsed_date, supplier, cpf_cnpj, number, total, text, page_number)]
+    data = {
+        "data_vencimento": due_date.isoformat() if due_date else "",
+        "data_pagamento": payment_date.isoformat() if payment_date else "",
+        "forma_pagamento": payment_original,
+        "tipo_pagamento_original": payment_original,
+    }
+    return [ParsedInvoice(parsed_date, supplier, cpf_cnpj, number, total, text, page_number, data)]
 
 
 def split_banco_do_brasil_receipt_blocks(text: str) -> list[str]:

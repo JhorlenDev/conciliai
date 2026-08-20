@@ -631,7 +631,7 @@ def test_invoice_rules_are_independent_and_export_own_csv():
     session.add(reconciliation); session.flush()
     file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="nota", banco_selecionado="Notas", nome_original="nota.pdf", caminho="/tmp/nota.pdf")
     session.add(file); session.flush()
-    invoice = NotaFiscal(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data_emissao=date(2024, 1, 10), fornecedor="CLINICA EXEMPLO LTDA", cpf_cnpj="12.345.678/0001-90", numero_nota="12345", valor_total=Decimal("1250.75"))
+    invoice = NotaFiscal(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data_emissao=date(2024, 1, 10), fornecedor="CLINICA EXEMPLO LTDA", cpf_cnpj="12.345.678/0001-90", numero_nota="12345", valor_total=Decimal("1250.75"), dados_originais=routes.enrich_invoice_data({"forma_pagamento": "Dinheiro", "data_pagamento": "2024-01-10"}, date(2024, 1, 10), Decimal("1250.75")))
     session.add(invoice); session.commit()
 
     initial = source_accounting_rules(reconciliation.id, "nota", session)
@@ -641,4 +641,106 @@ def test_invoice_rules_are_independent_and_export_own_csv():
 
     assert created["regras"]["resumo"] == {"total": 1, "classificados": 1, "pendentes": 0}
     csv = source_accounting_csv(reconciliation.id, "nota", session).body.decode("utf-8-sig")
-    assert "401;221;Serviços tomados;1250.75;Conforme nota fiscal" in csv
+    assert "401;221;Serviços tomados;1250.75;Conforme nota fiscal;DINHEIRO;CAIXA" in csv
+
+
+@pytest.mark.parametrize(
+    ("emission", "due", "payment", "expected"),
+    [
+        (date(2024, 1, 10), date(2024, 1, 10), date(2024, 1, 10), "NORMAL"),
+        (date(2024, 1, 10), date(2024, 1, 10), date(2024, 1, 8), "ANTECIPACAO_VENCIMENTO"),
+        (date(2024, 1, 10), date(2024, 1, 10), date(2024, 1, 12), "NORMAL"),
+        (date(2024, 1, 31), None, date(2024, 1, 30), "NORMAL"),
+        (date(2024, 2, 1), None, date(2024, 1, 31), "ANTECIPACAO_EMISSAO_MES_SEGUINTE"),
+        (date(2027, 1, 2), None, date(2026, 12, 31), "ANTECIPACAO_EMISSAO_MES_SEGUINTE"),
+        (date(2024, 2, 1), date(2024, 2, 5), date(2024, 1, 31), "ANTECIPACAO_AMBAS_CONDICOES"),
+        (None, date(2024, 1, 5), date(2024, 1, 3), "ANTECIPACAO_VENCIMENTO"),
+        (date(2024, 1, 5), date(2024, 1, 10), None, "REVISAR"),
+    ],
+)
+def test_invoice_anticipation_classification_matrix(emission, due, payment, expected):
+    classification, _ = routes.invoice_anticipation(emission, due, payment)
+    assert classification == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "kind", "generates", "destination"),
+    [
+        ("Cartão Débito", "CARTAO_DEBITO", True, "CARTAO"),
+        ("Cartao de Credito", "CARTAO_CREDITO", True, "CARTAO"),
+        ("Dinheiro", "DINHEIRO", True, "CAIXA"),
+        ("PIX", "PIX", False, "EXTRATO_BANCARIO"),
+        ("Deposito bancário", "DEPOSITO", False, "REVISAR_EXTRATO"),
+        ("TED", "TRANSFERENCIA", False, "REVISAR_EXTRATO"),
+        ("Boleto", "BOLETO", False, "REVISAR_BOLETO"),
+        ("", "NAO_IDENTIFICADO", False, "REVISAR"),
+    ],
+)
+def test_invoice_payment_type_and_generation_decision(raw, kind, generates, destination):
+    payment_type = routes.invoice_payment_type(raw)
+    decision = routes.invoice_generation_decision(payment_type)
+
+    assert payment_type == kind
+    assert decision[:2] == (generates, destination)
+
+
+def test_invoice_csv_generates_card_and_skips_pix_to_avoid_duplicate_statement_entry():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Notas", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="nota", banco_selecionado="Notas", nome_original="nota.pdf", caminho="/tmp/nota.pdf")
+    session.add(file); session.flush()
+    session.add_all([
+        NotaFiscal(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=1, data_emissao=date(2024, 1, 31), fornecedor="CLIENTE CARTAO", cpf_cnpj="", numero_nota="1", valor_total=Decimal("300.00"), dados_originais=routes.enrich_invoice_data({"forma_pagamento": "Cartão Crédito", "data_vencimento": "2024-02-05", "data_pagamento": "2024-01-31", "valor_pagamento": "300.00"}, date(2024, 1, 31), Decimal("300.00"))),
+        NotaFiscal(conciliacao_id=reconciliation.id, arquivo_id=file.id, pagina_numero=2, data_emissao=date(2024, 1, 31), fornecedor="CLIENTE PIX", cpf_cnpj="", numero_nota="2", valor_total=Decimal("700.00"), dados_originais=routes.enrich_invoice_data({"forma_pagamento": "PIX", "data_vencimento": "2024-02-05", "data_pagamento": "2024-01-31", "valor_pagamento": "700.00"}, date(2024, 1, 31), Decimal("700.00"))),
+    ])
+    session.commit()
+
+    create_source_accounting_rule(reconciliation.id, "nota", RegraFonteInput(gatilho="cliente", conta_debito="112 - Cartões", conta_credito="311 - Receita", historico="Venda nota", complemento="Conforme nota"), session)
+    data = source_accounting_rules(reconciliation.id, "nota", session)
+    csv = source_accounting_csv(reconciliation.id, "nota", session).body.decode("utf-8-sig")
+
+    assert data["resumo"] == {"total": 2, "classificados": 2, "pendentes": 0}
+    assert "CLIENTE PIX" not in csv
+    assert "112;311;Venda nota;300.00;Conforme nota;CARTAO_CREDITO;CARTAO" in csv
+
+
+def test_invoice_csv_opens_and_clears_customer_anticipation_between_competences():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Notas", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="nota", banco_selecionado="Notas", nome_original="nota.pdf", caminho="/tmp/nota.pdf")
+    session.add(file); session.flush()
+    session.add(NotaFiscal(
+        conciliacao_id=reconciliation.id,
+        arquivo_id=file.id,
+        pagina_numero=1,
+        data_emissao=date(2024, 2, 1),
+        fornecedor="CLIENTE ANTECIPADO",
+        cpf_cnpj="",
+        numero_nota="55",
+        valor_total=Decimal("450.00"),
+        dados_originais=routes.enrich_invoice_data(
+            {"forma_pagamento": "Cartão Crédito", "data_vencimento": "2024-02-10", "data_pagamento": "2024-01-31", "valor_pagamento": "450.00"},
+            date(2024, 2, 1),
+            Decimal("450.00"),
+        ),
+    ))
+    session.commit()
+
+    create_source_accounting_rule(reconciliation.id, "nota", RegraFonteInput(gatilho="cliente antecipado", conta_debito="112 - Cartões", conta_credito="311 - Receita", historico="Venda nota", complemento="NF 55"), session)
+    data = source_accounting_rules(reconciliation.id, "nota", session)
+    csv = source_accounting_csv(reconciliation.id, "nota", session).body.decode("utf-8-sig")
+
+    assert data["classificados"][0]["gera_lancamento"] == "Antecipação + baixa"
+    assert data["classificados"][0]["linhas_csv"] == "2"
+    assert "31/01/2024;112;Antecipação de clientes;Antecipação de clientes;450.00;NF 55 - antecipação;CARTAO_CREDITO;ANTECIPACAO_CLIENTES" in csv
+    assert "01/02/2024;Antecipação de clientes;311;Baixa da antecipação de clientes;450.00;NF 55 - baixa da antecipação;CARTAO_CREDITO;BAIXA_ANTECIPACAO" in csv

@@ -615,14 +615,20 @@ type IndependentRuleRow = {
   documento: string;
   forma_pagamento?: string;
   tipo_pagamento?: string;
+  tipo_pagamento_label?: string;
   classificacao_antecipacao?: string;
+  classificacao_antecipacao_label?: string;
   motivo_antecipacao?: string;
   gera_lancamento?: string;
   destino_lancamento?: string;
+  destino_lancamento_label?: string;
   modo_lancamento?: string;
+  modo_lancamento_label?: string;
   linhas_csv?: string;
   conta_antecipacao?: string;
   motivo_nao_geracao?: string;
+  tipo_lancamento?: string;
+  tipo_lancamento_label?: string;
   valor: string;
   arquivo_id?: string;
   pagina?: number;
@@ -639,6 +645,8 @@ type IndependentRule = {
   conta_credito: string;
   historico: string;
   complemento: string;
+  tipo_componente?: string;
+  tipo_componente_label?: string;
   cobertos: number;
 };
 type IndependentRulesData = {
@@ -684,7 +692,11 @@ function IndependentRulesPanel({
       });
   }, [reconciliationId, source]);
   const value = (id: string, field: string, fallback = "") => drafts[id]?.[field] ?? fallback;
-  const defaultComplement = (row: IndependentRuleRow) => source === "maquininha" ? "Conforme extrato de maquininha" : row.documento && row.documento !== "—" ? row.documento : "Conforme nota fiscal";
+  const defaultComplement = (row: IndependentRuleRow) => {
+    if (source === "maquininha") return "Conforme extrato de maquininha";
+    const document = row.documento && row.documento !== "—" ? row.documento : "Conforme nota fiscal";
+    return row.tipo_lancamento_label && row.tipo_lancamento_label !== "Principal" ? `${document} - ${row.tipo_lancamento_label}` : document;
+  };
   const change = (id: string, field: string, input: string) => setDrafts((current) => ({ ...current, [id]: { ...current[id], [field]: input } }));
   async function save(row: IndependentRuleRow) {
     const body = {
@@ -694,6 +706,7 @@ function IndependentRulesPanel({
       historico: value(row.id, "historico"),
       complemento: value(row.id, "complemento", defaultComplement(row)),
       escopo: "global",
+      tipo_componente: row.tipo_lancamento || "PRINCIPAL",
     };
     if (!body.gatilho.trim() || !body.conta_debito.trim() || !body.conta_credito.trim() || !body.historico.trim()) {
       setMessage("Preencha gatilho, débito, crédito e histórico.");
@@ -749,6 +762,126 @@ function IndependentRulesPanel({
         <Eye size={15} />
       </button>
     ) : null;
+  const isSplitNoteRule = (row: IndependentRuleRow) => isNoteSource && ["ANTECIPACAO_CLIENTES", "BAIXA_ANTECIPACAO"].includes(row.tipo_lancamento || "");
+  const noteComponentLabel = (row: IndependentRuleRow) =>
+    row.tipo_lancamento === "BAIXA_ANTECIPACAO" ? "Baixa Ant." : row.tipo_lancamento_label || "Principal";
+  const pendingSourceGroups = data.pendentes.reduce<IndependentRuleRow[][]>((groups, row) => {
+    if (!isSplitNoteRule(row)) {
+      groups.push([row]);
+      return groups;
+    }
+    const groupKey = row.id.split(":")[0];
+    const group = groups.find((items) => items.some((item) => item.id.split(":")[0] === groupKey));
+    if (group) group.push(row);
+    else groups.push([row]);
+    return groups;
+  }, []).map((group) => [...group].sort((left, right) => {
+    const order = { ANTECIPACAO_CLIENTES: 1, BAIXA_ANTECIPACAO: 2 } as Record<string, number>;
+    return (order[left.tipo_lancamento || ""] || 9) - (order[right.tipo_lancamento || ""] || 9);
+  }));
+  const renderPendingSourceRow = (row: IndependentRuleRow, grouped = false) => {
+    const splitNoteRule = isSplitNoteRule(row);
+    return (
+      <tr className={`border-t align-top ${grouped ? "border-x-2 border-sky-200" : ""} ${row.tipo_lancamento === "ANTECIPACAO_CLIENTES" ? "bg-violet-50/30" : row.tipo_lancamento === "BAIXA_ANTECIPACAO" ? "bg-indigo-50/30" : ""}`} key={row.id}>
+        <td className="break-words px-2 py-1.5">{grouped ? "—" : row.data}</td>
+        <td className="break-words px-2 py-1.5">
+          {grouped ? (
+            <span className="font-semibold text-slate-800">{noteComponentLabel(row)}</span>
+          ) : (
+            <>
+              <span className="line-clamp-2 font-medium text-slate-800" title={row.texto}>{row.texto}</span>
+              <span className="text-slate-500">{row.documento}</span>
+            </>
+          )}
+        </td>
+        {isNoteSource && (
+          <td className="break-words px-2 py-1.5">
+            <span className={`inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold ${row.tipo_lancamento === "BAIXA_ANTECIPACAO" ? "bg-indigo-50 text-indigo-800" : row.tipo_lancamento === "ANTECIPACAO_CLIENTES" ? "bg-violet-50 text-violet-800" : "bg-slate-100 text-slate-600"}`}>
+              {noteComponentLabel(row)}
+            </span>
+          </td>
+        )}
+        {isNoteSource && (
+          <td className="break-words px-2 py-1.5">
+            {grouped ? (
+              <span className="text-[10px] text-slate-500">{row.data}</span>
+            ) : (
+              <div className="flex flex-col items-start gap-1">
+                <span className={`inline-flex max-w-full rounded-full px-2 py-1 text-[10px] font-semibold ${row.forma_pagamento && row.forma_pagamento !== "—" ? "bg-amber-50 text-amber-800" : "bg-slate-100 text-slate-500"}`}>
+                  {row.tipo_pagamento_label || row.forma_pagamento || "—"}
+                </span>
+                <span className="block text-[10px] text-slate-500">
+                  Emissão {row.data_emissao || row.data || "—"} · Pgto. {row.data_pagamento || "—"}
+                </span>
+                <span title={row.motivo_antecipacao || ""} className={`inline-flex max-w-full rounded-full px-2 py-1 text-[10px] font-semibold ${row.classificacao_antecipacao?.startsWith("ANTECIPACAO") ? "bg-violet-50 text-violet-800" : row.classificacao_antecipacao === "NORMAL" ? "bg-emerald-50 text-emerald-800" : "bg-amber-50 text-amber-800"}`}>
+                  {row.classificacao_antecipacao_label || "Revisar"}
+                </span>
+                <span title={row.motivo_nao_geracao || row.destino_lancamento_label || row.destino_lancamento || ""} className={`inline-flex max-w-full rounded-full px-2 py-1 text-[10px] font-semibold ${row.gera_lancamento === "Antecipação + baixa" ? "bg-violet-50 text-violet-800" : row.gera_lancamento === "Sim" ? "bg-teal-50 text-teal-800" : row.gera_lancamento === "Via extrato" ? "bg-sky-50 text-sky-800" : row.gera_lancamento === "Aguardando forma" || row.gera_lancamento === "Conferir" ? "bg-amber-50 text-amber-800" : "bg-slate-100 text-slate-600"}`}>
+                  {row.gera_lancamento || "—"}
+                </span>
+              </div>
+            )}
+          </td>
+        )}
+        <td className="break-words px-2 py-1.5 font-semibold">{money(row.valor)}</td>
+        <td className="px-2 py-1">
+          <input value={value(row.id, "gatilho", row.texto)} onChange={(event) => change(row.id, "gatilho", event.target.value)} className="w-full min-w-0 rounded border px-2 py-1" />
+        </td>
+        <td className="px-2 py-1">
+          <input
+            list="catalogo-contas"
+            value={value(row.id, "debito")}
+            onChange={(event) => {
+              change(row.id, "debito", event.target.value);
+              showInputStart(event.currentTarget);
+            }}
+            onBlur={(event) => showInputStart(event.currentTarget)}
+            className="w-full min-w-0 rounded border px-2 py-1 pr-5 text-left"
+            placeholder="Selecionar"
+          />
+        </td>
+        <td className="px-2 py-1">
+          <input
+            list="catalogo-contas"
+            value={value(row.id, "credito")}
+            onChange={(event) => {
+              change(row.id, "credito", event.target.value);
+              showInputStart(event.currentTarget);
+            }}
+            onBlur={(event) => showInputStart(event.currentTarget)}
+            className="w-full min-w-0 rounded border px-2 py-1 pr-5 text-left"
+            placeholder="Selecionar"
+          />
+        </td>
+        <td className="px-2 py-1">
+          <input
+            list="catalogo-historicos"
+            value={value(row.id, "historico")}
+            onChange={(event) => {
+              change(row.id, "historico", event.target.value);
+              showInputStart(event.currentTarget);
+            }}
+            onBlur={(event) => showInputStart(event.currentTarget)}
+            className="w-full min-w-0 rounded border px-2 py-1 pr-5 text-left"
+            placeholder="Selecionar"
+          />
+        </td>
+        <td className="px-2 py-1"><input value={value(row.id, "complemento", defaultComplement(row))} onChange={(event) => change(row.id, "complemento", event.target.value)} className="w-full min-w-0 rounded border px-2 py-1" /></td>
+        <td className="px-2 py-1">
+          <button
+            disabled={busy === row.id}
+            onClick={() => save(row)}
+            title="Salvar regra"
+            aria-label="Salvar regra"
+            className="mb-1 inline-flex h-7 w-7 items-center justify-center rounded bg-teal-700 text-white hover:bg-teal-800 disabled:opacity-60"
+          >
+            {busy === row.id ? <RefreshCw className="animate-spin" size={14} /> : <CheckCircle2 size={14} />}
+          </button>
+          <RowFileButton row={row} />
+        </td>
+      </tr>
+    );
+  };
   return (
     <section className="rounded-xl border border-slate-200 bg-white p-5">
       <datalist id="catalogo-contas">
@@ -787,139 +920,117 @@ function IndependentRulesPanel({
         ))}
       </div>
       {activeView === "pending" && (
-        <div className="max-h-[calc(100dvh-360px)] overflow-auto rounded-lg border">
-          <table className={`w-full text-left text-xs ${isNoteSource ? "min-w-[1500px]" : "min-w-[980px]"}`}>
+        <div className="max-h-[calc(100dvh-360px)] overflow-y-auto overflow-x-hidden rounded-lg border">
+          <table className="w-full table-fixed text-left text-[11px]">
             <thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase text-slate-500">
               <tr>
-                {["Data", triggerLabel, ...(isNoteSource ? ["Vencimento", "Pagamento", "Forma pgto.", "Classificação", "Gera CSV"] : []), "Valor original", "Gatilho", "Débito", "Crédito", "Histórico", "Complemento", "Ação"].map((column) => (
-                  <th className="px-2 py-2" key={column}>{column}</th>
-                ))}
+                <th className="w-[6%] px-2 py-2">Data</th>
+                <th className={`${isNoteSource ? "w-[13%]" : "w-[18%]"} px-2 py-2`}>{triggerLabel}</th>
+                {isNoteSource && <th className="w-[9%] px-2 py-2">Tipo</th>}
+                {isNoteSource && <th className="w-[13%] px-2 py-2">Pagamento</th>}
+                <th className="w-[8%] px-2 py-2">Valor</th>
+                <th className="w-[11%] px-2 py-2">Gatilho</th>
+                <th className="w-[10%] px-2 py-2">D</th>
+                <th className="w-[10%] px-2 py-2">C</th>
+                <th className="w-[10%] px-2 py-2">H</th>
+                <th className="w-[7%] px-2 py-2">Compl.</th>
+                <th className="w-[3%] px-2 py-2">Ação</th>
               </tr>
             </thead>
             <tbody>
-              {data.pendentes.map((row) => (
-                <tr className="border-t align-top" key={row.id}>
-                  <td className="px-2 py-2">{row.data}</td>
-                  <td className="px-2 py-2">
-                    <span className="block font-medium text-slate-800">{row.texto}</span>
-                    <span className="text-slate-500">{row.documento}</span>
-                  </td>
-                  {isNoteSource && (
-                    <>
-                    <td className="px-2 py-2">{row.data_vencimento || "Não identificado"}</td>
-                    <td className="px-2 py-2">{row.data_pagamento || "Não identificado"}</td>
-                    <td className="px-2 py-2">
-                      <span className={`inline-flex rounded-full px-2 py-1 text-[11px] font-semibold ${row.forma_pagamento && row.forma_pagamento !== "—" ? "bg-amber-50 text-amber-800" : "bg-slate-100 text-slate-500"}`}>
-                        {row.tipo_pagamento || row.forma_pagamento || "—"}
-                      </span>
-                    </td>
-                    <td className="px-2 py-2">
-                      <span title={row.motivo_antecipacao || ""} className={`inline-flex rounded-full px-2 py-1 text-[11px] font-semibold ${row.classificacao_antecipacao?.startsWith("ANTECIPACAO") ? "bg-violet-50 text-violet-800" : row.classificacao_antecipacao === "NORMAL" ? "bg-emerald-50 text-emerald-800" : "bg-amber-50 text-amber-800"}`}>
-                        {row.classificacao_antecipacao || "REVISAR"}
-                      </span>
-                    </td>
-                    <td className="px-2 py-2">
-                      <span title={row.motivo_nao_geracao || row.destino_lancamento || ""} className={`inline-flex rounded-full px-2 py-1 text-[11px] font-semibold ${row.gera_lancamento === "Antecipação + baixa" ? "bg-violet-50 text-violet-800" : row.gera_lancamento === "Sim" ? "bg-teal-50 text-teal-800" : "bg-slate-100 text-slate-600"}`}>
-                        {row.gera_lancamento || "—"}
-                      </span>
-                      {row.gera_lancamento === "Antecipação + baixa" && (
-                        <span className="mt-1 block text-[10px] font-medium text-violet-700">
-                          {row.linhas_csv || "2"} linhas no CSV
-                        </span>
-                      )}
-                    </td>
-                    </>
-                  )}
-                  <td className="px-2 py-2 font-semibold">{money(row.valor)}</td>
-                  <td className="px-2 py-1"><input value={value(row.id, "gatilho", row.texto)} onChange={(event) => change(row.id, "gatilho", event.target.value)} className="w-36 rounded border px-2 py-1" /></td>
-                  <td className="px-2 py-1">
-                    <input
-                      list="catalogo-contas"
-                      value={value(row.id, "debito")}
-                      onChange={(event) => {
-                        change(row.id, "debito", event.target.value);
-                        showInputStart(event.currentTarget);
-                      }}
-                      onBlur={(event) => showInputStart(event.currentTarget)}
-                      className="w-36 rounded border px-2 py-1 pr-5 text-left"
-                      placeholder="Selecionar"
-                    />
-                  </td>
-                  <td className="px-2 py-1">
-                    <input
-                      list="catalogo-contas"
-                      value={value(row.id, "credito")}
-                      onChange={(event) => {
-                        change(row.id, "credito", event.target.value);
-                        showInputStart(event.currentTarget);
-                      }}
-                      onBlur={(event) => showInputStart(event.currentTarget)}
-                      className="w-36 rounded border px-2 py-1 pr-5 text-left"
-                      placeholder="Selecionar"
-                    />
-                  </td>
-                  <td className="px-2 py-1">
-                    <input
-                      list="catalogo-historicos"
-                      value={value(row.id, "historico")}
-                      onChange={(event) => {
-                        change(row.id, "historico", event.target.value);
-                        showInputStart(event.currentTarget);
-                      }}
-                      onBlur={(event) => showInputStart(event.currentTarget)}
-                      className="w-40 rounded border px-2 py-1 pr-5 text-left"
-                      placeholder="Selecionar"
-                    />
-                  </td>
-                  <td className="px-2 py-1"><input value={value(row.id, "complemento", defaultComplement(row))} onChange={(event) => change(row.id, "complemento", event.target.value)} className="w-48 rounded border px-2 py-1" /></td>
-                  <td className="whitespace-nowrap px-2 py-1"><button disabled={busy === row.id} onClick={() => save(row)} className="rounded bg-teal-700 px-2 py-1 text-white disabled:opacity-60">{busy === row.id ? "Salvando..." : "Salvar"}</button><RowFileButton row={row} /></td>
-                </tr>
-              ))}
+              {pendingSourceGroups.map((group) => {
+                const splitGroup = group.some(isSplitNoteRule);
+                const first = group[0];
+                if (!splitGroup) return renderPendingSourceRow(first);
+                return (
+                  <Fragment key={first.id.split(":")[0]}>
+                    <tr className="border-t bg-sky-50">
+                      <td colSpan={isNoteSource ? 11 : 9} className="border-l-4 border-sky-400 px-3 py-2">
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                          <strong>{first.texto}</strong>
+                          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">NF {first.documento}</span>
+                          <span className="text-[10px] font-semibold text-sky-800">2 lançamentos: Antecipação + Baixa Ant.</span>
+                          <span className="text-[10px] text-slate-500">Emissão {first.data_emissao || "—"} · Pgto. {first.data_pagamento || "—"}</span>
+                          <RowFileButton row={first} />
+                        </div>
+                      </td>
+                    </tr>
+                    {group.map((row) => renderPendingSourceRow(row, true))}
+                    <tr className="bg-sky-50">
+                      <td colSpan={isNoteSource ? 11 : 9} className="border-x-2 border-b-2 border-sky-200 px-3 py-1" />
+                    </tr>
+                  </Fragment>
+                );
+              })}
               {!data.pendentes.length && (
-                <tr><td className="px-2 py-6 text-center text-slate-500" colSpan={isNoteSource ? 14 : 9}>Nenhum registro pendente nesta aba.</td></tr>
+                <tr><td className="px-2 py-6 text-center text-slate-500" colSpan={isNoteSource ? 11 : 9}>Nenhum registro pendente nesta aba.</td></tr>
               )}
             </tbody>
           </table>
         </div>
       )}
       {activeView === "saved" && (
-        <div className="max-h-[calc(100dvh-360px)] overflow-auto rounded-lg border">
-          <table className="w-full min-w-[820px] text-left text-xs">
+        <div className="max-h-[calc(100dvh-360px)] overflow-y-auto overflow-x-hidden rounded-lg border">
+          <table className="w-full table-fixed text-left text-[11px]">
             <thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase text-slate-500">
-              <tr>{["Gatilho", "Cobertos", "Débito", "Crédito", "Histórico", "Complemento", "Ação"].map((column) => <th className="px-3 py-2" key={column}>{column}</th>)}</tr>
+              <tr>
+                <th className="w-[12%] px-3 py-2">Tipo</th>
+                <th className="w-[18%] px-3 py-2">Gatilho</th>
+                <th className="w-[7%] px-3 py-2">Cobertos</th>
+                <th className="w-[15%] px-3 py-2">Débito</th>
+                <th className="w-[15%] px-3 py-2">Crédito</th>
+                <th className="w-[15%] px-3 py-2">Histórico</th>
+                <th className="w-[14%] px-3 py-2">Complemento</th>
+                <th className="w-[4%] px-3 py-2">Ação</th>
+              </tr>
             </thead>
             <tbody>
               {data.salvas.map((rule) => (
                 <tr className="border-t" key={rule.id}>
-                  <td className="px-3 py-2 font-semibold text-slate-800">{rule.gatilho}</td>
+                  <td className="break-words px-3 py-2">{rule.tipo_componente_label || rule.tipo_componente || "Principal"}</td>
+                  <td className="break-words px-3 py-2 font-semibold text-slate-800">{rule.gatilho}</td>
                   <td className="px-3 py-2">{rule.cobertos}</td>
-                  <td className="px-3 py-2">{rule.conta_debito}</td>
-                  <td className="px-3 py-2">{rule.conta_credito}</td>
-                  <td className="px-3 py-2">{rule.historico}</td>
-                  <td className="px-3 py-2">{rule.complemento}</td>
+                  <td className="break-words px-3 py-2">{rule.conta_debito}</td>
+                  <td className="break-words px-3 py-2">{rule.conta_credito}</td>
+                  <td className="break-words px-3 py-2">{rule.historico}</td>
+                  <td className="break-words px-3 py-2">{rule.complemento}</td>
                   <td className="px-3 py-2"><button disabled={busy === rule.id} onClick={() => remove(rule)} className="rounded p-1 text-red-600 hover:bg-red-50" title="Excluir regra"><Trash2 size={15} /></button></td>
                 </tr>
               ))}
-              {!data.salvas.length && <tr><td className="px-3 py-6 text-center text-slate-500" colSpan={7}>Nenhuma regra criada.</td></tr>}
+              {!data.salvas.length && <tr><td className="px-3 py-6 text-center text-slate-500" colSpan={8}>Nenhuma regra criada.</td></tr>}
             </tbody>
           </table>
         </div>
       )}
       {activeView === "classified" && (
-        <div className="max-h-[calc(100dvh-360px)] overflow-auto rounded-lg border">
-          <table className={`w-full text-left text-xs ${isNoteSource ? "min-w-[1280px]" : "min-w-[820px]"}`}>
+        <div className="max-h-[calc(100dvh-360px)] overflow-y-auto overflow-x-hidden rounded-lg border">
+          <table className="w-full table-fixed text-left text-[11px]">
             <thead className="sticky top-0 z-10 bg-slate-50 text-[10px] uppercase text-slate-500">
-              <tr>{["Data", triggerLabel, ...(isNoteSource ? ["Forma pgto.", "Classificação", "Gera CSV"] : []), "Valor", "Débito", "Crédito", "Histórico", "Complemento", "Arquivo"].map((column) => <th className="px-3 py-2" key={column}>{column}</th>)}</tr>
+              <tr>
+                <th className="w-[7%] px-3 py-2">Data</th>
+                <th className={`${isNoteSource ? "w-[14%]" : "w-[24%]"} px-3 py-2`}>{triggerLabel}</th>
+                {isNoteSource && <th className="w-[9%] px-3 py-2">Tipo</th>}
+                {isNoteSource && <th className="w-[9%] px-3 py-2">Pgto.</th>}
+                {isNoteSource && <th className="w-[10%] px-3 py-2">Classif.</th>}
+                {isNoteSource && <th className="w-[9%] px-3 py-2">CSV</th>}
+                <th className="w-[7%] px-3 py-2">Valor</th>
+                <th className="w-[8%] px-3 py-2">D</th>
+                <th className="w-[8%] px-3 py-2">C</th>
+                <th className="w-[8%] px-3 py-2">H</th>
+                <th className="w-[7%] px-3 py-2">Compl.</th>
+                <th className="w-[3%] px-3 py-2">Arq.</th>
+              </tr>
             </thead>
             <tbody>
               {data.classificados.map((row) => (
                 <tr className="border-t" key={row.id}>
-                  <td className="px-3 py-2">{row.data}</td>
-                  <td className="px-3 py-2"><span className="block font-semibold text-slate-800">{row.texto}</span><span className="text-slate-500">{row.documento}</span></td>
-                  {isNoteSource && <td className="px-3 py-2">{row.tipo_pagamento || row.forma_pagamento || "—"}</td>}
-                  {isNoteSource && <td className="px-3 py-2">{row.classificacao_antecipacao || "—"}</td>}
+                  <td className="break-words px-3 py-2">{row.data}</td>
+                  <td className="break-words px-3 py-2"><span className="block font-semibold text-slate-800">{row.texto}</span><span className="text-slate-500">{row.documento}</span></td>
+                  {isNoteSource && <td className="break-words px-3 py-2">{row.tipo_lancamento_label || "Principal"}</td>}
+                  {isNoteSource && <td className="break-words px-3 py-2">{row.tipo_pagamento_label || row.forma_pagamento || "—"}</td>}
+                  {isNoteSource && <td className="break-words px-3 py-2">{row.classificacao_antecipacao_label || "—"}</td>}
                   {isNoteSource && (
-                    <td className="px-3 py-2">
+                    <td className="break-words px-3 py-2">
                       <span className={row.gera_lancamento === "Antecipação + baixa" ? "font-semibold text-violet-700" : ""}>
                         {row.gera_lancamento || "—"}
                       </span>
@@ -928,15 +1039,15 @@ function IndependentRulesPanel({
                       )}
                     </td>
                   )}
-                  <td className="px-3 py-2 font-semibold">{money(row.valor)}</td>
-                  <td className="px-3 py-2">{row.conta_debito}</td>
-                  <td className="px-3 py-2">{row.conta_credito}</td>
-                  <td className="px-3 py-2">{row.historico_contabil}</td>
-                  <td className="px-3 py-2">{row.complemento}</td>
+                  <td className="break-words px-3 py-2 font-semibold">{money(row.valor)}</td>
+                  <td className="break-words px-3 py-2">{row.conta_debito}</td>
+                  <td className="break-words px-3 py-2">{row.conta_credito}</td>
+                  <td className="break-words px-3 py-2">{row.historico_contabil}</td>
+                  <td className="break-words px-3 py-2">{row.complemento}</td>
                   <td className="px-3 py-2"><RowFileButton row={row} /></td>
                 </tr>
               ))}
-              {!data.classificados.length && <tr><td className="px-3 py-6 text-center text-slate-500" colSpan={isNoteSource ? 11 : 8}>Nenhum registro classificado.</td></tr>}
+              {!data.classificados.length && <tr><td className="px-3 py-6 text-center text-slate-500" colSpan={isNoteSource ? 12 : 8}>Nenhum registro classificado.</td></tr>}
             </tbody>
           </table>
         </div>
@@ -3942,7 +4053,7 @@ function ConciliacaoFlow({
                     <input
                       className="hidden"
                       type="file"
-                      accept="application/pdf"
+                      accept={String(type) === "emprestimo" ? "application/pdf,.pdf,.xlsx,.xlsm,.csv,text/csv" : "application/pdf,.pdf"}
                       multiple={Boolean(multiple)}
                       onChange={(event) => upload(String(type), event)}
                     />

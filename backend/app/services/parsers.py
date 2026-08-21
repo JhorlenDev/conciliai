@@ -1,11 +1,14 @@
+import csv
 import re
 import logging
 import calendar
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+from openpyxl import load_workbook
 
 from app.services.normalization import normalize_name
 
@@ -535,7 +538,7 @@ def extract_loan_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
             hora=parsed_time,
             favorecido=beneficiary or "Empréstimo/Financiamento",
             valor=paid,
-            tipo_operacao="EMPRÉSTIMO/FINANCIAMENTO",
+            tipo_operacao="EMPRESTIMO",
             texto_original=text,
             pagina_numero=page_number,
             origem_nome="CONTRATO",
@@ -544,6 +547,141 @@ def extract_loan_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
             numero_documento=contract,
         )
     ]
+
+
+def extract_loan_spreadsheet(path: str | Path) -> tuple[list[str], list[ParsedReceipt]]:
+    path = Path(path)
+    pages: list[str] = []
+    receipts: list[ParsedReceipt] = []
+
+    def as_decimal(value) -> Decimal | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, Decimal):
+            return value.quantize(Decimal("0.01"))
+        if isinstance(value, (int, float)):
+            return Decimal(str(value)).quantize(Decimal("0.01"))
+        text = str(value).strip()
+        if not text:
+            return None
+        if "," in text:
+            return parse_brl(text)
+        cleaned = re.sub(r"[^0-9.-]", "", text)
+        if not cleaned:
+            return None
+        try:
+            return Decimal(cleaned).quantize(Decimal("0.01"))
+        except (InvalidOperation, ValueError):
+            return None
+
+    def as_date(value) -> date | None:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if value:
+            parsed, _ = parse_date_time(str(value))
+            return parsed
+        return None
+
+    if path.suffix.lower() == ".csv":
+        raw = path.read_bytes()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("latin-1")
+        sample = text[:2048]
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=";,|\t,")
+        except csv.Error:
+            dialect = csv.excel
+            dialect.delimiter = ";"
+        sources = [("CSV", list(csv.reader(text.splitlines(), dialect)))]
+    else:
+        workbook = load_workbook(path, data_only=True, read_only=True)
+        sources = [(worksheet.title, list(worksheet.iter_rows(values_only=True))) for worksheet in workbook.worksheets]
+
+    for page_number, (source_name, source_rows) in enumerate(sources, 1):
+        lines: list[str] = []
+        contract = ""
+        header_indexes: dict[str, int] = {}
+        grouped: dict[date, dict[str, Decimal | list[str]]] = {}
+        for row in source_rows:
+            values = ["" if value is None else value for value in row]
+            line = " | ".join(str(value) for value in values if value != "")
+            if line:
+                lines.append(line)
+            if not contract:
+                match = re.search(r"\b\d{2,3}[.\s]\d{3}[.\s]\d{3}\b", line)
+                if match:
+                    contract = re.sub(r"\s+", "", match.group(0).strip(" ."))
+            normalized_cells = [normalize_name(str(value)) for value in values]
+            if "VENCIMENTO" in normalized_cells and "TIPO" in normalized_cells:
+                header_indexes = {name: index for index, name in enumerate(normalized_cells)}
+                continue
+            if not header_indexes:
+                continue
+            row_date = as_date(values[header_indexes.get("VENCIMENTO", 0)])
+            component = normalize_name(str(values[header_indexes.get("TIPO", 1)]))
+            if not row_date or component not in {"JUROS", "CAPITAL", "AMORTIZACAO", "PRINCIPAL"}:
+                continue
+            amount_index = header_indexes.get("VALOR PREVISTO R")
+            principal_index = header_indexes.get("CAPITAL DA PARCELA R")
+            amount = as_decimal(values[amount_index]) if amount_index is not None and amount_index < len(values) else None
+            principal_amount = as_decimal(values[principal_index]) if principal_index is not None and principal_index < len(values) else None
+            if amount is None and principal_amount is None:
+                continue
+            bucket = grouped.setdefault(row_date, {"principal": Decimal("0.00"), "juros": Decimal("0.00"), "encargos": Decimal("0.00"), "lines": []})
+            if component == "JUROS":
+                bucket["juros"] = Decimal(bucket["juros"]) + (amount or Decimal("0.00"))
+            elif component in {"CAPITAL", "AMORTIZACAO", "PRINCIPAL"}:
+                bucket["principal"] = Decimal(bucket["principal"]) + (principal_amount or amount or Decimal("0.00"))
+            else:
+                bucket["encargos"] = Decimal(bucket["encargos"]) + (amount or Decimal("0.00"))
+            bucket["lines"].append(line)
+
+        pages.append("\n".join(lines))
+        for row_date in sorted(grouped):
+            values = grouped[row_date]
+            principal = Decimal(values["principal"])
+            interest = Decimal(values["juros"])
+            charges = Decimal(values["encargos"])
+            paid = principal + interest + charges
+            if paid <= 0:
+                continue
+            details = {
+                "contrato": contract,
+                "principal": str(principal),
+                "juros": str(interest),
+                "encargos": str(charges),
+                "valor_pago": str(paid),
+                "origem": "planilha_emprestimo_bb",
+            }
+            financial = FinancialValues(
+                valor_original=principal if principal > 0 else paid,
+                valor_juros=interest if interest > 0 else None,
+                valor_encargos=charges if charges > 0 else None,
+                valor_pago=paid,
+                detalhes=details,
+                composicao_divergente=False,
+            )
+            beneficiary = " ".join(part for part in ["Empréstimo/Financiamento", contract] if part).strip()
+            receipts.append(
+                ParsedReceipt(
+                    data=row_date,
+                    hora=None,
+                    favorecido=beneficiary or "Empréstimo/Financiamento",
+                    valor=paid,
+                    tipo_operacao="EMPRESTIMO",
+                    texto_original="\n".join(values["lines"]),
+                    pagina_numero=page_number,
+                    origem_nome="PLANILHA_BB",
+                    financeiros=financial,
+                    beneficiario=beneficiary or "Empréstimo/Financiamento",
+                    numero_documento=contract,
+                )
+            )
+    return pages, receipts
 
 
 def _extract_banco_do_brasil_loan_schedule(text: str, page_number: int) -> list[ParsedReceipt]:
@@ -630,7 +768,7 @@ def _extract_banco_do_brasil_loan_schedule(text: str, page_number: int) -> list[
                 hora=None,
                 favorecido=beneficiary or "Empréstimo/Financiamento",
                 valor=paid,
-                tipo_operacao="EMPRÉSTIMO/FINANCIAMENTO",
+                tipo_operacao="EMPRESTIMO",
                 texto_original="\n".join(raw_lines[parsed_date]),
                 pagina_numero=page_number,
                 origem_nome="CRONOGRAMA_BB",
@@ -700,7 +838,15 @@ def _extract_tefe_nfse_invoice(text: str, page_number: int) -> ParsedInvoice | N
         match = re.search(r"N[uú]mero da NFS-e\s*\n\s*(\d{3,})", text, re.I)
         number = match.group(1) if match else ""
 
-    parsed_date, _ = parse_date_time(text)
+    emission_text = next(
+        (
+            " ".join(lines[max(0, index - 4):index + 4])
+            for index, line in enumerate(lines)
+            if "DATA" in normalize_name(line) and "EMISSAO" in normalize_name(line)
+        ),
+        text,
+    )
+    parsed_date, _ = parse_date_time(emission_text)
 
     tomador_name = ""
     tomador_document = ""
@@ -735,21 +881,36 @@ def _extract_tefe_nfse_invoice(text: str, page_number: int) -> ParsedInvoice | N
         service = " ".join(service_match.group(1).split())
 
     payment = {}
-    payment_match = re.search(
-        r"FATURAS:\s*([A-Z0-9 /.-]+?)\s+Venc:\s*(\d{2}/\d{2}/\d{4})\s+R\$\s*([\d.]+,\d{2})(?:\s+Doc:\s*([^\s]+))?",
-        text,
+    compact_text = " ".join(lines)
+    faturas_match = re.search(r"FATURAS:\s*(.+?)(?:\s+Val\.\s*Aprox\.|\s+NFS-e\s+COMPOSTA|\Z)", compact_text, re.I)
+    payment_matches = re.findall(
+        r"(?:^|\s+-\s+)(.+?)\s+Venc:\s*(\d{2}/\d{2}/\d{4})\s+R\$\s*([\d.]+,\d{2})(?:\s+Doc:\s*([^\s]+))?",
+        faturas_match.group(1) if faturas_match else "",
         re.I,
     )
-    if payment_match:
-        payment_date, _ = parse_date_time(payment_match.group(2))
-        payment_type_original = " ".join(payment_match.group(1).split())
+    if payment_matches:
+        payments = []
+        for payment_type, payment_due, payment_value, payment_doc in payment_matches:
+            parsed_payment_date, _ = parse_date_time(payment_due)
+            payments.append({
+                "forma_pagamento": " ".join(payment_type.split()),
+                "data_vencimento": parsed_payment_date.isoformat() if parsed_payment_date else "",
+                "data_pagamento": parsed_payment_date.isoformat() if parsed_payment_date else "",
+                "valor": str(parse_brl(payment_value) or ""),
+                "documento": payment_doc or "",
+            })
+        first_payment = payments[0]
+        payment_date = parse_date_time(payment_matches[0][1])[0]
+        payment_type_original = first_payment["forma_pagamento"] if len(payments) == 1 else "Pagamento dividido"
+        payment_total = sum((Decimal(item["valor"] or "0.00") for item in payments), Decimal("0.00"))
         payment = {
             "forma_pagamento": payment_type_original,
             "tipo_pagamento_original": payment_type_original,
             "data_vencimento": payment_date.isoformat() if payment_date else "",
             "data_pagamento": payment_date.isoformat() if payment_date else "",
-            "valor_pagamento": str(parse_brl(payment_match.group(3)) or ""),
-            "documento_pagamento": payment_match.group(4) or "",
+            "valor_pagamento": str(payment_total if len(payments) > 1 else parse_brl(payment_matches[0][2]) or ""),
+            "documento_pagamento": first_payment["documento"],
+            "pagamentos": payments,
         }
 
     counterparty = tomador_name or prestador_name

@@ -2,10 +2,11 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
+from openpyxl import Workbook
 
 from app.services.normalization import accounting_nature, names_similar, normalize_statement_nature
 from app.services.matching import invoice_is_candidate
-from app.services.parsers import ParsedStatement, _validate_santander_expected_statement, deduplicate_statement_records, extract_financial_values, extract_invoices, extract_loan_receipts, extract_receipts, extract_santander_words_statement, extract_statement, extract_statement_pages, parse_brl, parse_date_time
+from app.services.parsers import ParsedStatement, _validate_santander_expected_statement, deduplicate_statement_records, extract_financial_values, extract_invoices, extract_loan_receipts, extract_loan_spreadsheet, extract_receipts, extract_santander_words_statement, extract_statement, extract_statement_pages, parse_brl, parse_date_time
 from app.api.routes import receipt_match_criterion
 from app.models import Comprovante
 
@@ -33,7 +34,8 @@ VALOR TOTAL: 2.817,00
     assert record.valor == Decimal("2817.00")
     assert record.financeiros.valor_original == Decimal("2083.33")
     assert record.financeiros.valor_juros == Decimal("733.67")
-    assert record.tipo_operacao == "EMPRÉSTIMO/FINANCIAMENTO"
+    assert record.tipo_operacao == "EMPRESTIMO"
+    assert len(record.tipo_operacao) <= 20
 
 
 def test_banco_do_brasil_loan_schedule_groups_interest_and_capital_by_date():
@@ -75,6 +77,63 @@ Vencimento Parcela                         Previsto      Realizado      Exigivel
     assert records[0].financeiros.valor_original == Decimal("2083.33")
     assert records[0].financeiros.valor_juros == Decimal("355.00")
     assert records[1].valor == Decimal("2389.03")
+
+
+def test_banco_do_brasil_loan_spreadsheet_groups_interest_and_capital(tmp_path):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Planilha1"
+    sheet.append(["Controle de Empréstimo Banco do Brasil — Operação 057.709.569"])
+    sheet.append(["Linha de Crédito:", "0612 - BB CAPITAL DE GIRO DIGITAL"])
+    sheet.append([])
+    sheet.append(["Vencimento", "Tipo", "Valor Previsto (R$)", "Capital da Parcela (R$)", "Saldo Devedor Após Parcela (R$)", "Situação"])
+    sheet.append([date(2024, 1, 15), "JUROS", 733.67, 0, 25000.04, "A partir da abertura"])
+    sheet.append([date(2024, 1, 15), "CAPITAL", 2083.33, 2083.33, 22916.71, "A partir da abertura"])
+    sheet.append([date(2024, 2, 15), "JUROS", 672.53, 0, 22916.71, "A partir da abertura"])
+    sheet.append([date(2024, 2, 15), "CAPITAL", 2083.33, 2083.33, 20833.38, "A partir da abertura"])
+    path = tmp_path / "emprestimos.xlsx"
+    workbook.save(path)
+
+    pages, records = extract_loan_spreadsheet(path)
+
+    assert len(pages) == 1
+    assert len(records) == 2
+    assert records[0].data == date(2024, 1, 15)
+    assert records[0].numero_documento == "057.709.569"
+    assert records[0].valor == Decimal("2817.00")
+    assert records[0].financeiros.valor_original == Decimal("2083.33")
+    assert records[0].financeiros.valor_juros == Decimal("733.67")
+    assert records[0].financeiros.detalhes["origem"] == "planilha_emprestimo_bb"
+    assert records[0].tipo_operacao == "EMPRESTIMO"
+    assert len(records[0].tipo_operacao) <= 20
+    assert records[1].valor == Decimal("2755.86")
+
+
+def test_banco_do_brasil_loan_csv_groups_interest_and_capital(tmp_path):
+    path = tmp_path / "emprestimos.csv"
+    path.write_text(
+        "\n".join(
+            [
+                "Controle de Empréstimo Banco do Brasil — Operação 057.709.569;;;;;",
+                "Vencimento;Tipo;Valor Previsto (R$);Capital da Parcela (R$);Saldo Devedor Após Parcela (R$);Situação",
+                "15/01/2024;JUROS;733,67;0;25000,04;A partir da abertura",
+                "15/01/2024;CAPITAL;2083,33;2083,33;22916,71;A partir da abertura",
+                "15/02/2024;JUROS;672.53;0;22916.71;A partir da abertura",
+                "15/02/2024;CAPITAL;2083.33;2083.33;20833.38;A partir da abertura",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    pages, records = extract_loan_spreadsheet(path)
+
+    assert len(pages) == 1
+    assert len(records) == 2
+    assert records[0].numero_documento == "057.709.569"
+    assert records[0].valor == Decimal("2817.00")
+    assert records[0].financeiros.valor_original == Decimal("2083.33")
+    assert records[0].financeiros.valor_juros == Decimal("733.67")
+    assert records[1].valor == Decimal("2755.86")
 
 
 def test_invoice_extracts_supplier_number_date_and_total():
@@ -128,6 +187,96 @@ FATURAS: PIX Venc: 27/01/2024 R$ 120,00 Doc: 1434 Obs: null
     assert record.dados["forma_pagamento"] == "PIX"
     assert record.dados["data_pagamento"] == "2024-01-27"
     assert record.dados["documento_pagamento"] == "1434"
+
+
+def test_tefe_nfse_extracts_accented_card_payment_from_faturas():
+    text = """PM DE TEFE - AM
+NOTA FISCAL DE SERVIÇOS ELETRÔNICA - NFS-e
+Número da NFS-e
+512933
+Data e Hora de Emissão da NFS-e
+31/01/2024 às 16:48:55
+TOMADOR DE SERVIÇOS
+CPF/CNPJ/Documento RG/Inscrição Estadual Inscrição Municipal Nome/Razão Social
+014.782.102-90 CLIENTE CARTAO
+Discriminação dos Serviços
+1.0 UN PRESTAÇÃO DE SERVIÇOS ODONTOLÓGICOS 150.0 R$ 150,00
+Valor Líquido da NFS-e: R$ 150,00
+FATURAS: CARTÃO DE CRÉDITO Venc: 30/01/2024 R$ 150,00 Doc: 001353 Obs: null
+"""
+    records = extract_invoices(text, 4)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.dados["forma_pagamento"] == "CARTÃO DE CRÉDITO"
+    assert record.dados["tipo_pagamento_original"] == "CARTÃO DE CRÉDITO"
+    assert record.dados["data_pagamento"] == "2024-01-30"
+    assert record.dados["valor_pagamento"] == "150.00"
+    assert record.dados["documento_pagamento"] == "001353"
+
+
+def test_tefe_nfse_extracts_card_payment_from_multiline_faturas():
+    text = """PM DE TEFE - AM
+NOTA FISCAL DE SERVIÇOS ELETRÔNICA - NFS-e
+Número da NFS-e
+512708
+03/01/2024 às 18:35:37
+Chave de Acesso
+512708
+Data e Hora de Emissão da NFS-e
+Número da NFS-e
+TOMADOR DE SERVIÇOS
+CPF/CNPJ/Documento RG/Inscrição Estadual Inscrição Municipal Nome/Razão Social
+ANDERSON DA SILVA CUNHA
+Discriminação dos Serviços
+1.0 UN PRESTAÇÃO DE SERVIÇOS ODONTOLÓGICOS 120.0 R$ 120,00
+Valor Líquido da NFS-e: R$ 120,00
+FATURAS:
+CARTÃO DE CRÉDITO
+Venc: 30/12/2023
+R$ 120,00
+Doc: 1195
+Obs: null
+"""
+    records = extract_invoices(text, 5)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.numero_nota == "512708"
+    assert record.data_emissao == date(2024, 1, 3)
+    assert record.dados["forma_pagamento"] == "CARTÃO DE CRÉDITO"
+    assert record.dados["data_pagamento"] == "2023-12-30"
+    assert record.dados["valor_pagamento"] == "120.00"
+    assert record.dados["documento_pagamento"] == "1195"
+
+
+def test_tefe_nfse_extracts_split_payment_from_faturas():
+    text = """PM DE TEFE - AM
+NOTA FISCAL DE SERVIÇOS ELETRÔNICA - NFS-e
+Número da NFS-e
+512809
+Data e Hora de Emissão da NFS-e
+16/01/2024 às 18:35:37
+TOMADOR DE SERVIÇOS
+CPF/CNPJ/Documento RG/Inscrição Estadual Inscrição Municipal Nome/Razão Social
+LAURA MAIANA CARDOSO GOMES
+Discriminação dos Serviços
+1.0 UN PRESTAÇÃO DE SERVIÇOS ODONTOLÓGICOS 120.0 R$ 120,00
+Valor Líquido da NFS-e: R$ 120,00
+FATURAS: PIX Venc: 09/01/2024 R$ 100,00 Doc: 1390 Obs: null - PAGAMENTO À VISTA Venc: 09/01/2024 R$ 20,00 Doc: 1391 Obs: null
+"""
+    records = extract_invoices(text, 6)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.dados["forma_pagamento"] == "Pagamento dividido"
+    assert record.dados["tipo_pagamento_original"] == "Pagamento dividido"
+    assert record.dados["data_pagamento"] == "2024-01-09"
+    assert record.dados["valor_pagamento"] == "120.00"
+    assert record.dados["pagamentos"] == [
+        {"forma_pagamento": "PIX", "data_vencimento": "2024-01-09", "data_pagamento": "2024-01-09", "valor": "100.00", "documento": "1390"},
+        {"forma_pagamento": "PAGAMENTO À VISTA", "data_vencimento": "2024-01-09", "data_pagamento": "2024-01-09", "valor": "20.00", "documento": "1391"},
+    ]
 
 
 def test_pix_receipt_extracts_its_separate_tariff():

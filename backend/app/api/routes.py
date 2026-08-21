@@ -28,7 +28,7 @@ from app.core.database import get_db
 from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, ComprovanteRfbItem, Conciliacao, ContaBancaria, Correspondencia, DocumentoImportante, LancamentoContabil, MovimentoExtrato, NotaFiscal, ProcessoConciliacao, RegraContabil, RegraContabilExcecao
 from app.services.normalization import accounting_nature, is_statement_debit, normalize_name, normalize_rule_accounting_nature, normalize_statement_nature
 from app.services.matching import names_similar
-from app.services.parsers import deduplicate_statement_records, extract_basa_pdfplumber_pages, extract_getnet_pdfplumber_pages, extract_invoices, extract_loan_receipts, extract_receipts, extract_santander_pdfplumber_statement, extract_statement_pages, parse_brl
+from app.services.parsers import deduplicate_statement_records, extract_basa_pdfplumber_pages, extract_getnet_pdfplumber_pages, extract_invoices, extract_loan_receipts, extract_loan_spreadsheet, extract_receipts, extract_santander_pdfplumber_statement, extract_statement_pages, parse_brl
 from app.services.getnet_adjustments import GETNET_ADJUSTMENT_COMPONENT, GETNET_ADJUSTMENT_DESCRIPTION, is_getnet_adjustment_movement, is_santander_getnet_credit, sync_getnet_anticipation_adjustments
 from app.services.rfb import belongs_to_selected_bank, extract_competence, parse_rfb_page
 from app.services.rule_source import choose_rule_source
@@ -47,7 +47,10 @@ SCANNED_PDF_OCR_MESSAGE = "PDF escaneado sem texto pesquisável. Instale o OCR T
 INVOICE_ANTICIPATION_ACCOUNT = "Antecipação de clientes"
 INVOICE_ANTICIPATION_HISTORY = "Antecipação de clientes"
 INVOICE_ANTICIPATION_CLEARING_HISTORY = "Baixa da antecipação de clientes"
-INVOICE_INTER_COMPETENCE_ANTICIPATIONS = {"ANTECIPACAO_EMISSAO_MES_SEGUINTE", "ANTECIPACAO_AMBAS_CONDICOES"}
+INVOICE_CLEARING_ANTICIPATIONS = {
+    "ANTECIPACAO_EMISSAO",
+    "ANTECIPACAO_EMISSAO_E_VENCIMENTO",
+}
 
 
 def extract_basa_initial_balance(text: str) -> Decimal | None:
@@ -122,20 +125,54 @@ def invoice_payment_type(value: str) -> str:
         return "CARTAO_DEBITO"
     if normalized in {"CREDITO", "CREDITO A VISTA", "CREDITO PARCELADO"}:
         return "CARTAO_CREDITO"
+    if normalized in {"PAGAMENTO A VISTA", "A VISTA", "AVISTA"}:
+        return "DINHEIRO"
+    if "PAGAMENTO DIVIDIDO" in normalized or "MULTIPLAS FORMAS" in normalized:
+        return "PAGAMENTO_DIVIDIDO"
     return "OUTRO"
+
+
+def invoice_payment_type_label(value: str) -> str:
+    return {
+        "CARTAO_DEBITO": "Cartão débito",
+        "CARTAO_CREDITO": "Cartão crédito",
+        "DINHEIRO": "Dinheiro",
+        "PIX": "PIX",
+        "BOLETO": "Boleto",
+        "DEPOSITO": "Depósito",
+        "TRANSFERENCIA": "Transferência",
+        "OUTRO": "Outro",
+        "PAGAMENTO_DIVIDIDO": "Pagamento dividido",
+        "NAO_IDENTIFICADO": "Não identificado",
+    }.get(value or "", value or "Não identificado")
+
+
+def invoice_anticipation_label(value: str) -> str:
+    return {
+        "ANTECIPACAO_EMISSAO": "Antecipação",
+        "ANTECIPACAO_EMISSAO_E_VENCIMENTO": "Antecipação + vencimento",
+        "ANTECIPACAO_VENCIMENTO": "Antes do vencimento",
+        "NORMAL": "Normal",
+        "REVISAR": "Revisar",
+        "REVISAR_EMISSAO": "Conferir emissão",
+    }.get(value or "", value or "Revisar")
 
 
 def invoice_anticipation(emission: date | None, due: date | None, payment: date | None) -> tuple[str, str]:
     if not payment:
         return "REVISAR", "Data de pagamento não identificada."
     by_due = bool(due and payment < due)
-    by_emission = bool(emission and payment < emission and date_competence(payment) < date_competence(emission))
+    if not emission:
+        if by_due:
+            return "ANTECIPACAO_VENCIMENTO", "Pagamento realizado antes do vencimento; confira a emissão da nota."
+        return "REVISAR_EMISSAO", "Data de emissão não identificada; não foi possível comparar com o pagamento."
+    by_emission = bool(emission and payment < emission)
     if by_due and by_emission:
-        return "ANTECIPACAO_AMBAS_CONDICOES", "Pagamento antes do vencimento e em competência anterior à emissão."
+        return "ANTECIPACAO_EMISSAO_E_VENCIMENTO", "Pagamento realizado antes da emissão da nota e antes do vencimento."
+    if by_emission:
+        return "ANTECIPACAO_EMISSAO", "Pagamento realizado antes da emissão da nota."
     if by_due:
         return "ANTECIPACAO_VENCIMENTO", "Pagamento realizado antes do vencimento."
-    if by_emission:
-        return "ANTECIPACAO_EMISSAO_MES_SEGUINTE", "Pagamento realizado em competência anterior à emissão."
     return "NORMAL", "Nenhuma condição de antecipação identificada."
 
 
@@ -150,11 +187,13 @@ def invoice_generation_decision(payment_type: str) -> tuple[bool, str, str]:
         return False, "REVISAR_EXTRATO", "Depósito/transferência precisa ser conferido com o extrato antes de gerar lançamento."
     if payment_type == "BOLETO":
         return False, "REVISAR_BOLETO", "Boleto precisa ser conferido com o recebimento bancário antes de gerar lançamento."
+    if payment_type == "PAGAMENTO_DIVIDIDO":
+        return False, "REVISAR_PAGAMENTO_DIVIDIDO", "Pagamento dividido precisa ser lançado por forma de pagamento."
     return False, "REVISAR", "Forma de pagamento não identificada com segurança."
 
 
 def invoice_uses_anticipation_entries(classification: str, generates: bool) -> bool:
-    return generates and classification in INVOICE_INTER_COMPETENCE_ANTICIPATIONS
+    return generates and classification in INVOICE_CLEARING_ANTICIPATIONS
 
 
 def enrich_invoice_data(data: dict, emission: date | None, total: Decimal | None) -> dict:
@@ -197,9 +236,11 @@ def enrich_invoice_data(data: dict, emission: date | None, total: Decimal | None
         "data_vencimento": due.isoformat() if due else "",
         "data_pagamento": payment.isoformat() if payment else "",
         "tipo_pagamento": payment_type,
+        "tipo_pagamento_label": invoice_payment_type_label(payment_type),
         "tipo_pagamento_original": payment_original,
         "forma_pagamento": payment_original or payment_type,
         "classificacao_antecipacao": classification,
+        "classificacao_antecipacao_label": invoice_anticipation_label(classification),
         "motivo_antecipacao": reason,
         "gera_lancamento": generates,
         "destino_lancamento": destination,
@@ -217,7 +258,10 @@ def view_file(arquivo_id: str, db: Session = Depends(get_db)):
     record = db.get(Arquivo, arquivo_id)
     if not record or not Path(record.caminho).is_file():
         raise HTTPException(404, "Documento original não encontrado")
-    return FileResponse(Path(record.caminho), media_type="application/pdf", headers={"Content-Disposition": f'inline; filename="{record.nome_original}"'})
+    suffix = Path(record.caminho).suffix.lower()
+    media_type = "text/csv; charset=utf-8" if suffix == ".csv" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if suffix in {".xlsx", ".xlsm"} else "application/pdf"
+    disposition = "attachment" if suffix in {".xlsx", ".xlsm", ".csv"} else "inline"
+    return FileResponse(Path(record.caminho), media_type=media_type, headers={"Content-Disposition": f'{disposition}; filename="{record.nome_original}"'})
 
 
 @router.delete("/arquivos/{arquivo_id}", status_code=204)
@@ -302,6 +346,7 @@ class RegraFonteInput(BaseModel):
     historico: str
     complemento: str = ""
     escopo: str = "global"
+    tipo_componente: str = "PRINCIPAL"
 
 
 class ContaBancariaInput(BaseModel):
@@ -1021,10 +1066,17 @@ def receipt_match_criterion(movement_text: str, receipt: Comprovante, movement_d
         return "código Caixa sem prefixo do dia"
     if movement_document and receipt.numero_documento and document_numbers_overlap(movement_document, receipt.numero_documento):
         return "número do documento"
+    if is_loan_receipt(receipt) and loan_statement_operation_matches(movement_text):
+        return "lançamento de empréstimo"
     for field, label in ((receipt.beneficiario or receipt.favorecido, "beneficiário"), (receipt.beneficiario_final, "beneficiário final"), (receipt.nome_fantasia, "nome fantasia")):
         if field and receipt_matches_movement(movement_text, field):
             return label
     return ""
+
+
+def loan_statement_operation_matches(value: str) -> bool:
+    normalized = normalize_name(value)
+    return bool(re.search(r"\b(?:CAP GIRO|AMORTIZACAO|EMPRESTIMO|FINANCIAMENTO|PARCELA|CONTRATO|OPERACAO|CREDITO RURAL|COMERCIAL)\b", normalized))
 
 
 def movement_document_number(movement: MovimentoExtrato) -> str:
@@ -1369,7 +1421,7 @@ def source_rule_bank(reconciliation: Conciliacao, source: str) -> str:
 
 
 def source_rule_text(row) -> str:
-    return " ".join(str(value or "") for value in [row.texto, row.documento, getattr(row, "forma_pagamento", ""), getattr(row, "servico", "")]).strip()
+    return " ".join(str(value or "") for value in [row.texto, row.documento, getattr(row, "forma_pagamento", ""), getattr(row, "servico", ""), getattr(row, "tipo_lancamento_label", "")]).strip()
 
 
 def invoice_metadata(item: NotaFiscal) -> dict:
@@ -1387,41 +1439,38 @@ def invoice_payment_value(item: NotaFiscal, data: dict) -> Decimal | None:
 
 def invoice_generation_label(data: dict) -> str:
     if not data.get("gera_lancamento"):
+        destination = str(data.get("destino_lancamento") or "")
+        if destination == "EXTRATO_BANCARIO":
+            return "Via extrato"
+        if destination == "REVISAR":
+            return "Aguardando forma"
+        if destination in {"REVISAR_EXTRATO", "REVISAR_BOLETO"}:
+            return "Conferir"
         return "Não"
     if data.get("modo_lancamento") == "ANTECIPACAO_CLIENTES":
         return "Antecipação + baixa"
     return "Sim"
 
 
+def invoice_destination_label(value: str) -> str:
+    return {
+        "PRINCIPAL": "Principal",
+        "CARTAO": "Cartão",
+        "CAIXA": "Caixa",
+        "EXTRATO_BANCARIO": "Extrato bancário",
+        "REVISAR_EXTRATO": "Revisar extrato",
+        "REVISAR_BOLETO": "Revisar boleto",
+        "REVISAR_PAGAMENTO_DIVIDIDO": "Pagamento dividido",
+        "REVISAR": "Revisar",
+        "ANTECIPACAO_CLIENTES": "Antecipação de clientes",
+        "BAIXA_ANTECIPACAO": "Baixa da antecipação",
+    }.get(value or "", value or "—")
+
+
 def source_note_csv_rows(row, rule: RegraContabil) -> list[list[str]]:
     value = f"{Decimal(row.valor or 0):.2f}"
     payment_type = getattr(row, "tipo_pagamento", "") or ""
     complement = rule.complemento
-    if getattr(row, "modo_lancamento", "") == "ANTECIPACAO_CLIENTES":
-        payment_date = getattr(row, "data_pagamento", None) or getattr(row, "data", None)
-        emission_date = getattr(row, "data_emissao", None) or getattr(row, "data", None)
-        return [
-            [
-                payment_date.strftime("%d/%m/%Y") if payment_date else "",
-                accounting_code(rule.conta_debito),
-                accounting_code(INVOICE_ANTICIPATION_ACCOUNT),
-                accounting_code(INVOICE_ANTICIPATION_HISTORY),
-                value,
-                f"{complement} - antecipação" if complement else "Antecipação de cliente",
-                payment_type,
-                "ANTECIPACAO_CLIENTES",
-            ],
-            [
-                emission_date.strftime("%d/%m/%Y") if emission_date else "",
-                accounting_code(INVOICE_ANTICIPATION_ACCOUNT),
-                accounting_code(rule.conta_credito),
-                accounting_code(INVOICE_ANTICIPATION_CLEARING_HISTORY),
-                value,
-                f"{complement} - baixa da antecipação" if complement else "Baixa da antecipação de cliente",
-                payment_type,
-                "BAIXA_ANTECIPACAO",
-            ],
-        ]
     return [[
         row.data.strftime("%d/%m/%Y") if row.data else "",
         accounting_code(rule.conta_debito),
@@ -1430,8 +1479,39 @@ def source_note_csv_rows(row, rule: RegraContabil) -> list[list[str]]:
         value,
         complement,
         payment_type,
-        getattr(row, "destino_lancamento", "") or "",
+        getattr(row, "tipo_lancamento", "") if getattr(row, "tipo_lancamento", "") in {"ANTECIPACAO_CLIENTES", "BAIXA_ANTECIPACAO"} else getattr(row, "destino_lancamento", "") or "",
     ]]
+
+
+def note_source_row(item: NotaFiscal, data: dict, row_id: str, row_date: date | None, component: str, label: str, value: Decimal | None):
+    return SimpleNamespace(
+        id=row_id,
+        data=row_date,
+        data_emissao=item.data_emissao,
+        data_vencimento=iso_date(data.get("data_vencimento")),
+        data_pagamento=iso_date(data.get("data_pagamento")),
+        texto=item.fornecedor,
+        documento=item.numero_nota,
+        valor=value,
+        arquivo_id=item.arquivo_id,
+        pagina=item.pagina_numero,
+        forma_pagamento=data.get("forma_pagamento", ""),
+        tipo_pagamento=data.get("tipo_pagamento", ""),
+        tipo_pagamento_label=data.get("tipo_pagamento_label", ""),
+        classificacao_antecipacao=data.get("classificacao_antecipacao", "REVISAR"),
+        classificacao_antecipacao_label=data.get("classificacao_antecipacao_label", "Revisar"),
+        motivo_antecipacao=data.get("motivo_antecipacao", ""),
+        gera_lancamento=bool(data.get("gera_lancamento")),
+        destino_lancamento=data.get("destino_lancamento", ""),
+        modo_lancamento=data.get("modo_lancamento", ""),
+        linhas_csv=1 if data.get("gera_lancamento") else 0,
+        conta_antecipacao=data.get("conta_antecipacao", ""),
+        motivo_nao_geracao=data.get("motivo_nao_geracao", ""),
+        servico=data.get("servico", ""),
+        tipo_lancamento=component,
+        tipo_lancamento_label=label,
+        fonte="nota",
+    )
 
 
 def independent_source_rows(reconciliation: Conciliacao, source: str, db: Session) -> list[SimpleNamespace]:
@@ -1460,30 +1540,12 @@ def independent_source_rows(reconciliation: Conciliacao, source: str, db: Sessio
             row_date = invoice_display_date(item, data)
             if not item.valor_total or (row_date and not (reconciliation.data_inicio <= row_date <= reconciliation.data_fim)):
                 continue
-            rows.append(SimpleNamespace(
-                id=item.id,
-                data=row_date,
-                data_emissao=item.data_emissao,
-                data_vencimento=iso_date(data.get("data_vencimento")),
-                data_pagamento=iso_date(data.get("data_pagamento")),
-                texto=item.fornecedor,
-                documento=item.numero_nota,
-                valor=invoice_payment_value(item, data),
-                arquivo_id=item.arquivo_id,
-                pagina=item.pagina_numero,
-                forma_pagamento=data.get("forma_pagamento", ""),
-                tipo_pagamento=data.get("tipo_pagamento", ""),
-                classificacao_antecipacao=data.get("classificacao_antecipacao", "REVISAR"),
-                motivo_antecipacao=data.get("motivo_antecipacao", ""),
-                gera_lancamento=bool(data.get("gera_lancamento")),
-                destino_lancamento=data.get("destino_lancamento", ""),
-                modo_lancamento=data.get("modo_lancamento", ""),
-                linhas_csv=int(data.get("linhas_csv") or 0),
-                conta_antecipacao=data.get("conta_antecipacao", ""),
-                motivo_nao_geracao=data.get("motivo_nao_geracao", ""),
-                servico=data.get("servico", ""),
-                fonte="nota",
-            ))
+            value = invoice_payment_value(item, data)
+            if data.get("modo_lancamento") == "ANTECIPACAO_CLIENTES":
+                rows.append(note_source_row(item, data, f"{item.id}:antecipacao", iso_date(data.get("data_pagamento")) or row_date, "ANTECIPACAO_CLIENTES", "Antecipação", value))
+                rows.append(note_source_row(item, data, f"{item.id}:baixa_antecipacao", item.data_emissao or row_date, "BAIXA_ANTECIPACAO", "Baixa da antecipação", value))
+            else:
+                rows.append(note_source_row(item, data, item.id, row_date, "PRINCIPAL", invoice_generation_label(data), value))
     else:
         raise HTTPException(404, "Fonte de regras não encontrada")
     return sorted(rows, key=lambda item: (item.data or date.max, item.texto or "", item.id))
@@ -1499,6 +1561,8 @@ def source_rules_for(reconciliation: Conciliacao, source: str, db: Session) -> l
 
 
 def source_rule_matches(rule: RegraContabil, row) -> bool:
+    if getattr(row, "tipo_lancamento", "PRINCIPAL") != (rule.tipo_componente or "PRINCIPAL"):
+        return False
     return trigger_matches(source_rule_text(row), rule.favorecido_normalizado)
 
 
@@ -1511,6 +1575,8 @@ def source_rule_payload(rule: RegraContabil, rows: list[SimpleNamespace]) -> dic
         "conta_credito": rule.conta_credito,
         "historico": rule.historico,
         "complemento": rule.complemento,
+        "tipo_componente": rule.tipo_componente or "PRINCIPAL",
+        "tipo_componente_label": invoice_destination_label(rule.tipo_componente) if rule.tipo_fonte == "nota" else rule.tipo_componente or "Principal",
         "escopo": rule.escopo,
         "criada_em": rule.created_at.isoformat() if rule.created_at else "",
         "cobertos": len(covered),
@@ -1528,14 +1594,23 @@ def source_rule_match_payload(row, rule: RegraContabil | None = None) -> dict:
         "documento": row.documento or "—",
         "forma_pagamento": getattr(row, "forma_pagamento", "") or "—",
         "tipo_pagamento": getattr(row, "tipo_pagamento", "") or "NAO_IDENTIFICADO",
+        "tipo_pagamento_label": getattr(row, "tipo_pagamento_label", "") or invoice_payment_type_label(getattr(row, "tipo_pagamento", "")),
         "classificacao_antecipacao": getattr(row, "classificacao_antecipacao", "") or "REVISAR",
+        "classificacao_antecipacao_label": getattr(row, "classificacao_antecipacao_label", "") or invoice_anticipation_label(getattr(row, "classificacao_antecipacao", "")),
         "motivo_antecipacao": getattr(row, "motivo_antecipacao", "") or "",
-        "gera_lancamento": "Antecipação + baixa" if getattr(row, "modo_lancamento", "") == "ANTECIPACAO_CLIENTES" else ("Sim" if getattr(row, "gera_lancamento", True) else "Não"),
+        "gera_lancamento": "Antecipação + baixa" if getattr(row, "modo_lancamento", "") == "ANTECIPACAO_CLIENTES" else ("Sim" if getattr(row, "gera_lancamento", True) else invoice_generation_label({
+            "gera_lancamento": False,
+            "destino_lancamento": getattr(row, "destino_lancamento", ""),
+        })),
         "destino_lancamento": getattr(row, "destino_lancamento", "") or "—",
+        "destino_lancamento_label": invoice_destination_label(getattr(row, "destino_lancamento", "")),
         "modo_lancamento": getattr(row, "modo_lancamento", "") or "—",
+        "modo_lancamento_label": invoice_destination_label(getattr(row, "modo_lancamento", "")),
         "linhas_csv": str(getattr(row, "linhas_csv", "") or ""),
         "conta_antecipacao": getattr(row, "conta_antecipacao", "") or "—",
         "motivo_nao_geracao": getattr(row, "motivo_nao_geracao", "") or "",
+        "tipo_lancamento": getattr(row, "tipo_lancamento", "") or "PRINCIPAL",
+        "tipo_lancamento_label": getattr(row, "tipo_lancamento_label", "") or "Principal",
         "valor": str(row.valor or 0),
         "arquivo_id": row.arquivo_id,
         "pagina": row.pagina,
@@ -1544,6 +1619,8 @@ def source_rule_match_payload(row, rule: RegraContabil | None = None) -> dict:
         "conta_credito": rule.conta_credito if rule else "",
         "historico_contabil": rule.historico if rule else "",
         "complemento": rule.complemento if rule else "",
+        "tipo_componente": rule.tipo_componente if rule else getattr(row, "tipo_lancamento", "PRINCIPAL"),
+        "tipo_componente_label": invoice_destination_label(rule.tipo_componente) if rule and rule.tipo_fonte == "nota" else getattr(row, "tipo_lancamento_label", "Principal"),
     }
 
 
@@ -1572,7 +1649,7 @@ def preview_source_accounting_rule(conciliacao_id: str, fonte: str, payload: Reg
     if fonte not in SOURCE_RULES:
         raise HTTPException(404, "Fonte de regras não encontrada")
     reconciliation = reconciliation_or_404(conciliacao_id, db)
-    rule = RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco=source_rule_bank(reconciliation, fonte), tipo_fonte=fonte, tipo_operacao="Débito", tipo_componente="PRINCIPAL", favorecido_normalizado=normalize_name(payload.gatilho))
+    rule = RegraContabil(cliente_id=reconciliation.cliente_id, conciliacao_id=reconciliation.id, banco=source_rule_bank(reconciliation, fonte), tipo_fonte=fonte, tipo_operacao="Débito", tipo_componente=payload.tipo_componente or "PRINCIPAL", favorecido_normalizado=normalize_name(payload.gatilho))
     matches = [source_rule_match_payload(row) for row in independent_source_rows(reconciliation, fonte, db) if source_rule_matches(rule, row)]
     return {"quantidade": len(matches), "lancamentos": matches, "motivo": "Nenhum registro corresponde ao gatilho informado." if not matches else ""}
 
@@ -1587,7 +1664,8 @@ def create_source_accounting_rule(conciliacao_id: str, fonte: str, payload: Regr
     rows = independent_source_rows(reconciliation, fonte, db)
     bank = source_rule_bank(reconciliation, fonte)
     normalized_trigger = normalize_name(payload.gatilho)
-    if any(rule.favorecido_normalizado == normalized_trigger for rule in source_rules_for(reconciliation, fonte, db)):
+    component = payload.tipo_componente or "PRINCIPAL"
+    if any(rule.favorecido_normalizado == normalized_trigger and (rule.tipo_componente or "PRINCIPAL") == component for rule in source_rules_for(reconciliation, fonte, db)):
         raise HTTPException(409, "Já existe uma regra equivalente nesta aba")
     rule = RegraContabil(
         cliente_id=reconciliation.cliente_id,
@@ -1595,7 +1673,7 @@ def create_source_accounting_rule(conciliacao_id: str, fonte: str, payload: Regr
         banco=bank,
         tipo_fonte=fonte,
         tipo_operacao="Débito",
-        tipo_componente="PRINCIPAL",
+        tipo_componente=component,
         favorecido_normalizado=normalized_trigger,
         conta_debito=payload.conta_debito.strip(),
         conta_credito=payload.conta_credito.strip(),
@@ -2262,25 +2340,28 @@ def accounting_pdf(conciliacao_id: str, db: Session = Depends(get_db)):
 
 @router.post("/conciliacoes/{conciliacao_id}/arquivos")
 def upload(conciliacao_id: str, tipo_documento: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    if tipo_documento not in DOCUMENT_TYPES or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(422, "Envie um PDF com tipo de documento válido")
+    filename = file.filename or ""
+    suffix = Path(filename).suffix.lower()
+    is_loan_spreadsheet = tipo_documento == LOAN_DOCUMENT_TYPE and suffix in {".xlsx", ".xlsm", ".csv"}
+    if tipo_documento not in DOCUMENT_TYPES or not (suffix == ".pdf" or is_loan_spreadsheet):
+        raise HTTPException(422, "Envie um PDF com tipo de documento válido; para empréstimos/financiamentos também aceitamos XLSX ou CSV")
     reconciliation = db.get(Conciliacao, conciliacao_id)
     if not reconciliation:
         raise HTTPException(404, "Conciliação não encontrada")
     reset_reconciliation(conciliacao_id, db)
     destination = UPLOAD_DIR / conciliacao_id
     destination.mkdir(parents=True, exist_ok=True)
-    path = destination / f"{uuid4()}.pdf"
+    path = destination / f"{uuid4()}{suffix or '.pdf'}"
     with path.open("wb") as output:
         shutil.copyfileobj(file.file, output)
-    record = Arquivo(conciliacao_id=conciliacao_id, tipo_documento=tipo_documento, banco_selecionado=reconciliation.banco, nome_original=file.filename, caminho=str(path))
+    record = Arquivo(conciliacao_id=conciliacao_id, tipo_documento=tipo_documento, banco_selecionado=reconciliation.banco, nome_original=filename, caminho=str(path))
     db.add(record); db.commit(); db.refresh(record)
     try:
-        pages, extracted = extract_statement_document(path, reconciliation.banco, tipo_documento) if tipo_documento == "extrato" else (extract_pdf_pages(path, reconciliation.banco, tipo_documento), [])
+        pages, extracted = extract_loan_spreadsheet(path) if is_loan_spreadsheet else extract_statement_document(path, reconciliation.banco, tipo_documento) if tipo_documento == "extrato" else (extract_pdf_pages(path, reconciliation.banco, tipo_documento), [])
         record.texto_bruto = "\n\f\n".join(pages); record.paginas = len(pages)
         for number, page_text in enumerate(pages, 1):
             parsed_rfb = parse_rfb_page(page_text, number) if tipo_documento == "rfb" else None
-            if tipo_documento != "extrato":
+            if tipo_documento != "extrato" and not is_loan_spreadsheet:
                 extracted.extend([parsed_rfb] if parsed_rfb else [] if tipo_documento == "rfb" else extract_invoices(page_text, number) if tipo_documento == INVOICE_DOCUMENT_TYPE else extract_loan_receipts(page_text, number) if tipo_documento == LOAN_DOCUMENT_TYPE else extract_receipts(page_text, number))
         if tipo_documento == "extrato" and reconciliation.banco == "Banco do Brasil":
             extracted = deduplicate_statement_records(extracted)
@@ -2377,9 +2458,12 @@ def reprocess_document(arquivo_id: str, db: Session = Depends(get_db)):
     model = MovimentoExtrato if record.tipo_documento == "extrato" else Comprovante if record.tipo_documento in RECEIPT_DOCUMENT_TYPES else NotaFiscal if record.tipo_documento == INVOICE_DOCUMENT_TYPE else ComprovanteRfb
     db.query(model).filter_by(arquivo_id=record.id).delete()
     pages = (record.texto_bruto or "").split("\n\f\n")
+    is_loan_spreadsheet = record.tipo_documento == LOAN_DOCUMENT_TYPE and Path(record.caminho).suffix.lower() in {".xlsx", ".xlsm", ".csv"}
     if Path(record.caminho).is_file():
         try:
-            if record.tipo_documento == "extrato":
+            if is_loan_spreadsheet:
+                pages, extracted = extract_loan_spreadsheet(Path(record.caminho))
+            elif record.tipo_documento == "extrato":
                 pages, extracted = extract_statement_document(Path(record.caminho), record.banco_selecionado, record.tipo_documento)
             else:
                 pdf_pages = extract_pdf_pages(Path(record.caminho), record.banco_selecionado, record.tipo_documento)
@@ -2399,7 +2483,7 @@ def reprocess_document(arquivo_id: str, db: Session = Depends(get_db)):
     record.texto_bruto = "\n\f\n".join(pages); record.paginas = len(pages)
     for number, page_text in enumerate(pages, 1):
         parsed_rfb = parse_rfb_page(page_text, number) if record.tipo_documento == "rfb" else None
-        if record.tipo_documento != "extrato":
+        if record.tipo_documento != "extrato" and not is_loan_spreadsheet:
             extracted.extend([parsed_rfb] if parsed_rfb else [] if record.tipo_documento == "rfb" else extract_invoices(page_text, number) if record.tipo_documento == INVOICE_DOCUMENT_TYPE else extract_loan_receipts(page_text, number) if record.tipo_documento == LOAN_DOCUMENT_TYPE else extract_receipts(page_text, number))
     if record.tipo_documento == "extrato" and record.banco_selecionado == "Banco do Brasil":
         extracted = deduplicate_statement_records(extracted)
@@ -2747,12 +2831,14 @@ def review(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPI
             "cpf_cnpj": x.cpf_cnpj or "—",
             "numero_nota": x.numero_nota or "—",
             "forma_pagamento": invoice_metadata(x).get("forma_pagamento", "—"),
-            "tipo_pagamento": invoice_metadata(x).get("tipo_pagamento", "NAO_IDENTIFICADO"),
-            "classificacao": invoice_metadata(x).get("classificacao_antecipacao", "REVISAR"),
+            "tipo_pagamento": invoice_metadata(x).get("tipo_pagamento_label", "Não identificado"),
+            "tipo_pagamento_label": invoice_metadata(x).get("tipo_pagamento_label", "Não identificado"),
+            "classificacao": invoice_metadata(x).get("classificacao_antecipacao_label", "Revisar"),
+            "classificacao_label": invoice_metadata(x).get("classificacao_antecipacao_label", "Revisar"),
             "motivo": invoice_metadata(x).get("motivo_antecipacao", ""),
             "gera_csv": invoice_generation_label(invoice_metadata(x)),
-            "destino": invoice_metadata(x).get("destino_lancamento", "—"),
-            "modo_lancamento": invoice_metadata(x).get("modo_lancamento", "—"),
+            "destino": invoice_destination_label(invoice_metadata(x).get("destino_lancamento", "")),
+            "modo_lancamento": invoice_destination_label(invoice_metadata(x).get("modo_lancamento", "")),
             "linhas_csv": str(invoice_metadata(x).get("linhas_csv", "")),
             "conta_antecipacao": invoice_metadata(x).get("conta_antecipacao", "—"),
             "motivo_nao_geracao": invoice_metadata(x).get("motivo_nao_geracao", ""),

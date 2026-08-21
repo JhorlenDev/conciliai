@@ -621,6 +621,34 @@ def test_loan_document_matches_statement_by_contract_and_creates_components():
     assert all("Comprovante de empréstimo/financiamento" in item["composicao_simples"] for item in loan_pending)
 
 
+def test_loan_document_matches_statement_by_loan_operation_when_contract_is_missing():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    reconciliation = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    session.add(reconciliation); session.flush()
+    statement_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="extrato", banco_selecionado="Banco do Brasil", nome_original="extrato.pdf", caminho="/tmp/extrato.pdf")
+    loan_file = Arquivo(conciliacao_id=reconciliation.id, tipo_documento="emprestimo", banco_selecionado="Banco do Brasil", nome_original="emprestimo.xlsx", caminho="/tmp/emprestimo.xlsx")
+    session.add_all([statement_file, loan_file]); session.flush()
+    movement = MovimentoExtrato(conciliacao_id=reconciliation.id, arquivo_id=statement_file.id, pagina_numero=1, data=date(2024, 1, 15), historico="13128 500 Cap Giro Dig Amortização", valor=Decimal("2817.00"), natureza="Débito")
+    loan = Comprovante(conciliacao_id=reconciliation.id, arquivo_id=loan_file.id, pagina_numero=1, data=date(2024, 1, 15), favorecido="Empréstimo/Financiamento 057.709.569", beneficiario="Empréstimo/Financiamento 057.709.569", numero_documento="057.709.569", valor=Decimal("2817.00"), valor_original=Decimal("2083.33"), valor_juros=Decimal("733.67"), valor_pago=Decimal("2817.00"), tipo_operacao="EMPRESTIMO")
+    session.add_all([movement, loan]); session.commit()
+
+    reconcile(reconciliation.id, session)
+
+    match = session.query(Correspondencia).filter_by(movimento_extrato_id=movement.id).one()
+    assert match.comprovante_id == loan.id
+    assert match.criterio_correspondencia == "Correspondência pelo lançamento de empréstimo"
+    rows = result(reconciliation.id, session)
+    assert rows[0]["natureza"] == "Débito"
+    assert rows[0]["natureza_contabil"] == "Crédito"
+    rules = accounting_rules(reconciliation.id, session)
+    loan_pending = [item for item in rules["pendentes"] if item["comprovante_tipo"] == "emprestimo"]
+    assert {item["tipo_componente"] for item in loan_pending} == {"PRINCIPAL", "JUROS"}
+
+
 def test_invoice_rules_are_independent_and_export_own_csv():
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
@@ -648,13 +676,14 @@ def test_invoice_rules_are_independent_and_export_own_csv():
     ("emission", "due", "payment", "expected"),
     [
         (date(2024, 1, 10), date(2024, 1, 10), date(2024, 1, 10), "NORMAL"),
-        (date(2024, 1, 10), date(2024, 1, 10), date(2024, 1, 8), "ANTECIPACAO_VENCIMENTO"),
+        (date(2024, 1, 10), date(2024, 1, 10), date(2024, 1, 8), "ANTECIPACAO_EMISSAO_E_VENCIMENTO"),
         (date(2024, 1, 10), date(2024, 1, 10), date(2024, 1, 12), "NORMAL"),
-        (date(2024, 1, 31), None, date(2024, 1, 30), "NORMAL"),
-        (date(2024, 2, 1), None, date(2024, 1, 31), "ANTECIPACAO_EMISSAO_MES_SEGUINTE"),
-        (date(2027, 1, 2), None, date(2026, 12, 31), "ANTECIPACAO_EMISSAO_MES_SEGUINTE"),
-        (date(2024, 2, 1), date(2024, 2, 5), date(2024, 1, 31), "ANTECIPACAO_AMBAS_CONDICOES"),
+        (date(2024, 1, 31), None, date(2024, 1, 30), "ANTECIPACAO_EMISSAO"),
+        (date(2024, 2, 1), None, date(2024, 1, 31), "ANTECIPACAO_EMISSAO"),
+        (date(2027, 1, 2), None, date(2026, 12, 31), "ANTECIPACAO_EMISSAO"),
+        (date(2024, 2, 1), date(2024, 2, 5), date(2024, 1, 31), "ANTECIPACAO_EMISSAO_E_VENCIMENTO"),
         (None, date(2024, 1, 5), date(2024, 1, 3), "ANTECIPACAO_VENCIMENTO"),
+        (date(2024, 1, 1), date(2024, 1, 10), date(2024, 1, 5), "ANTECIPACAO_VENCIMENTO"),
         (date(2024, 1, 5), date(2024, 1, 10), None, "REVISAR"),
     ],
 )
@@ -673,6 +702,8 @@ def test_invoice_anticipation_classification_matrix(emission, due, payment, expe
         ("Deposito bancário", "DEPOSITO", False, "REVISAR_EXTRATO"),
         ("TED", "TRANSFERENCIA", False, "REVISAR_EXTRATO"),
         ("Boleto", "BOLETO", False, "REVISAR_BOLETO"),
+        ("Pagamento à vista", "DINHEIRO", True, "CAIXA"),
+        ("Pagamento dividido", "PAGAMENTO_DIVIDIDO", False, "REVISAR_PAGAMENTO_DIVIDIDO"),
         ("", "NAO_IDENTIFICADO", False, "REVISAR"),
     ],
 )
@@ -705,11 +736,13 @@ def test_invoice_csv_generates_card_and_skips_pix_to_avoid_duplicate_statement_e
     csv = source_accounting_csv(reconciliation.id, "nota", session).body.decode("utf-8-sig")
 
     assert data["resumo"] == {"total": 2, "classificados": 2, "pendentes": 0}
+    pix_row = next(item for item in data["classificados"] if item["texto"] == "CLIENTE PIX")
+    assert pix_row["gera_lancamento"] == "Via extrato"
     assert "CLIENTE PIX" not in csv
     assert "112;311;Venda nota;300.00;Conforme nota;CARTAO_CREDITO;CARTAO" in csv
 
 
-def test_invoice_csv_opens_and_clears_customer_anticipation_between_competences():
+def test_invoice_anticipation_creates_separate_rule_rows_and_csv_entries():
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine)()
@@ -736,11 +769,26 @@ def test_invoice_csv_opens_and_clears_customer_anticipation_between_competences(
     ))
     session.commit()
 
-    create_source_accounting_rule(reconciliation.id, "nota", RegraFonteInput(gatilho="cliente antecipado", conta_debito="112 - Cartões", conta_credito="311 - Receita", historico="Venda nota", complemento="NF 55"), session)
+    initial = source_accounting_rules(reconciliation.id, "nota", session)
+    assert initial["resumo"] == {"total": 2, "classificados": 0, "pendentes": 2}
+    assert {item["tipo_lancamento_label"] for item in initial["pendentes"]} == {"Antecipação", "Baixa da antecipação"}
+
+    create_source_accounting_rule(
+        reconciliation.id,
+        "nota",
+        RegraFonteInput(gatilho="cliente antecipado", tipo_componente="ANTECIPACAO_CLIENTES", conta_debito="112 - Cartões", conta_credito="232 - Antecipação de clientes", historico="Antecipação de clientes", complemento="NF 55 - antecipação"),
+        session,
+    )
+    create_source_accounting_rule(
+        reconciliation.id,
+        "nota",
+        RegraFonteInput(gatilho="cliente antecipado", tipo_componente="BAIXA_ANTECIPACAO", conta_debito="232 - Antecipação de clientes", conta_credito="311 - Receita", historico="Baixa da antecipação", complemento="NF 55 - baixa"),
+        session,
+    )
     data = source_accounting_rules(reconciliation.id, "nota", session)
     csv = source_accounting_csv(reconciliation.id, "nota", session).body.decode("utf-8-sig")
 
-    assert data["classificados"][0]["gera_lancamento"] == "Antecipação + baixa"
-    assert data["classificados"][0]["linhas_csv"] == "2"
-    assert "31/01/2024;112;Antecipação de clientes;Antecipação de clientes;450.00;NF 55 - antecipação;CARTAO_CREDITO;ANTECIPACAO_CLIENTES" in csv
-    assert "01/02/2024;Antecipação de clientes;311;Baixa da antecipação de clientes;450.00;NF 55 - baixa da antecipação;CARTAO_CREDITO;BAIXA_ANTECIPACAO" in csv
+    assert data["resumo"] == {"total": 2, "classificados": 2, "pendentes": 0}
+    assert {item["tipo_lancamento_label"] for item in data["classificados"]} == {"Antecipação", "Baixa da antecipação"}
+    assert "31/01/2024;112;232;Antecipação de clientes;450.00;NF 55 - antecipação;CARTAO_CREDITO;ANTECIPACAO_CLIENTES" in csv
+    assert "01/02/2024;232;311;Baixa da antecipação;450.00;NF 55 - baixa;CARTAO_CREDITO;BAIXA_ANTECIPACAO" in csv

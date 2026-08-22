@@ -215,6 +215,7 @@ class RegraContabilExcecao(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     regra_contabil_id: Mapped[str] = mapped_column(ForeignKey("regras_contabeis.id"), index=True)
     conciliacao_id: Mapped[str] = mapped_column(ForeignKey("conciliacoes.id"), index=True)
+    origem: Mapped[str] = mapped_column(String(30), default="manual")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

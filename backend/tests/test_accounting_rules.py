@@ -871,6 +871,59 @@ def test_hidden_rule_with_new_coverage_can_be_restored_in_bulk():
     assert response["regras"]["salvas"][0]["cobertos"] == 1
 
 
+def test_auto_hidden_rule_with_new_coverage_is_restored_automatically():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    january = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    february = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 2, 1), data_fim=date(2024, 2, 29))
+    session.add_all([january, february]); session.flush()
+    january_file = Arquivo(conciliacao_id=january.id, tipo_documento="extrato", banco_selecionado=january.banco, nome_original="jan.pdf", caminho="/tmp/jan.pdf")
+    february_file = Arquivo(conciliacao_id=february.id, tipo_documento="extrato", banco_selecionado=february.banco, nome_original="fev.pdf", caminho="/tmp/fev.pdf")
+    session.add_all([january_file, february_file]); session.flush()
+    session.add(MovimentoExtrato(conciliacao_id=january.id, arquivo_id=january_file.id, pagina_numero=1, data=date(2024, 1, 5), historico="TARIFA PIX ENVIADO", valor=Decimal("1.00"), natureza="Débito"))
+    session.commit()
+    created = create_accounting_rule(january.id, rule_input("TARIFA PIX ENVIADO", scope="global"), session)
+    session.add(RegraContabilExcecao(regra_contabil_id=created["id"], conciliacao_id=february.id, origem="auto_zero"))
+    session.add(MovimentoExtrato(conciliacao_id=february.id, arquivo_id=february_file.id, pagina_numero=1, data=date(2024, 2, 1), historico="13113 258 Tarifa Pix Enviado Tar. agrupadas ocorrencia 01 02 2024", valor=Decimal("1.23"), natureza="Débito"))
+    session.commit()
+
+    data = accounting_rules(february.id, session)
+
+    assert session.query(RegraContabilExcecao).filter_by(regra_contabil_id=created["id"], conciliacao_id=february.id).count() == 0
+    assert data["pendentes"] == []
+    assert data["salvas"][0]["gatilho"] == "TARIFA PIX ENVIADO"
+    assert data["salvas"][0]["cobertos"] == 1
+
+
+def test_manually_hidden_rule_with_coverage_stays_hidden():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.flush()
+    january = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31))
+    february = Conciliacao(cliente_id=client.id, banco="Banco do Brasil", data_inicio=date(2024, 2, 1), data_fim=date(2024, 2, 29))
+    session.add_all([january, february]); session.flush()
+    january_file = Arquivo(conciliacao_id=january.id, tipo_documento="extrato", banco_selecionado=january.banco, nome_original="jan.pdf", caminho="/tmp/jan.pdf")
+    february_file = Arquivo(conciliacao_id=february.id, tipo_documento="extrato", banco_selecionado=february.banco, nome_original="fev.pdf", caminho="/tmp/fev.pdf")
+    session.add_all([january_file, february_file]); session.flush()
+    session.add(MovimentoExtrato(conciliacao_id=january.id, arquivo_id=january_file.id, pagina_numero=1, data=date(2024, 1, 5), historico="TARIFA PIX ENVIADO", valor=Decimal("1.00"), natureza="Débito"))
+    session.commit()
+    created = create_accounting_rule(january.id, rule_input("TARIFA PIX ENVIADO", scope="global"), session)
+    session.add(RegraContabilExcecao(regra_contabil_id=created["id"], conciliacao_id=february.id, origem="manual"))
+    session.add(MovimentoExtrato(conciliacao_id=february.id, arquivo_id=february_file.id, pagina_numero=1, data=date(2024, 2, 1), historico="13113 258 Tarifa Pix Enviado Tar. agrupadas ocorrencia 01 02 2024", valor=Decimal("1.23"), natureza="Débito"))
+    session.commit()
+
+    data = accounting_rules(february.id, session)
+
+    assert session.query(RegraContabilExcecao).filter_by(regra_contabil_id=created["id"], conciliacao_id=february.id).count() == 1
+    assert data["salvas"] == []
+    assert data["ignoradas"][0]["id"] == created["id"]
+
+
 def test_deleting_a_rule_immediately_removes_its_value_from_reason():
     session, reconciliation, _ = rules_session()
     created = create_accounting_rule(reconciliation.id, rule_input(), session)

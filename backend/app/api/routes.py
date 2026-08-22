@@ -1203,6 +1203,23 @@ def current_bank_rules(reconciliation: Conciliacao, db: Session) -> list[RegraCo
     return [rule for rule in scoped_rules(reconciliation, db) if rule.banco == reconciliation.banco and rule.id not in ignored_rule_ids]
 
 
+def restore_auto_hidden_rules_with_coverage(reconciliation: Conciliacao, db: Session) -> int:
+    exceptions = db.query(RegraContabilExcecao).filter_by(conciliacao_id=reconciliation.id, origem="auto_zero").all()
+    rule_ids = [item.regra_contabil_id for item in exceptions]
+    rules_by_id = {item.id: item for item in db.query(RegraContabil).filter(RegraContabil.id.in_(rule_ids)).all()} if rule_ids else {}
+    restored = 0
+    for exception in exceptions:
+        rule = rules_by_id.get(exception.regra_contabil_id)
+        if not rule or not rule.ativo or rule.cliente_id != reconciliation.cliente_id or rule.banco != reconciliation.banco:
+            continue
+        if rule_preview(rule, reconciliation, db):
+            db.delete(exception)
+            restored += 1
+    if restored:
+        db.flush()
+    return restored
+
+
 def rule_period_exception(rule_id: str, reconciliation: Conciliacao, db: Session) -> RegraContabilExcecao | None:
     return db.query(RegraContabilExcecao).filter_by(regra_contabil_id=rule_id, conciliacao_id=reconciliation.id).first()
 
@@ -1325,6 +1342,7 @@ def accounting_integrity(reconciliation: Conciliacao, db: Session) -> dict:
 
 def apply_accounting_rules(reconciliation: Conciliacao, db: Session) -> int:
     """Create or update accounting entries without changing document matching links."""
+    restore_auto_hidden_rules_with_coverage(reconciliation, db)
     rules = current_bank_rules(reconciliation, db)
     applied = 0
     movements = accounting_rule_movements(reconciliation, db)
@@ -1737,6 +1755,10 @@ def source_accounting_csv(conciliacao_id: str, fonte: str, db: Session = Depends
 @router.get("/conciliacoes/{conciliacao_id}/regras-contabeis")
 def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPIResponse = None, auto_hide_zero_covered: bool = True):
     reconciliation = reconciliation_or_404(conciliacao_id, db)
+    restored_auto_hidden = restore_auto_hidden_rules_with_coverage(reconciliation, db)
+    if restored_auto_hidden:
+        apply_accounting_rules(reconciliation, db)
+        db.commit()
     movements = [item for item in db.query(MovimentoExtrato).filter_by(conciliacao_id=conciliacao_id, ativo=True) if movement_used_in_period(item) and in_reconciliation_period(reconciliation, item)]
     if reconciliation.banco == "Santander" and any(is_santander_getnet_credit(item) for item in movements):
         sync_getnet_anticipation_adjustments(reconciliation, db)
@@ -1846,7 +1868,7 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
         if zero_rule_ids:
             for rule_id in zero_rule_ids:
                 if not db.query(RegraContabilExcecao).filter_by(regra_contabil_id=rule_id, conciliacao_id=reconciliation.id).first():
-                    db.add(RegraContabilExcecao(regra_contabil_id=rule_id, conciliacao_id=reconciliation.id))
+                    db.add(RegraContabilExcecao(regra_contabil_id=rule_id, conciliacao_id=reconciliation.id, origem="auto_zero"))
             release_rule_entries(zero_rule_ids, db, reconciliation.id)
             db.commit()
             saved_payloads = [item for item in saved_payloads if item["id"] not in zero_rule_ids]
@@ -2042,7 +2064,7 @@ def ignore_rule_in_period(conciliacao_id: str, regra_id: str, db: Session = Depe
         raise HTTPException(404, "Regra não encontrada para este cliente e banco")
     try:
         if not db.query(RegraContabilExcecao).filter_by(regra_contabil_id=rule.id, conciliacao_id=reconciliation.id).first():
-            db.add(RegraContabilExcecao(regra_contabil_id=rule.id, conciliacao_id=reconciliation.id))
+            db.add(RegraContabilExcecao(regra_contabil_id=rule.id, conciliacao_id=reconciliation.id, origem="manual"))
         release_rule_entries([rule.id], db, reconciliation.id)
         for match in db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id, regra_contabil_id=rule.id):
             match.regra_contabil_id = None
@@ -2108,7 +2130,7 @@ def delete_zero_covered_accounting_rules(conciliacao_id: str, db: Session = Depe
         ]
         for rule_id in zero_rule_ids:
             if not db.query(RegraContabilExcecao).filter_by(regra_contabil_id=rule_id, conciliacao_id=reconciliation.id).first():
-                db.add(RegraContabilExcecao(regra_contabil_id=rule_id, conciliacao_id=reconciliation.id))
+                db.add(RegraContabilExcecao(regra_contabil_id=rule_id, conciliacao_id=reconciliation.id, origem="auto_zero"))
         if zero_rule_ids:
             release_rule_entries(zero_rule_ids, db, reconciliation.id)
             for match in db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id):
@@ -2177,7 +2199,7 @@ def delete_all_accounting_rules(conciliacao_id: str, db: Session = Depends(get_d
             release_rule_entries([rule.id for rule in inactive_rules], db, reconciliation.id)
         for rule in global_rules:
             if not db.query(RegraContabilExcecao).filter_by(regra_contabil_id=rule.id, conciliacao_id=reconciliation.id).first():
-                db.add(RegraContabilExcecao(regra_contabil_id=rule.id, conciliacao_id=reconciliation.id))
+                db.add(RegraContabilExcecao(regra_contabil_id=rule.id, conciliacao_id=reconciliation.id, origem="manual"))
             release_rule_entries([rule.id], db, reconciliation.id)
         for match in db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id):
             if match.regra_contabil_id in {rule.id for rule in rules}:

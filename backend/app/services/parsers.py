@@ -596,25 +596,51 @@ def extract_loan_spreadsheet(path: str | Path) -> tuple[list[str], list[ParsedRe
         except csv.Error:
             dialect = csv.excel
             dialect.delimiter = ";"
-        sources = [("CSV", list(csv.reader(text.splitlines(), dialect)))]
+        sources = [("CSV", [(list(row), [False] * len(row)) for row in csv.reader(text.splitlines(), dialect)])]
     else:
-        workbook = load_workbook(path, data_only=True, read_only=True)
-        sources = [(worksheet.title, list(worksheet.iter_rows(values_only=True))) for worksheet in workbook.worksheets]
+        workbook = load_workbook(path, data_only=True)
+        sources = []
+        for worksheet in workbook.worksheets:
+            rows = []
+            for row in worksheet.iter_rows():
+                values = [cell.value for cell in row]
+                highlighted = []
+                for cell in row:
+                    color = cell.font.color.rgb if cell.font and cell.font.color and cell.font.color.type == "rgb" else ""
+                    highlighted.append(str(color).upper() in {"FFFF0000", "FFC00000"})
+                rows.append((values, highlighted))
+            sources.append((worksheet.title, rows))
 
     for page_number, (source_name, source_rows) in enumerate(sources, 1):
         lines: list[str] = []
+        highlighted_lines: list[str] = []
+        lenders: list[str] = []
         contract = ""
+        title = ""
+        credit_line = ""
         header_indexes: dict[str, int] = {}
-        grouped: dict[date, dict[str, Decimal | list[str]]] = {}
-        for row in source_rows:
+        grouped: dict[tuple[date, str], dict[str, Decimal | list[str] | str | set[str]]] = {}
+        for row, highlighted in source_rows:
             values = ["" if value is None else value for value in row]
             line = " | ".join(str(value) for value in values if value != "")
             if line:
                 lines.append(line)
+                if any(highlighted[: len(values)]):
+                    highlighted_lines.append(line)
+                if not title and "CONTROLE" in normalize_name(line):
+                    title = line
             if not contract:
                 match = re.search(r"\b\d{2,3}[.\s]\d{3}[.\s]\d{3}\b", line)
                 if match:
                     contract = re.sub(r"\s+", "", match.group(0).strip(" ."))
+            if "Linha de Crédito" in line or "Linha de Credito" in line:
+                credit_line = " ".join(str(value) for value in values[1:] if value).strip()
+            normalized_line = normalize_name(line)
+            if header_indexes and "PARCELA" not in normalized_line and not line.startswith("202"):
+                pass
+            elif not header_indexes and line and "FINANCIADOR" not in normalized_line and "CONTROLE" not in normalized_line and "LINHA CREDITO" not in normalized_line and len(lenders) < 4:
+                if any(word in normalized_line for word in ("AYMORE", "SANTANDER", "BANCO", "CREDITO FINANC")):
+                    lenders.append(line)
             normalized_cells = [normalize_name(str(value)) for value in values]
             if "VENCIMENTO" in normalized_cells and "TIPO" in normalized_cells:
                 header_indexes = {name: index for index, name in enumerate(normalized_cells)}
@@ -625,13 +651,23 @@ def extract_loan_spreadsheet(path: str | Path) -> tuple[list[str], list[ParsedRe
             component = normalize_name(str(values[header_indexes.get("TIPO", 1)]))
             if not row_date or component not in {"JUROS", "CAPITAL", "AMORTIZACAO", "PRINCIPAL"}:
                 continue
-            amount_index = header_indexes.get("VALOR PREVISTO R")
-            principal_index = header_indexes.get("CAPITAL DA PARCELA R")
+            amount_index = next((header_indexes[key] for key in ("VALOR PREVISTO R", "VALOR R", "PREVISTO R") if key in header_indexes), None)
+            principal_index = next((header_indexes[key] for key in ("CAPITAL DA PARCELA R", "VALOR CAPITAL R", "CAPITAL R") if key in header_indexes), None)
+            status_index = header_indexes.get("SITUACAO")
+            debit_index = header_indexes.get("DEBITO")
+            credit_index = header_indexes.get("CREDITO")
+            history_index = header_indexes.get("HISTORICO")
             amount = as_decimal(values[amount_index]) if amount_index is not None and amount_index < len(values) else None
             principal_amount = as_decimal(values[principal_index]) if principal_index is not None and principal_index < len(values) else None
             if amount is None and principal_amount is None:
                 continue
-            bucket = grouped.setdefault(row_date, {"principal": Decimal("0.00"), "juros": Decimal("0.00"), "encargos": Decimal("0.00"), "lines": []})
+            status = str(values[status_index]).strip() if status_index is not None and status_index < len(values) else ""
+            normalized_status = normalize_name(status)
+            parcel_match = re.search(r"\bPARCELA\s+(\d+)\s+(\d+)\b", normalized_status)
+            parcel = f"{parcel_match.group(1)}/{parcel_match.group(2)}" if parcel_match else ""
+            bank = next((name for name in ("Santander", "Banco do Brasil", "BB", "Aymoré") if name.upper() in status.upper()), "")
+            group_key = (row_date, parcel or row_date.isoformat())
+            bucket = grouped.setdefault(group_key, {"principal": Decimal("0.00"), "juros": Decimal("0.00"), "encargos": Decimal("0.00"), "lines": [], "red_lines": [], "parcela": parcel, "situacoes": set(), "debitos": set(), "creditos": set(), "historicos": set(), "bancos": set()})
             if component == "JUROS":
                 bucket["juros"] = Decimal(bucket["juros"]) + (amount or Decimal("0.00"))
             elif component in {"CAPITAL", "AMORTIZACAO", "PRINCIPAL"}:
@@ -639,23 +675,47 @@ def extract_loan_spreadsheet(path: str | Path) -> tuple[list[str], list[ParsedRe
             else:
                 bucket["encargos"] = Decimal(bucket["encargos"]) + (amount or Decimal("0.00"))
             bucket["lines"].append(line)
+            if any(highlighted[: len(values)]):
+                bucket["red_lines"].append(line)
+            if status:
+                bucket["situacoes"].add(status)
+            if bank:
+                bucket["bancos"].add(bank)
+            for index, field in ((debit_index, "debitos"), (credit_index, "creditos"), (history_index, "historicos")):
+                if index is not None and index < len(values) and str(values[index]).strip():
+                    bucket[field].add(str(values[index]).strip())
 
         pages.append("\n".join(lines))
-        for row_date in sorted(grouped):
-            values = grouped[row_date]
+        origin_name = "PLANILHA_FINANCIAMENTO" if any("GNATUS" in normalize_name(line) or "AYMORE" in normalize_name(line) for line in lines[:10]) else "PLANILHA_BB"
+        origin_detail = "planilha_financiamento" if origin_name == "PLANILHA_FINANCIAMENTO" else "planilha_emprestimo_bb"
+        for row_date, group_id in sorted(grouped):
+            values = grouped[(row_date, group_id)]
             principal = Decimal(values["principal"])
             interest = Decimal(values["juros"])
             charges = Decimal(values["encargos"])
             paid = principal + interest + charges
             if paid <= 0:
                 continue
+            parcel = str(values["parcela"] or "")
+            situations = sorted(values["situacoes"])
+            banks = sorted(values["bancos"])
             details = {
                 "contrato": contract,
                 "principal": str(principal),
                 "juros": str(interest),
                 "encargos": str(charges),
                 "valor_pago": str(paid),
-                "origem": "planilha_emprestimo_bb",
+                "origem": origin_detail,
+                "parcela": parcel,
+                "financiamento": title,
+                "financiadores": lenders,
+                "linha_credito": credit_line,
+                "situacoes": situations,
+                "bancos": banks,
+                "debitos": sorted(values["debitos"]),
+                "creditos": sorted(values["creditos"]),
+                "historicos": sorted(values["historicos"]),
+                "linhas_destacadas": values["red_lines"] or highlighted_lines,
             }
             financial = FinancialValues(
                 valor_original=principal if principal > 0 else paid,
@@ -665,7 +725,8 @@ def extract_loan_spreadsheet(path: str | Path) -> tuple[list[str], list[ParsedRe
                 detalhes=details,
                 composicao_divergente=False,
             )
-            beneficiary = " ".join(part for part in ["Empréstimo/Financiamento", contract] if part).strip()
+            descriptor = " ".join(part for part in [contract, parcel and f"Parcela {parcel}", "/".join(banks)] if part).strip()
+            beneficiary = " ".join(part for part in ["Empréstimo/Financiamento", descriptor] if part).strip()
             receipts.append(
                 ParsedReceipt(
                     data=row_date,
@@ -675,10 +736,10 @@ def extract_loan_spreadsheet(path: str | Path) -> tuple[list[str], list[ParsedRe
                     tipo_operacao="EMPRESTIMO",
                     texto_original="\n".join(values["lines"]),
                     pagina_numero=page_number,
-                    origem_nome="PLANILHA_BB",
+                    origem_nome=origin_name,
                     financeiros=financial,
                     beneficiario=beneficiary or "Empréstimo/Financiamento",
-                    numero_documento=contract,
+                    numero_documento=contract or parcel,
                 )
             )
     return pages, receipts

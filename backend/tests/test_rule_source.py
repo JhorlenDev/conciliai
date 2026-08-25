@@ -96,3 +96,14 @@ def test_receipt_interest_and_fine_create_separate_components():
     result = choose_rule_source(Decimal("105.00"), receipt)
 
     assert [(line.componente, line.valor) for line in result.linhas] == [("VALOR_COBRADO", Decimal("100.00")), ("MULTA", Decimal("3.00")), ("JUROS", Decimal("2.00"))]
+
+
+def test_loan_spreadsheet_composition_must_match_statement_total():
+    receipt = SimpleNamespace(tipo_operacao="EMPRESTIMO", financeiros=FinancialValues(valor_original=Decimal("800.00"), valor_juros=Decimal("200.00"), valor_pago=Decimal("1000.00")))
+
+    result = choose_rule_source(Decimal("1000.01"), receipt)
+
+    assert [(line.componente, line.valor) for line in result.linhas] == [("PRINCIPAL", Decimal("800.00")), ("JUROS", Decimal("200.00"))]
+    assert result.status == "Lançamentos não fecham com o extrato"
+    assert result.exige_revisao
+    assert result.diferenca == Decimal("0.01")

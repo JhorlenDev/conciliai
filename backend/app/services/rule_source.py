@@ -26,19 +26,21 @@ def choose_rule_source(extrato_valor: Decimal | None, receipt=None, rfb=None, ta
         return RuleDecision("Documento sem movimento no extrato", None, True)
     has_receipt = bool(receipt)
     if tariff and has_receipt:
-        return RuleDecision("Conciliado bancário", "comprovante bancário", False, [RuleLine("TARIFA", extrato_valor, origem="comprovante")])
-    if rfb is not None and has_receipt:
+        decision = RuleDecision("Conciliado bancário", "comprovante bancário", False, [RuleLine("TARIFA", extrato_valor, origem="comprovante")])
+    elif rfb is not None and has_receipt:
         decision = RuleDecision("Conciliado completo", "RFB", False, _rfb_lines(rfb))
     elif rfb is not None:
         decision = RuleDecision("Extrato + RFB", "RFB", True, _rfb_lines(rfb))
     elif has_receipt:
         lines = _receipt_lines(receipt) if not isinstance(receipt, bool) else []
-        return RuleDecision("Conciliado bancário", "comprovante bancário", False, lines)
+        decision = RuleDecision("Conciliado bancário", "comprovante bancário", False, lines)
     else:
         return RuleDecision("Somente extrato", "extrato", True)
+    if not decision.linhas:
+        return decision
     total = sum((line.valor if line.efeito_no_total == "SOMA" else -line.valor if line.efeito_no_total == "SUBTRAI" else Decimal("0.00") for line in decision.linhas), Decimal("0.00"))
     decision.diferenca = extrato_valor - total
-    if abs(decision.diferenca) > Decimal("0.01"):
+    if decision.diferenca != Decimal("0.00"):
         decision.status = "Lançamentos não fecham com o extrato"
         decision.exige_revisao = True
     return decision

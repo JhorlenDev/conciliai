@@ -3,6 +3,7 @@ from decimal import Decimal
 
 import pytest
 from openpyxl import Workbook
+from openpyxl.styles import Font
 
 from app.services.normalization import accounting_nature, names_similar, normalize_statement_nature
 from app.services.matching import invoice_is_candidate
@@ -134,6 +135,50 @@ def test_banco_do_brasil_loan_csv_groups_interest_and_capital(tmp_path):
     assert records[0].financeiros.valor_original == Decimal("2083.33")
     assert records[0].financeiros.valor_juros == Decimal("733.67")
     assert records[1].valor == Decimal("2755.86")
+
+
+def test_gnatus_santander_aymore_loan_spreadsheet_groups_by_parcel_and_preserves_metadata(tmp_path):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Planilha1"
+    sheet.append(["Controle de Financiamento — GNATUS (Doctor Excellence)"])
+    sheet.append(["Financiadores"])
+    sheet.append(["Aymoré Crédito Financ. Invest"])
+    sheet.append(["Santander Sociedade Crédito"])
+    sheet.append(["Linha de Crédito:"])
+    sheet.append(["Valor Total Contratado (Capital):", 40295])
+    sheet.append([])
+    sheet.append([])
+    sheet.append([])
+    sheet.append(["Vencimento", "Tipo", "Valor Previsto (R$)", "Valor Capital R$", "Saldo Devedor Após Parcela (R$)", "Situação", "Débito", "Crédito", "Histórico"])
+    rows = [
+        [date(2024, 1, 24), "JUROS", 588.63, 0, 33579.14, "Parcela 6/36 — confirmada (Santander)", "292.xx (nova)", "33", "384"],
+        [date(2024, 1, 24), "CAPITAL", 1119.31, 1119.31, 33579.14, "Parcela 6/36 — confirmada (Santander)", "225", "33", "336"],
+    ]
+    for row in rows:
+        sheet.append(row)
+        for cell in sheet[sheet.max_row][:6]:
+            cell.font = Font(color="FFFF0000")
+    path = tmp_path / "gnatus.xlsx"
+    workbook.save(path)
+
+    _, records = extract_loan_spreadsheet(path)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.data == date(2024, 1, 24)
+    assert record.numero_documento == "6/36"
+    assert record.valor == Decimal("1707.94")
+    assert record.financeiros.valor_original == Decimal("1119.31")
+    assert record.financeiros.valor_juros == Decimal("588.63")
+    assert record.financeiros.detalhes["origem"] == "planilha_financiamento"
+    assert record.financeiros.detalhes["parcela"] == "6/36"
+    assert record.financeiros.detalhes["financiadores"] == ["Aymoré Crédito Financ. Invest", "Santander Sociedade Crédito"]
+    assert record.financeiros.detalhes["bancos"] == ["Santander"]
+    assert record.financeiros.detalhes["debitos"] == ["225", "292.xx (nova)"]
+    assert record.financeiros.detalhes["creditos"] == ["33"]
+    assert record.financeiros.detalhes["historicos"] == ["336", "384"]
+    assert len(record.financeiros.detalhes["linhas_destacadas"]) == 2
 
 
 def test_invoice_extracts_supplier_number_date_and_total():

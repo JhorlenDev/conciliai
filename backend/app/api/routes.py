@@ -2412,6 +2412,12 @@ def upload(conciliacao_id: str, tipo_documento: str, file: UploadFile = File(...
         sync_getnet_anticipation_adjustments(reconciliation, db)
         record.status_processamento = "concluido"
     except Exception as error:
+        logger.exception("Falha ao processar arquivo %s (%s)", record.id, tipo_documento)
+        record_id = record.id
+        db.rollback()
+        record = db.get(Arquivo, record_id)
+        if not record:
+            raise
         record.status_processamento = "erro"; record.mensagem_erro = str(error)
     db.commit()
     return {"id": record.id, "status": record.status_processamento}

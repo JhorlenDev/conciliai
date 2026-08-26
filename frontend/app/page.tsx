@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { ArrowRight, Building2, Clock3, FileText, ListFilter, Plus, RefreshCw, Trash2, Users, X } from "lucide-react";
+import { ArrowRight, Building2, Clock3, FileText, ListFilter, Plus, RefreshCw, Route, Trash2, Users, X } from "lucide-react";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 type Client = { id: string; nome: string };
@@ -160,6 +160,7 @@ export default function EntryPage() {
             </p>
           </div>
           <nav className="ml-auto flex items-center gap-2 text-sm" aria-label="Navegação principal">
+            <Link href="/conciliacao/nova" className="inline-flex items-center gap-1 rounded px-2 py-1 hover:bg-emerald-700"><Route size={15}/>Nova conciliação</Link>
             <Link href="/clientes" className="inline-flex items-center gap-1 rounded px-2 py-1 hover:bg-emerald-700"><Users size={15}/>Clientes</Link>
             <Link href="/documentos" className="inline-flex items-center gap-1 rounded px-2 py-1 hover:bg-emerald-700"><FileText size={15}/>Documentos</Link>
           </nav>
@@ -173,11 +174,15 @@ export default function EntryPage() {
         >
           <h2 className="flex items-center gap-2 font-bold text-emerald-900">
             <Plus size={18} />
-            Nova conciliação
+            Conciliação atual
           </h2>
           <p className="mt-1 text-sm text-slate-500">
-            Crie um processo por cliente e período.
+            Crie direto no fluxo antigo, banco por banco.
           </p>
+          <Link href="/conciliacao/nova" className="mt-4 flex items-center justify-between rounded-lg border border-teal-200 bg-teal-50 px-3 py-2 text-sm font-semibold text-teal-900 hover:bg-teal-100">
+            Abrir fluxo guiado
+            <ArrowRight size={15} />
+          </Link>
           <label className="mt-4 block text-sm font-medium">
             Cliente
             <select

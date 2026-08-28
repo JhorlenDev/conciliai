@@ -778,6 +778,37 @@ def get_reconciliation_process(processo_id: str, db: Session = Depends(get_db)):
     return process_payload(process, db)
 
 
+def delete_reconciliation_area(reconciliation: Conciliacao, db: Session) -> None:
+    rules = db.query(RegraContabil).filter_by(conciliacao_id=reconciliation.id).all()
+    local_rule_ids = [rule.id for rule in rules if rule.escopo == "periodo"]
+    if local_rule_ids:
+        db.query(RegraContabilExcecao).filter(RegraContabilExcecao.regra_contabil_id.in_(local_rule_ids)).delete(synchronize_session=False)
+    for rule in rules:
+        if rule.escopo == "global":
+            rule.conciliacao_id = None
+        else:
+            rule.ativo = False
+            rule.conciliacao_id = None
+    db.query(RegraContabilExcecao).filter_by(conciliacao_id=reconciliation.id).delete(synchronize_session=False)
+    matches = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id).all()
+    for match in matches:
+        db.query(LancamentoContabil).filter_by(correspondencia_id=match.id).delete()
+    db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id).delete()
+    receipts = db.query(ComprovanteRfb).filter_by(conciliacao_id=reconciliation.id).all()
+    for receipt in receipts:
+        db.query(ComprovanteRfbItem).filter_by(comprovante_rfb_id=receipt.id).delete()
+    db.query(ComprovanteRfb).filter_by(conciliacao_id=reconciliation.id).delete()
+    db.query(MovimentoExtrato).filter_by(conciliacao_id=reconciliation.id).delete()
+    db.query(Comprovante).filter_by(conciliacao_id=reconciliation.id).delete()
+    db.query(NotaFiscal).filter_by(conciliacao_id=reconciliation.id).delete()
+    files = db.query(Arquivo).filter_by(conciliacao_id=reconciliation.id).all()
+    for file in files:
+        if file.caminho:
+            Path(file.caminho).unlink(missing_ok=True)
+        db.delete(file)
+    db.delete(reconciliation)
+
+
 @router.delete("/processos-conciliacao/{processo_id}", status_code=204)
 def delete_reconciliation_process(processo_id: str, db: Session = Depends(get_db)):
     process = db.get(ProcessoConciliacao, processo_id)
@@ -785,34 +816,25 @@ def delete_reconciliation_process(processo_id: str, db: Session = Depends(get_db
         raise HTTPException(404, "Processo de conciliação não encontrado")
     reconciliations = db.query(Conciliacao).filter_by(processo_id=process.id).all()
     for reconciliation in reconciliations:
-        rules = db.query(RegraContabil).filter_by(conciliacao_id=reconciliation.id).all()
-        local_rule_ids = [rule.id for rule in rules if rule.escopo == "periodo"]
-        if local_rule_ids:
-            db.query(RegraContabilExcecao).filter(RegraContabilExcecao.regra_contabil_id.in_(local_rule_ids)).delete(synchronize_session=False)
-        for rule in rules:
-            if rule.escopo == "global":
-                rule.conciliacao_id = None
-            else:
-                rule.ativo = False
-                rule.conciliacao_id = None
-        db.query(RegraContabilExcecao).filter_by(conciliacao_id=reconciliation.id).delete(synchronize_session=False)
-        matches = db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id).all()
-        for match in matches:
-            db.query(LancamentoContabil).filter_by(correspondencia_id=match.id).delete()
-        db.query(Correspondencia).filter_by(conciliacao_id=reconciliation.id).delete()
-        receipts = db.query(ComprovanteRfb).filter_by(conciliacao_id=reconciliation.id).all()
-        for receipt in receipts:
-            db.query(ComprovanteRfbItem).filter_by(comprovante_rfb_id=receipt.id).delete()
-        db.query(ComprovanteRfb).filter_by(conciliacao_id=reconciliation.id).delete()
-        db.query(MovimentoExtrato).filter_by(conciliacao_id=reconciliation.id).delete()
-        db.query(Comprovante).filter_by(conciliacao_id=reconciliation.id).delete()
-        db.query(NotaFiscal).filter_by(conciliacao_id=reconciliation.id).delete()
-        files = db.query(Arquivo).filter_by(conciliacao_id=reconciliation.id).all()
-        for file in files:
-            Path(file.caminho).unlink(missing_ok=True)
-            db.delete(file)
-        db.delete(reconciliation)
+        delete_reconciliation_area(reconciliation, db)
     db.delete(process)
+    db.commit()
+
+
+@router.delete("/processos-conciliacao/{processo_id}/bancos/{banco}", status_code=204)
+def delete_process_bank(processo_id: str, banco: str, db: Session = Depends(get_db)):
+    process = db.get(ProcessoConciliacao, processo_id)
+    if not process:
+        raise HTTPException(404, "Processo de conciliação não encontrado")
+    reconciliation = db.query(Conciliacao).filter_by(processo_id=process.id, banco=banco).first()
+    if not reconciliation:
+        raise HTTPException(404, "Área não encontrada neste período")
+    delete_reconciliation_area(reconciliation, db)
+    remaining = db.query(Conciliacao).filter_by(processo_id=process.id).count()
+    if remaining == 0:
+        db.delete(process)
+    else:
+        process.status = "concluido" if all(item.status == "concluido" for item in db.query(Conciliacao).filter_by(processo_id=process.id)) else "em_andamento"
     db.commit()
 
 

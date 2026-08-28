@@ -16,7 +16,6 @@ import {
   LayoutDashboard,
   Loader2,
   PlayCircle,
-  ReceiptText,
   RotateCcw,
   Save,
   UploadCloud,
@@ -26,8 +25,9 @@ import {
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 type Client = { id: string; nome: string };
-type Reconciliation = { id: string; banco: string; status?: string };
-type Process = { id: string; bancos: Reconciliation[] };
+type BankProgress = { total: number; cobertos: number; percentual: number };
+type Reconciliation = { id: string; banco: string; status?: string; progresso_regras?: BankProgress };
+type Process = { id: string; cliente_id?: string; cliente_nome?: string; data_inicio?: string; data_fim?: string; bancos: Reconciliation[] };
 type UploadStatus = Record<string, { status: "uploading" | "done" | "error" | "processed"; message: string }>;
 type Review = {
   extratos?: unknown[];
@@ -68,6 +68,34 @@ type RulePreview = {
   motivo?: string;
   lancamentos?: { data?: string; historico?: string; componente?: string; fonte?: string }[];
 };
+type FlowType = "bancos" | "notas" | "despesas";
+
+const flowConfigs: Record<FlowType, { title: string; area: string; support: string[]; step2: string; step2Desc: string; summary: string }> = {
+  bancos: {
+    title: "Conciliador de Bancos",
+    area: "Banco do Brasil",
+    support: ["Conta Caixa", "Apropriações", "Empréstimos/Financiamentos"],
+    step2: "Definir banco",
+    step2Desc: "Bancos e áreas",
+    summary: "Extratos, comprovantes, RFB, maquininhas e financiamentos por banco.",
+  },
+  notas: {
+    title: "Conciliador de Notas",
+    area: "Notas",
+    support: [],
+    step2: "Notas fiscais",
+    step2Desc: "Upload e regras de NFS-e",
+    summary: "Notas extraídas, regras próprias e CSV independente.",
+  },
+  despesas: {
+    title: "Conciliador de Despesas Gerais",
+    area: "Apropriações",
+    support: [],
+    step2: "Despesas gerais",
+    step2Desc: "Documentos avulsos e regras",
+    summary: "Documentos gerais fora do fluxo bancário, com regras e exportação próprios.",
+  },
+};
 
 const steps = [
   { id: 1, title: "Cadastro", desc: "Cliente e período", icon: Building2 },
@@ -80,15 +108,14 @@ const steps = [
 ];
 
 const bankOptions = [
-  { name: "Banco do Brasil", code: "001", hint: "Extrato, comprovantes, RFB e empréstimos." },
-  { name: "Santander", code: "033", hint: "Extrato, comprovantes, Getnet e financiamentos." },
-  { name: "BASA", code: "021", hint: "Extrato e comprovantes do Banco da Amazônia." },
-  { name: "Bradesco", code: "237", hint: "Extrato e comprovantes Bradesco." },
-  { name: "Caixa", code: "104", hint: "Extrato, comprovantes e boletos Caixa." },
+  { name: "Banco do Brasil", code: "001", hint: "Extrato, comprovantes, RFB e empréstimos.", logo: "/bancos/banco-do-brasil.png" },
+  { name: "Santander", code: "033", hint: "Extrato, comprovantes, Getnet e financiamentos.", logo: "/bancos/santander.png" },
+  { name: "BASA", code: "021", hint: "Extrato e comprovantes do Banco da Amazônia.", logo: "/bancos/basa.png" },
+  { name: "Bradesco", code: "237", hint: "Extrato e comprovantes Bradesco.", logo: "/bancos/bradesco.png" },
+  { name: "Caixa", code: "104", hint: "Extrato, comprovantes e boletos Caixa.", logo: "/bancos/caixa.png" },
 ];
 
 const supportOptions = [
-  { name: "Notas", hint: "NFS-e e regras independentes de notas.", icon: ReceiptText },
   { name: "Conta Caixa", hint: "Movimentos em espécie fora do banco.", icon: Banknote },
   { name: "Apropriações", hint: "Lançamentos de provisão e ajustes.", icon: ClipboardList },
   { name: "Empréstimos/Financiamentos", hint: "Contratos, PDFs e planilhas de amortização.", icon: FileSpreadsheet },
@@ -98,6 +125,8 @@ const bankNames = bankOptions.map((bank) => bank.name);
 const loanAccept = "application/pdf,.pdf,.xlsx,.xlsm,.csv,text/csv";
 
 function uploadDocumentsFor(area: string, support: string[] = []) {
+  if (area === "Notas") return [{ type: "nota", label: "NFS-e", accept: "application/pdf,.pdf", multiple: true }];
+  if (area === "Apropriações") return [{ type: "comprovante", label: "Despesas gerais", accept: "application/pdf,.pdf", multiple: true }];
   if (bankNames.includes(area)) {
     const documents = [
       { type: "extrato", label: "Extrato", accept: "application/pdf,.pdf" },
@@ -105,7 +134,6 @@ function uploadDocumentsFor(area: string, support: string[] = []) {
       { type: "rfb", label: "Receita Federal", accept: "application/pdf,.pdf", multiple: true },
       { type: "maquininha_extrato", label: area === "Santander" ? "Extrato Getnet" : "Maquininhas", accept: "application/pdf,.pdf", multiple: true },
     ];
-    if (support.includes("Notas")) documents.push({ type: "nota", label: "NFS-e", accept: "application/pdf,.pdf", multiple: true });
     if (support.includes("Empréstimos/Financiamentos")) documents.push({ type: "emprestimo", label: "Emprést./Fin.", accept: loanAccept, multiple: true });
     return documents;
   }
@@ -124,13 +152,36 @@ function count(value: unknown[] | undefined) {
   return value?.length ?? 0;
 }
 
+function samePeriod(process: Process, clientId: string, start: string, end: string) {
+  return process.cliente_id === clientId && process.data_inicio === start && process.data_fim === end;
+}
+
+function bankHasGuidedLock(reconciliation?: Reconciliation) {
+  if (!reconciliation) return false;
+  const progress = reconciliation.progresso_regras;
+  const hasClassifiedMovements = !!progress && (progress.total > 0 || progress.cobertos > 0 || progress.percentual > 0);
+  return hasClassifiedMovements || ["conciliado", "concluido", "finalizado"].includes(String(reconciliation.status ?? "").toLowerCase());
+}
+
+function progressColor(percent: number) {
+  if (percent >= 60) return "text-emerald-700";
+  if (percent >= 10) return "text-orange-600";
+  return "text-red-700";
+}
+
+function displayAreaName(area: string, flowType: FlowType) {
+  return area === "Apropriações" && flowType === "despesas" ? "Despesas Gerais" : area;
+}
+
 export default function GuidedReconciliationPage() {
+  const [flowType, setFlowType] = useState<FlowType>("bancos");
   const [clients, setClients] = useState<Client[]>([]);
+  const [processes, setProcesses] = useState<Process[]>([]);
   const [clientId, setClientId] = useState("");
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
   const [selectedBanks, setSelectedBanks] = useState<string[]>(["Banco do Brasil"]);
-  const [selectedSupport, setSelectedSupport] = useState<string[]>(["Notas", "Empréstimos/Financiamentos"]);
+  const [selectedSupport, setSelectedSupport] = useState<string[]>(flowConfigs.bancos.support);
   const [process, setProcess] = useState<Process | null>(null);
   const [activeStep, setActiveStep] = useState(1);
   const [activeArea, setActiveArea] = useState("Banco do Brasil");
@@ -150,24 +201,57 @@ export default function GuidedReconciliationPage() {
   const [expandedRuleId, setExpandedRuleId] = useState("");
 
   useEffect(() => {
-    fetch(`${API}/api/clientes`)
-      .then((response) => {
+    const param = new URLSearchParams(window.location.search).get("tipo");
+    const nextType: FlowType = param === "notas" || param === "despesas" ? param : "bancos";
+    const config = flowConfigs[nextType];
+    setFlowType(nextType);
+    setSelectedBanks([config.area]);
+    setActiveArea(config.area);
+    setSelectedSupport(config.support);
+  }, []);
+
+  useEffect(() => {
+    Promise.all([
+      fetch(`${API}/api/clientes`).then((response) => {
         if (!response.ok) throw new Error();
         return response.json();
+      }),
+      fetch(`${API}/api/processos-conciliacao`, { cache: "no-store" }).then((response) => {
+        if (!response.ok) throw new Error();
+        return response.json();
+      }),
+    ])
+      .then(([nextClients, nextProcesses]) => {
+        setClients(nextClients);
+        setProcesses(nextProcesses);
       })
-      .then(setClients)
       .catch(() => setMessage("Não foi possível carregar os clientes."));
   }, []);
 
   const selectedClient = clients.find((client) => client.id === clientId);
-  const selectedBlocks = useMemo(() => Array.from(new Set([...selectedBanks, ...selectedSupport])), [selectedBanks, selectedSupport]);
+  const flowConfig = flowConfigs[flowType];
+  const displayedSteps = useMemo(() => steps.map((step) => step.id === 2 ? { ...step, title: flowConfig.step2, desc: flowConfig.step2Desc } : step), [flowConfig]);
+  const selectedBlocks = useMemo(() => Array.from(new Set([...selectedBanks.map((item) => item === "Apropriações" && flowType === "despesas" ? "Despesas Gerais" : item), ...selectedSupport])), [selectedBanks, selectedSupport, flowType]);
+  const matchingProcess = useMemo(() => processes.find((item) => samePeriod(item, clientId, start, end)) ?? null, [processes, clientId, start, end]);
   const activeReconciliation = process?.bancos.find((item) => item.banco === activeArea) ?? process?.bancos[0] ?? null;
   const activeDocuments = uploadDocumentsFor(activeArea, selectedSupport);
   const activeUploadDocument = activeDocuments.find((item) => item.type === uploadTab) ?? activeDocuments[0];
+  const selectedExistingBank = matchingProcess?.bancos.find((item) => item.banco === selectedBanks[0]);
+  const selectedBankLocked = bankHasGuidedLock(selectedExistingBank);
 
   useEffect(() => {
     if (activeDocuments.length && !activeDocuments.some((item) => item.type === uploadTab)) setUploadTab(activeDocuments[0].type);
   }, [activeDocuments, uploadTab]);
+
+  useEffect(() => {
+    if (!matchingProcess) return;
+    const currentBank = selectedBanks[0];
+    const current = matchingProcess.bancos.find((item) => item.banco === currentBank);
+    if (!bankHasGuidedLock(current)) return;
+    if (flowType !== "bancos") return;
+    const available = bankOptions.find((bank) => !bankHasGuidedLock(matchingProcess.bancos.find((item) => item.banco === bank.name)));
+    if (available) selectBank(available.name);
+  }, [matchingProcess, selectedBanks, flowType]);
 
   useEffect(() => {
     if (!activeReconciliation || ![4, 5, 6, 7].includes(activeStep)) return;
@@ -196,8 +280,16 @@ export default function GuidedReconciliationPage() {
   };
 
   function selectBank(bank: string) {
+    const existing = matchingProcess?.bancos.find((item) => item.banco === bank);
+    if (bankHasGuidedLock(existing)) return;
     setSelectedBanks([bank]);
     setActiveArea(bank);
+  }
+
+  async function loadProcess(processId: string) {
+    const response = await fetch(`${API}/api/processos-conciliacao/${processId}`, { cache: "no-store" });
+    if (!response.ok) throw new Error("Não foi possível carregar o processo.");
+    return (await response.json()) as Process;
   }
 
   async function ensureProcess(event?: FormEvent | React.MouseEvent<HTMLButtonElement>) {
@@ -217,30 +309,41 @@ export default function GuidedReconciliationPage() {
       setActiveStep(2);
       return;
     }
+    if (selectedBankLocked && matchingProcess) {
+      setProcess(matchingProcess);
+      setActiveArea(selectedExistingBank?.banco ?? matchingProcess.bancos[0]?.banco ?? selectedBanks[0]);
+      setMessage("Este banco já foi iniciado neste período. Abra pela conciliação normal para preservar o trabalho feito.");
+      return;
+    }
     setLoading(true);
     try {
-      const response = await fetch(`${API}/api/processos-conciliacao`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cliente_id: clientId, data_inicio: start, data_fim: end }),
-      });
-      if (!response.ok) throw new Error((await response.json()).detail ?? "Não foi possível criar o processo.");
-      const created = (await response.json()) as Process;
-      const reconciliations = await Promise.all(
+      const targetProcess = matchingProcess ?? await (async () => {
+        const response = await fetch(`${API}/api/processos-conciliacao`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cliente_id: clientId, data_inicio: start, data_fim: end }),
+        });
+        if (!response.ok) throw new Error((await response.json()).detail ?? "Não foi possível criar o processo.");
+        return (await response.json()) as Process;
+      })();
+      await Promise.all(
         selectedBanks.map(async (area) => {
-          const areaResponse = await fetch(`${API}/api/processos-conciliacao/${created.id}/bancos`, {
+          if (targetProcess.bancos.some((item) => item.banco === area)) return null;
+          const areaResponse = await fetch(`${API}/api/processos-conciliacao/${targetProcess.id}/bancos`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ banco: area }),
           });
           if (!areaResponse.ok) throw new Error((await areaResponse.json()).detail ?? `Não foi possível criar ${area}.`);
-          return (await areaResponse.json()) as Reconciliation;
+          return areaResponse.json();
         }),
       );
-      setProcess({ ...created, bancos: reconciliations });
-      setActiveArea(reconciliations[0]?.banco ?? selectedBanks[0]);
+      const updated = await loadProcess(targetProcess.id);
+      setProcess({ ...updated, bancos: updated.bancos.filter((item) => selectedBanks.includes(item.banco)) });
+      setProcesses((current) => [updated, ...current.filter((item) => item.id !== updated.id)]);
+      setActiveArea(selectedBanks[0]);
       setActiveStep(3);
-      setMessage("Processo criado. Envie os arquivos para continuar.");
+      setMessage(matchingProcess ? "Período existente retomado. Envie os arquivos deste banco." : "Processo criado. Envie os arquivos para continuar.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Não foi possível criar o processo.");
     } finally {
@@ -452,29 +555,38 @@ export default function GuidedReconciliationPage() {
   const reconciled = results.filter((item) => item.situacao?.toLowerCase().includes("conciliado")).length;
   const pending = Math.max(results.length - reconciled, 0);
   const csvPermitted = rules.integridade?.csv_permitido !== false;
-  const activeMeta = steps.find((step) => step.id === activeStep) ?? steps[0];
+  const activeMeta = displayedSteps.find((step) => step.id === activeStep) ?? displayedSteps[0];
+  const areaLabel = displayAreaName(activeArea, flowType);
+  const contextItems = [
+    ["Fluxo", flowConfig.title],
+    ["Etapa", `${activeStep}/7 · ${activeMeta.title}`],
+    ["Cliente", selectedClient?.nome ?? "Não selecionado"],
+    ["Período", monthRange(start, end)],
+    [flowType === "bancos" ? "Banco" : "Área", areaLabel],
+    ["Documento", activeStep >= 3 ? activeUploadDocument?.label ?? "Selecione um arquivo" : "Aguardando upload"],
+  ];
 
   return (
-    <main className="min-h-screen bg-slate-100 text-slate-900">
-      <div className="grid min-h-screen lg:grid-cols-[278px_1fr]">
-        <aside className="hidden bg-slate-950 p-4 text-slate-200 lg:flex lg:flex-col">
-          <Link href="/" className="mb-4 flex items-center gap-2 rounded-lg px-2 py-2 text-sm font-bold text-white">
+    <main className="guided-compact min-h-screen bg-slate-100 text-slate-900">
+      <div className="grid min-h-screen lg:grid-cols-[264px_1fr]">
+        <aside className="hidden max-h-screen overflow-y-auto bg-slate-950 p-3 text-slate-200 lg:flex lg:flex-col">
+          <Link href="/" className="mb-3 flex items-center gap-2 rounded-lg border-b border-slate-800 px-2 py-2 text-sm font-bold text-white">
             <span className="rounded-md bg-teal-600 p-1.5"><Building2 size={16} /></span>
             ConcilIA
           </Link>
-          <div className="mb-4 rounded-lg border border-slate-800 bg-slate-900 p-3 text-xs">
+          <div className="mb-3 rounded-lg border border-slate-800 bg-slate-900 p-2.5 text-xs">
             <span className="block font-semibold text-slate-400">Contexto ativo</span>
             <strong className="mt-1 block text-white">{selectedClient?.nome ?? "Selecione um cliente"}</strong>
-            <span className="mt-1 block text-slate-400">{activeArea} · {monthRange(start, end)}</span>
+            <span className="mt-1 block text-slate-400">{flowConfig.title} · {areaLabel} · {monthRange(start, end)}</span>
           </div>
           <nav className="space-y-1 text-sm">
             <Link href="/" className="flex items-center gap-2 rounded-lg px-3 py-2 text-slate-300 hover:bg-slate-900"><LayoutDashboard size={16} />Central</Link>
             <Link href="/conciliacao" className="mb-3 flex items-center gap-2 rounded-lg px-3 py-2 text-slate-300 hover:bg-slate-900"><FolderOpen size={16} />Conciliação atual</Link>
-            {steps.map((step) => {
+            {displayedSteps.map((step) => {
               const Icon = step.icon;
               return (
-                <button type="button" key={step.id} onClick={() => setActiveStep(step.id)} className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left ${activeStep === step.id ? "bg-teal-500 font-semibold text-slate-950" : "text-slate-300 hover:bg-slate-900"}`}>
-                  <span className={`grid h-6 w-6 place-items-center rounded-full text-xs ${activeStep === step.id ? "bg-white" : "bg-slate-900 text-slate-400"}`}>{step.id}</span>
+                <button type="button" key={step.id} onClick={() => setActiveStep(step.id)} className={`flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left ${activeStep === step.id ? "bg-teal-500 font-semibold text-slate-950" : "text-slate-300 hover:bg-slate-900"}`}>
+                  <span className={`grid h-5 w-5 place-items-center rounded-full text-[10px] ${activeStep === step.id ? "bg-white" : "bg-slate-900 text-slate-400"}`}>{step.id}</span>
                   <Icon size={15} />
                   <span className="min-w-0"><span className="block">{step.title}</span><span className={`block text-[11px] ${activeStep === step.id ? "text-teal-950" : "text-slate-500"}`}>{step.desc}</span></span>
                 </button>
@@ -484,11 +596,18 @@ export default function GuidedReconciliationPage() {
         </aside>
 
         <section className="min-w-0">
-          <header className="border-b border-slate-200 bg-white px-5 py-4">
+          <header className="border-b border-slate-200 bg-white px-5 py-3">
             <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3">
               <div>
+                <div className="mb-1 flex flex-wrap items-center gap-1.5 text-[11px] font-bold text-slate-500">
+                  <span className="rounded-full bg-teal-50 px-2 py-0.5 text-teal-800">{flowConfig.title}</span>
+                  <span>/</span>
+                  <span>{areaLabel}</span>
+                  <span>/</span>
+                  <span>{monthRange(start, end)}</span>
+                </div>
                 <p className="text-xs font-semibold uppercase tracking-wide text-teal-700">Etapa {activeStep} de 7</p>
-                <h1 className="text-xl font-bold">{activeMeta.title}</h1>
+                <h1 className="text-lg font-bold">{activeMeta.title}</h1>
                 <p className="text-sm text-slate-500">{activeMeta.desc}</p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
@@ -502,8 +621,9 @@ export default function GuidedReconciliationPage() {
             </div>
           </header>
 
-          <div className="mx-auto max-w-7xl space-y-4 px-5 py-5">
+          <div className="mx-auto max-w-7xl space-y-3 px-4 py-4">
             {message && <p className="rounded-md bg-teal-50 px-3 py-2 text-sm font-semibold text-teal-800">{message}</p>}
+            <ContextMap items={contextItems} existing={!!matchingProcess} />
 
             {activeStep === 1 && (
               <form onSubmit={(event) => { event.preventDefault(); setActiveStep(2); }} className="grid gap-4 xl:grid-cols-[1fr_360px]">
@@ -542,10 +662,10 @@ export default function GuidedReconciliationPage() {
                   {cadTab === "plano" && <CadastroTable rows={[["219", "Banco Brasil"], ["232", "Clientes Diversos"], ["258", "Leandro Barbosa Figueiro"], ["387", "Anuidades"]]} headers={["Código", "Conta"]} />}
                   {cadTab === "historico" && <CadastroTable rows={[["52", "Tarifa Bancária"], ["307", "Pagto. de Duplic. Fornecedor"], ["310", "Transferência entre contas"], ["467", "Recebimento via PIX conforme extrato."]]} headers={["Código", "Histórico"]} />}
                   <div className="mt-4 flex justify-end">
-                    <button className="inline-flex items-center gap-2 rounded-md bg-teal-700 px-4 py-2 text-sm font-bold text-white hover:bg-teal-800">Próxima etapa<ArrowRight size={16} /></button>
+                    <button className="inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800">Próxima<ArrowRight size={15} /></button>
                   </div>
                 </section>
-                <SummaryCard selectedClient={selectedClient} start={start} end={end} selectedAreas={selectedBlocks} />
+                <SummaryCard selectedClient={selectedClient} start={start} end={end} selectedAreas={selectedBlocks} matchingProcess={matchingProcess} title={flowConfig.title} summary={flowConfig.summary} />
               </form>
             )}
 
@@ -553,55 +673,105 @@ export default function GuidedReconciliationPage() {
               <section className="grid gap-4 xl:grid-cols-[1fr_360px]">
                 <div className="space-y-4">
                   <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-                    <div className="mb-4 flex items-center gap-2 text-teal-800"><Banknote size={18} /><h2 className="font-bold">Bancos</h2></div>
-                    <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-5">
+                    <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex items-center gap-2 text-teal-800"><Banknote size={18} /><h2 className="font-bold">Bancos</h2></div>
+                      {matchingProcess && <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-bold text-amber-900">Período existente encontrado</span>}
+                    </div>
+                    {flowType === "bancos" ? <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-5">
                       {bankOptions.map((bank) => {
                         const active = selectedBanks.includes(bank.name);
+                        const existing = matchingProcess?.bancos.find((item) => item.banco === bank.name);
+                        const locked = bankHasGuidedLock(existing);
+                        const progress = existing?.progresso_regras ?? { total: 0, cobertos: 0, percentual: 0 };
+                        const created = !!existing;
                         return (
-                          <button type="button" onClick={() => selectBank(bank.name)} className={`rounded-lg border p-3 text-left ${active ? "border-teal-600 bg-teal-50" : "border-slate-200 bg-white hover:border-slate-300"}`} key={bank.name}>
-                            <span className="flex items-center justify-between gap-2 text-xs font-mono text-slate-500">{bank.code}{active && <Check size={14} className="text-teal-700" />}</span>
-                            <strong className="mt-1 block text-sm">{bank.name}</strong>
-                            <span className="mt-1 block text-xs text-slate-500">{bank.hint}</span>
-                          </button>
+                          <div
+                            role={locked ? undefined : "button"}
+                            tabIndex={locked ? undefined : 0}
+                            onClick={() => !locked && selectBank(bank.name)}
+                            onKeyDown={(event) => {
+                              if (!locked && (event.key === "Enter" || event.key === " ")) selectBank(bank.name);
+                            }}
+                            className={`rounded-lg border p-2 text-left ${locked ? "border-slate-200 bg-slate-50 opacity-90" : active ? "cursor-pointer border-teal-600 bg-teal-50" : "cursor-pointer border-slate-200 bg-white hover:border-slate-300"}`}
+                            key={bank.name}
+                          >
+                            <div className="flex items-center gap-2">
+                              <div className="flex h-8 w-12 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-white px-1">
+                                <img src={bank.logo} alt={bank.name} className="max-h-6 max-w-full object-contain" />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="font-mono text-[10px] font-bold text-slate-500">{bank.code}</span>
+                                  {active && <Check size={12} className="text-teal-700" />}
+                                </div>
+                                <strong className="block truncate text-xs leading-tight" title={bank.name}>{bank.name}</strong>
+                              </div>
+                            </div>
+                            <span className="mt-2 flex items-center justify-between gap-2 rounded bg-white/70 px-1.5 py-1">
+                              <span className={`truncate text-[11px] font-bold ${locked ? "text-slate-600" : created ? "text-teal-700" : "text-slate-500"}`}>{locked ? "Já iniciado" : created ? "Continuar" : "Disponível"}</span>
+                              <span className={`text-xs font-black tabular-nums ${progressColor(progress.percentual)}`}>{progress.percentual}%</span>
+                            </span>
+                            {locked && matchingProcess && (
+                              <Link href={`/conciliacao?process=${matchingProcess.id}`} className="mt-1.5 inline-flex w-full items-center justify-center rounded-md bg-slate-900 px-2 py-1 text-[11px] font-bold text-white hover:bg-slate-800">
+                                Abrir
+                              </Link>
+                            )}
+                          </div>
                         );
                       })}
-                    </div>
+                    </div> : (
+                      <div className="rounded-lg border border-teal-200 bg-teal-50 p-4">
+                        <span className="text-xs font-bold uppercase tracking-wide text-teal-700">{flowConfig.title}</span>
+                        <h3 className="mt-1 text-lg font-black text-slate-900">{flowType === "notas" ? "Notas fiscais" : "Despesas Gerais"}</h3>
+                        <p className="mt-1 text-sm font-medium text-slate-600">{flowConfig.summary}</p>
+                        {matchingProcess && (
+                          <p className="mt-3 text-xs font-semibold text-amber-800">
+                            Se este fluxo já tiver sido iniciado neste período, continue pela conciliação normal para revisar regras e exportações.
+                          </p>
+                        )}
+                      </div>
+                    )}
+                    {matchingProcess && (
+                      <p className="mt-3 rounded-md bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-600">
+                        Bancos já trabalhados ficam protegidos no acesso guiado. Para revisar regras, editar ou excluir lançamentos, abra pela conciliação normal.
+                      </p>
+                    )}
                   </section>
-                  <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-                    <div className="mb-4 flex items-center gap-2 text-teal-800"><FileText size={18} /><h2 className="font-bold">Áreas auxiliares</h2></div>
-                    <div className="grid gap-2 md:grid-cols-2">
+                  {flowType === "bancos" && <section className="rounded-xl border border-slate-200 bg-white p-3 shadow-sm">
+                    <div className="mb-2 flex items-center gap-2 text-teal-800"><FileText size={16} /><h2 className="font-bold">Áreas auxiliares</h2></div>
+                    <div className="grid gap-2 md:grid-cols-3">
                       {supportOptions.map((option) => {
                         const Icon = option.icon;
                         const active = selectedSupport.includes(option.name);
                         return (
-                          <button type="button" onClick={() => toggle(option.name, selectedSupport, setSelectedSupport)} className={`flex items-start gap-3 rounded-lg border p-3 text-left ${active ? "border-teal-600 bg-teal-50" : "border-slate-200 bg-white hover:border-slate-300"}`} key={option.name}>
-                            <Icon size={17} className={active ? "text-teal-700" : "text-slate-500"} />
-                            <span><strong className="block text-sm">{option.name}</strong><span className="text-xs text-slate-500">{option.hint}</span></span>
+                          <button type="button" onClick={() => toggle(option.name, selectedSupport, setSelectedSupport)} className={`flex min-h-10 items-center gap-2 rounded-lg border px-2.5 py-2 text-left ${active ? "border-teal-600 bg-teal-50" : "border-slate-200 bg-white hover:border-slate-300"}`} key={option.name} title={option.hint}>
+                            <Icon size={15} className={active ? "text-teal-700" : "text-slate-500"} />
+                            <strong className="block truncate text-xs">{option.name}</strong>
                           </button>
                         );
                       })}
                     </div>
-                  </section>
+                  </section>}
                   <div className="flex justify-end">
-                    <button disabled={loading} onClick={ensureProcess} className="inline-flex items-center gap-2 rounded-md bg-teal-700 px-4 py-2 text-sm font-bold text-white hover:bg-teal-800 disabled:cursor-wait disabled:opacity-70">
+                    <button disabled={loading || selectedBankLocked} onClick={ensureProcess} className="inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800 disabled:cursor-not-allowed disabled:opacity-70">
                       {loading ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
-                      Criar processo e ir para upload
+                      {matchingProcess ? "Continuar" : "Criar e enviar"}
                     </button>
                   </div>
                 </div>
-                <SummaryCard selectedClient={selectedClient} start={start} end={end} selectedAreas={selectedBlocks} />
+                <SummaryCard selectedClient={selectedClient} start={start} end={end} selectedAreas={selectedBlocks} matchingProcess={matchingProcess} title={flowConfig.title} summary={flowConfig.summary} />
               </section>
             )}
 
             {activeStep === 3 && (
-              <GuidedPanel title="Upload de arquivos" action={<button onClick={processActive} disabled={!activeReconciliation || uploadStatus[`${activeReconciliation.id}:processar`]?.status === "uploading"} className="inline-flex items-center gap-2 rounded-md bg-slate-900 px-3 py-2 text-sm font-bold text-white hover:bg-slate-800 disabled:cursor-wait disabled:opacity-70"><PlayCircle size={15} />Processar</button>}>
+              <GuidedPanel title="Upload de arquivos" action={<button onClick={processActive} disabled={!activeReconciliation || uploadStatus[`${activeReconciliation.id}:processar`]?.status === "uploading"} className="inline-flex items-center gap-2 rounded-md bg-slate-900 px-3 py-1.5 text-xs font-bold text-white hover:bg-slate-800 disabled:cursor-wait disabled:opacity-70"><PlayCircle size={15} />Processar</button>}>
                 {!process ? (
                   <EmptyAction text="Crie o processo antes de enviar arquivos." onClick={() => setActiveStep(1)} />
                 ) : (
                   <div>
                     <div className="mb-4 flex flex-wrap gap-2">
                       {activeDocuments.map((doc) => (
-                        <button type="button" key={doc.type} onClick={() => setUploadTab(doc.type)} className={`rounded-full border px-4 py-2 text-xs font-bold ${uploadTab === doc.type ? "border-slate-900 bg-slate-900 text-white" : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"}`}>{doc.label}</button>
+                        <button type="button" key={doc.type} onClick={() => setUploadTab(doc.type)} className={`rounded-full border px-3 py-1.5 text-xs font-bold ${uploadTab === doc.type ? "border-slate-900 bg-slate-900 text-white" : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"}`}>{doc.label}</button>
                       ))}
                     </div>
                     {activeUploadDocument ? (() => {
@@ -610,11 +780,11 @@ export default function GuidedReconciliationPage() {
                       const status = uploadStatus[key];
                       const busy = status?.status === "uploading";
                       return (
-                        <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-8 text-center">
-                          <UploadCloud className="mx-auto text-teal-700" size={28} />
-                          <h3 className="mt-3 text-base font-bold">{doc.label} — {activeArea}</h3>
-                          <p className="mt-1 text-sm text-slate-500">{doc.accept.includes("xlsx") ? "PDF, XLSX ou CSV" : "PDF"}{doc.multiple ? " · múltiplos arquivos" : ""}</p>
-                          <label className={`mt-4 inline-flex cursor-pointer items-center gap-2 rounded-md px-4 py-2 text-sm font-bold ${busy ? "bg-slate-300 text-slate-600" : "bg-teal-700 text-white hover:bg-teal-800"}`}>
+                        <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5 text-center">
+                          <UploadCloud className="mx-auto text-teal-700" size={24} />
+                          <h3 className="mt-2 text-sm font-bold">{doc.label} — {activeArea}</h3>
+                          <p className="mt-1 text-xs text-slate-500">{doc.accept.includes("xlsx") ? "PDF, XLSX ou CSV" : "PDF"}{doc.multiple ? " · múltiplos arquivos" : ""}</p>
+                          <label className={`mt-3 inline-flex cursor-pointer items-center gap-2 rounded-md px-3 py-1.5 text-xs font-bold ${busy ? "bg-slate-300 text-slate-600" : "bg-teal-700 text-white hover:bg-teal-800"}`}>
                             {busy ? <Loader2 size={15} className="animate-spin" /> : <UploadCloud size={15} />}
                             Selecionar arquivo
                             <input type="file" className="hidden" accept={doc.accept} multiple={doc.multiple} disabled={busy || !activeReconciliation} onChange={(event) => activeReconciliation && uploadFile(activeReconciliation.id, doc.type, event)} />
@@ -638,18 +808,18 @@ export default function GuidedReconciliationPage() {
             )}
 
             {activeStep === 4 && (
-              <GuidedPanel title="Conciliação" loading={panelLoading} action={<button onClick={processActive} disabled={!activeReconciliation} className="inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-2 text-sm font-bold text-white hover:bg-teal-800 disabled:opacity-60"><PlayCircle size={15} />Reprocessar</button>}>
+              <GuidedPanel title="Conciliação" loading={panelLoading} action={<button onClick={processActive} disabled={!activeReconciliation} className="inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800 disabled:opacity-60"><PlayCircle size={15} />Reprocessar</button>}>
                 <StatsGrid items={[["Extrato", count(review.extratos)], ["Comprovantes", count(review.comprovantes)], ["RFB", count(review.rfb)], ["Resultados", results.length]]} />
                 <MiniTable rows={results.slice(0, 12)} />
               </GuidedPanel>
             )}
 
             {activeStep === 5 && (
-              <GuidedPanel title="Criar regras" loading={panelLoading} action={<button onClick={() => setActiveStep(6)} className="inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-2 text-sm font-bold text-white hover:bg-teal-800"><WandSparkles size={15} />Ver regras salvas</button>}>
+              <GuidedPanel title="Criar regras" loading={panelLoading} action={<button onClick={() => setActiveStep(6)} className="inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800"><WandSparkles size={15} />Regras salvas</button>}>
                 <StatsGrid items={[["Regras a criar", count(rules.pendentes)], ["Ocultas", count(rules.ignoradas)], ["Salvas", count(rules.salvas)]]} />
                 <div className="grid gap-4 xl:grid-cols-[1fr_420px]">
                   <PendingRules rows={rules.pendentes ?? []} onSelect={selectPendingRule} />
-                  <form onSubmit={saveGuidedRule} className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                  <form onSubmit={saveGuidedRule} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
                     <div className="flex items-center justify-between gap-2">
                       <h3 className="font-bold">{editingRuleId ? "Editar regra" : "Nova regra"}</h3>
                       {editingRuleId && <button type="button" onClick={newGuidedRule} className="rounded border border-slate-200 bg-white px-2 py-1 text-xs font-bold text-slate-700">Cancelar edição</button>}
@@ -689,7 +859,7 @@ export default function GuidedReconciliationPage() {
                           </div>
                         ) : <p className="mt-2 text-xs text-slate-500">Valide antes de salvar.</p>}
                       </div>
-                      <button disabled={ruleBusy === "save"} className="inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-4 py-2 text-sm font-bold text-white hover:bg-teal-800 disabled:cursor-wait disabled:opacity-60">{ruleBusy === "save" ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}{editingRuleId ? "Atualizar regra" : "Salvar regra"}</button>
+                      <button disabled={ruleBusy === "save"} className="inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800 disabled:cursor-wait disabled:opacity-60">{ruleBusy === "save" ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}{editingRuleId ? "Atualizar" : "Salvar"}</button>
                     </div>
                   </form>
                 </div>
@@ -716,27 +886,89 @@ export default function GuidedReconciliationPage() {
           </div>
         </section>
       </div>
+      <style jsx global>{`
+        .guided-compact {
+          font-size: 13px;
+        }
+        .guided-compact h2 {
+          font-size: 15px;
+        }
+        .guided-compact h3 {
+          font-size: 13px;
+        }
+        .guided-compact input,
+        .guided-compact select {
+          min-height: 30px;
+          padding-top: 0.32rem;
+          padding-bottom: 0.32rem;
+          font-size: 12px;
+        }
+        .guided-compact table {
+          font-size: 12px;
+        }
+        .guided-compact th {
+          padding: 0.45rem 0.65rem;
+          font-size: 10px;
+          letter-spacing: 0.03em;
+        }
+        .guided-compact td {
+          padding: 0.45rem 0.65rem;
+        }
+        .guided-compact button,
+        .guided-compact a,
+        .guided-compact label {
+          letter-spacing: 0;
+        }
+        .guided-compact .shadow-sm {
+          box-shadow: 0 1px 2px rgb(15 23 42 / 0.04);
+        }
+      `}</style>
     </main>
   );
 }
 
-function SummaryCard({ selectedClient, start, end, selectedAreas }: { selectedClient?: Client; start: string; end: string; selectedAreas: string[] }) {
+function SummaryCard({ selectedClient, start, end, selectedAreas, matchingProcess, title, summary }: { selectedClient?: Client; start: string; end: string; selectedAreas: string[]; matchingProcess?: Process | null; title: string; summary: string }) {
   return (
-    <aside className="rounded-xl border border-teal-200 bg-white p-4 shadow-sm">
-      <div className="mb-3 flex items-center gap-2 text-teal-800"><CalendarDays size={18} /><h2 className="font-bold">Resumo</h2></div>
-      <dl className="space-y-3 text-sm">
+    <aside className="rounded-xl border border-teal-200 bg-white p-3 shadow-sm">
+      <div className="mb-2 flex items-center gap-2 text-teal-800"><CalendarDays size={16} /><h2 className="font-bold">Resumo</h2></div>
+      <dl className="space-y-2 text-xs">
+        <div><dt className="text-xs font-semibold uppercase tracking-wide text-slate-400">Fluxo</dt><dd className="mt-0.5 font-medium">{title}</dd><dd className="mt-1 text-xs text-slate-500">{summary}</dd></div>
         <div><dt className="text-xs font-semibold uppercase tracking-wide text-slate-400">Cliente</dt><dd className="mt-0.5 font-medium">{selectedClient?.nome ?? "Selecione um cliente"}</dd></div>
         <div><dt className="text-xs font-semibold uppercase tracking-wide text-slate-400">Período</dt><dd className="mt-0.5 font-medium">{monthRange(start, end)}</dd></div>
+        {matchingProcess && <div><dt className="text-xs font-semibold uppercase tracking-wide text-slate-400">Situação</dt><dd className="mt-0.5 font-medium text-amber-800">Este período já existe. O guiado vai reaproveitar o processo.</dd></div>}
         <div><dt className="text-xs font-semibold uppercase tracking-wide text-slate-400">Blocos</dt><dd className="mt-1 flex flex-wrap gap-1">{selectedAreas.map((area) => <span className="rounded bg-slate-100 px-2 py-1 text-xs font-semibold" key={area}>{area}</span>)}</dd></div>
       </dl>
     </aside>
   );
 }
 
+function ContextMap({ items, existing }: { items: string[][]; existing: boolean }) {
+  return (
+    <section className="rounded-xl border border-slate-200 bg-white p-2.5 shadow-sm">
+      <div className="grid gap-2 md:grid-cols-3 xl:grid-cols-6">
+        {items.map(([label, value]) => {
+          const isPeriod = label === "Período";
+          return (
+            <div className={`min-w-0 rounded-lg border px-2.5 py-2 ${isPeriod ? "border-emerald-300 bg-emerald-50" : "border-slate-200 bg-slate-50"}`} key={label}>
+              <dt className={`text-[10px] font-black uppercase tracking-wide ${isPeriod ? "text-emerald-800" : "text-slate-400"}`}>{label}</dt>
+              <dd className={`mt-0.5 truncate text-xs font-bold ${isPeriod ? "text-emerald-950" : "text-slate-800"}`} title={value}>{value}</dd>
+            </div>
+          );
+        })}
+      </div>
+      {existing && (
+        <p className="mt-2 rounded-md bg-amber-50 px-2.5 py-1.5 text-[11px] font-semibold text-amber-900">
+          Período já existente: novos bancos ou áreas entram no mesmo processo. Itens já iniciados devem ser revisados pela conciliação normal.
+        </p>
+      )}
+    </section>
+  );
+}
+
 function GuidedPanel({ title, action, loading, children }: { title: string; action?: ReactNode; loading?: boolean; children: ReactNode }) {
   return (
-    <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+    <section className="rounded-xl border border-slate-200 bg-white p-3 shadow-sm">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <h2 className="font-bold">{title}</h2>
         <div className="flex items-center gap-2">{loading && <Loader2 size={16} className="animate-spin text-slate-500" />}{action}</div>
       </div>
@@ -746,9 +978,9 @@ function GuidedPanel({ title, action, loading, children }: { title: string; acti
 }
 
 function EmptyAction({ text, onClick, href }: { text: string; onClick?: () => void; href?: string }) {
-  const className = "inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-2 text-sm font-bold text-white hover:bg-teal-800";
+  const className = "inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800";
   return (
-    <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 p-5 text-center text-sm text-slate-600">
+    <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 p-4 text-center text-sm text-slate-600">
       <p className="mb-3 font-semibold">{text}</p>
       {href ? <Link href={href} className={className}><FolderOpen size={15} />Abrir</Link> : <button onClick={onClick} className={className}>Começar</button>}
     </div>
@@ -757,10 +989,10 @@ function EmptyAction({ text, onClick, href }: { text: string; onClick?: () => vo
 
 function StatsGrid({ items }: { items: [string, number][] }) {
   return (
-    <div className="mb-4 grid gap-3 md:grid-cols-3 xl:grid-cols-4">
+    <div className="mb-3 grid gap-2 md:grid-cols-3 xl:grid-cols-4">
       {items.map(([label, value]) => (
-        <div className="rounded-lg border border-slate-200 bg-slate-50 p-3" key={label}>
-          <div className="text-2xl font-bold text-slate-900">{value}</div>
+        <div className="rounded-lg border border-slate-200 bg-slate-50 p-2.5" key={label}>
+          <div className="text-xl font-bold text-slate-900">{value}</div>
           <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</div>
         </div>
       ))}

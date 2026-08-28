@@ -6,7 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.api import routes
-from app.api.routes import ContaBancariaClienteInput, RegraFonteInput, accounting_integrity, accounting_rules, apply_accounting_rules, banks, client_bank_accounts, create_reconciliation_process, create_source_accounting_rule, delete_client_bank_account, delete_reconciliation_process, list_reconciliation_processes, reconcile, reprocess_document, result, resume_process_bank, review, save_client_bank_account, source_accounting_csv, source_accounting_rules, unused_documents
+from app.api.routes import ContaBancariaClienteInput, RegraFonteInput, accounting_integrity, accounting_rules, apply_accounting_rules, banks, client_bank_accounts, create_reconciliation_process, create_source_accounting_rule, delete_client_bank_account, delete_process_bank, delete_reconciliation_process, list_reconciliation_processes, reconcile, reprocess_document, result, resume_process_bank, review, save_client_bank_account, source_accounting_csv, source_accounting_rules, unused_documents
 from app.core.database import Base
 from app.models import Arquivo, Cliente, Comprovante, Conciliacao, ContaBancaria, Correspondencia, LancamentoContabil, MovimentoExtrato, NotaFiscal, ProcessoConciliacao, RegraContabil, RegraContabilExcecao
 from app.services.normalization import normalize_name
@@ -193,6 +193,33 @@ def test_delete_process_removes_its_reconciliations_and_files(tmp_path):
     assert session.get(RegraContabil, local_rule.id).ativo is False
     assert session.get(RegraContabil, local_rule.id).conciliacao_id is None
     assert session.query(RegraContabilExcecao).filter_by(conciliacao_id=reconciliation_id).count() == 0
+
+
+def test_delete_notes_area_keeps_process_and_bank_reconciliations(tmp_path):
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.commit()
+    process = create_reconciliation_process(ProcessoConciliacaoInput(cliente_id=client.id, data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31), banco="Banco do Brasil"), session)
+    bank_id = process["bancos"][0]["id"]
+    notes = resume_process_bank(process["id"], ProcessoBancoInput(banco="Notas"), session)
+    file_path = tmp_path / "notas.pdf"
+    file_path.write_text("conteúdo")
+    file = Arquivo(conciliacao_id=notes["id"], tipo_documento="nota", banco_selecionado="Notas", nome_original="notas.pdf", caminho=str(file_path))
+    session.add(file); session.flush()
+    session.add(NotaFiscal(conciliacao_id=notes["id"], arquivo_id=file.id, pagina_numero=1, fornecedor="Cliente", numero_nota="123", valor_total=Decimal("100.00")))
+    rule = RegraContabil(cliente_id=client.id, conciliacao_id=notes["id"], banco="Notas", tipo_fonte="nota", tipo_operacao="Débito", favorecido_normalizado=normalize_name("Cliente"), conta_debito="Clientes", conta_credito="Receita", historico="Nota", escopo="periodo")
+    session.add(rule); session.commit()
+
+    delete_process_bank(process["id"], "Notas", session)
+
+    assert session.get(ProcessoConciliacao, process["id"]) is not None
+    assert session.get(Conciliacao, bank_id) is not None
+    assert session.query(Conciliacao).filter_by(processo_id=process["id"], banco="Notas").count() == 0
+    assert session.query(NotaFiscal).filter_by(conciliacao_id=notes["id"]).count() == 0
+    assert session.get(RegraContabil, rule.id).ativo is False
+    assert not file_path.exists()
 
 
 def test_reprocessing_statement_clears_previous_reconciliation_results(tmp_path):

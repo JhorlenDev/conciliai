@@ -3293,9 +3293,10 @@ function EditableResultTable({
                               <div className="flex gap-2">
                                 <button
                                   onClick={() => addComplementary(row)}
-                                  className="rounded border border-teal-700 px-2 py-1 text-xs font-semibold text-teal-800"
+                                  title="Desdobrar este lançamento"
+                                  className="rounded border border-teal-700 px-2 py-1 text-[11px] font-semibold text-teal-800"
                                 >
-                                  Adicionar complementar
+                                  Desd. Lancto
                                 </button>
                                 <button
                                   disabled={saving === rowId || !itemsFor(row).length}
@@ -3554,6 +3555,12 @@ function ConciliacaoFlow({
               item.id === params.get("reconciliation") ||
               item.banco === requestedBank,
           ) || process.bancos[0];
+        if (requestedBank && !process.bancos.some((item: { banco: string }) => item.banco === requestedBank)) {
+          setBank(visibleBank(requestedBank));
+          setReconciliationId("");
+          window.history.replaceState(null, "", `/conciliacao?process=${process.id}&bank=${encodeURIComponent(requestedBank)}`);
+          return;
+        }
         if (!reconciliation) {
           setReconciliationId("");
           window.history.replaceState(null, "", `/conciliacao?process=${process.id}`);

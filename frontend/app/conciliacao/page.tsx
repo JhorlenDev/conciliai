@@ -34,6 +34,7 @@ const banks = [
   "Notas",
   "Apropriações",
   "Empréstimos/Financiamentos",
+  "Folha de Pagamento",
 ];
 type Client = { id: string; nome: string };
 type Row = Record<string, string | null>;
@@ -137,6 +138,7 @@ const documentTypeLabels: Record<string, string> = {
   comprovante: "Comprovante bancário",
   rfb: "Comprovante RFB",
   emprestimo: "Empréstimos/Financiamentos",
+  folha_pagamento: "Folha de pagamento",
   nota: "Notas fiscais",
 };
 

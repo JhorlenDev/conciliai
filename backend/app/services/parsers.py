@@ -456,6 +456,141 @@ def extract_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
     return extract_receipt_block(text, page_number)
 
 
+def extract_payroll_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
+    normalized = normalize_name(text)
+    if "TRABALHADOR" not in normalized or "LIQUIDO" not in normalized or "DT PGTO" not in normalized:
+        return []
+
+    period_match = re.search(r"PER[IÍ]ODO:\s*(\d{2}/\d{2}/\d{4})\s*[ÀA]\s*(\d{2}/\d{2}/\d{4})", text, flags=re.IGNORECASE)
+    company_match = re.search(r"^\s*([A-Z0-9 .&/-]+?)\s*\(\d+\)", text, flags=re.MULTILINE)
+    period = " a ".join(period_match.groups()) if period_match else ""
+    company = " ".join(company_match.group(1).split()) if company_match else ""
+    results: list[ParsedReceipt] = []
+
+    for raw_line in text.splitlines():
+        line = " ".join(raw_line.split())
+        if not line or "TOTAL GERAL" in normalize_name(line):
+            continue
+        match = re.match(r"^(?P<worker>.+?)\s+(?P<cpf>\d{3}\.\d{3}\.\d{3}-\d{2})\s+(?P<rest>.+)$", line)
+        if not match:
+            continue
+        rest = match.group("rest").strip()
+        tail = re.search(
+            r"(?P<gross>\d{1,3}(?:\.\d{3})*,\d{2})\s+"
+            r"(?P<discount>\d{1,3}(?:\.\d{3})*,\d{2})\s+"
+            r"(?P<paid_date>\d{2}/\d{2}/\d{4})\s+"
+            r"(?P<net>\d{1,3}(?:\.\d{3})*,\d{2})$",
+            rest,
+        )
+        if not tail:
+            continue
+        worker = " ".join(match.group("worker").split())
+        cpf = match.group("cpf")
+        role = " ".join(rest[:tail.start()].split())
+        gross = parse_brl(tail.group("gross"))
+        discount = parse_brl(tail.group("discount"))
+        net = parse_brl(tail.group("net"))
+        paid_date = datetime.strptime(tail.group("paid_date"), "%d/%m/%Y").date()
+        if net is None:
+            continue
+        details = {
+            "cpf": cpf,
+            "cargo": role,
+            "periodo": period,
+            "empresa": company,
+            "vencimentos": str(gross or ""),
+            "descontos": str(discount or ""),
+            "liquido": str(net),
+        }
+        text_original = (
+            f"Folha de pagamento: {worker} | CPF: {cpf} | Cargo: {role} | "
+            f"Vencimentos: {tail.group('gross')} | Descontos: {tail.group('discount')} | "
+            f"Pgto: {tail.group('paid_date')} | Líquido: {tail.group('net')}"
+        )
+        results.append(
+            ParsedReceipt(
+                data=paid_date,
+                hora=None,
+                favorecido=worker,
+                valor=net,
+                tipo_operacao="FOLHA",
+                texto_original=text_original,
+                pagina_numero=page_number,
+                origem_nome="FOLHA",
+                financeiros=FinancialValues(valor_original=gross, valor_desconto=discount, valor_pago=net, detalhes=details),
+                beneficiario=worker,
+                numero_documento=cpf,
+            )
+        )
+
+    if results:
+        return results
+
+    def is_amount_line(value: str) -> bool:
+        return bool(re.fullmatch(r"\d{1,3}(?:\.\d{3})*,\d{2}", value.strip()))
+
+    def make_receipt(worker: str, cpf: str, role: str, gross_text: str, discount_text: str, net_text: str, paid_text: str) -> ParsedReceipt | None:
+        gross = parse_brl(gross_text)
+        discount = parse_brl(discount_text)
+        net = parse_brl(net_text)
+        if net is None:
+            return None
+        paid_date = datetime.strptime(paid_text, "%d/%m/%Y").date()
+        clean_worker = " ".join(worker.split())
+        clean_role = " ".join(role.split())
+        details = {
+            "cpf": cpf,
+            "cargo": clean_role,
+            "periodo": period,
+            "empresa": company,
+            "vencimentos": str(gross or ""),
+            "descontos": str(discount or ""),
+            "liquido": str(net),
+        }
+        text_original = (
+            f"Folha de pagamento: {clean_worker} | CPF: {cpf} | Cargo: {clean_role} | "
+            f"Vencimentos: {gross_text} | Descontos: {discount_text} | Pgto: {paid_text} | Líquido: {net_text}"
+        )
+        return ParsedReceipt(
+            data=paid_date,
+            hora=None,
+            favorecido=clean_worker,
+            valor=net,
+            tipo_operacao="FOLHA",
+            texto_original=text_original,
+            pagina_numero=page_number,
+            origem_nome="FOLHA",
+            financeiros=FinancialValues(valor_original=gross, valor_desconto=discount, valor_pago=net, detalhes=details),
+            beneficiario=clean_worker,
+            numero_documento=cpf,
+        )
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    skip_names = {"TRABALHADOR", "VENCIMENTOS", "DESCONTOS", "LIQUIDO", "LÍQUIDO", "CARGO", "CPF", "DT. PGTO.", "TOTAL GERAL:"}
+    normalized_skip_names = {normalize_name(item) for item in skip_names}
+    index = 0
+    while index + 6 < len(lines):
+        worker = lines[index]
+        normalized_worker = normalize_name(worker)
+        if (
+            normalized_worker not in normalized_skip_names
+            and not is_amount_line(worker)
+            and not re.fullmatch(r"\d{3}\.\d{3}\.\d{3}-\d{2}", worker)
+            and is_amount_line(lines[index + 1])
+            and is_amount_line(lines[index + 2])
+            and is_amount_line(lines[index + 3])
+            and re.fullmatch(r"\d{3}\.\d{3}\.\d{3}-\d{2}", lines[index + 5])
+            and re.fullmatch(r"\d{2}/\d{2}/\d{4}", lines[index + 6])
+        ):
+            receipt = make_receipt(worker, lines[index + 5], lines[index + 4], lines[index + 1], lines[index + 2], lines[index + 3], lines[index + 6])
+            if receipt:
+                results.append(receipt)
+            index += 7
+            continue
+        index += 1
+    return results
+
+
 def extract_loan_receipts(text: str, page_number: int) -> list[ParsedReceipt]:
     normalized = normalize_name(text)
     if not any(term in normalized for term in ("EMPRESTIMO", "FINANCIAMENTO", "CONTRATO", "OPERACAO")):

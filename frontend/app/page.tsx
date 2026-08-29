@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { ArrowRight, Banknote, Building2, Clock3, FileText, ListFilter, Plus, ReceiptText, RefreshCw, Route, Trash2, Users, WalletCards, X } from "lucide-react";
+import { ArrowRight, Banknote, Building2, Clock3, FileSpreadsheet, FileText, ListFilter, Plus, ReceiptText, RefreshCw, Route, Trash2, Users, WalletCards, X } from "lucide-react";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 type Client = { id: string; nome: string };
@@ -32,8 +32,9 @@ const bankLogos: Record<string, string> = {
   Apropriações: "/bancos/apropriacoes.png",
   "Empréstimos/Financeiro": "/bancos/emprestimos.svg",
   "Empréstimos/Financiamentos": "/bancos/emprestimos.svg",
+  "Folha de Pagamento": "/bancos/emprestimos.svg",
 };
-type ConciliatorKey = "bancos" | "notas" | "despesas";
+type ConciliatorKey = "bancos" | "notas" | "despesas" | "folha";
 
 const processProgressBanks = ["Banco do Brasil", "Santander", "BASA", "Bradesco", "Caixa"];
 const conciliatorOptions = [
@@ -61,6 +62,14 @@ const conciliatorOptions = [
     area: "Apropriações",
     icon: WalletCards,
   },
+  {
+    key: "folha" as const,
+    title: "Folha de Pagamento",
+    desc: "Relatórios de folha, regras próprias e CSV separado.",
+    href: "/conciliacao/nova?tipo=folha",
+    area: "Folha de Pagamento",
+    icon: FileSpreadsheet,
+  },
 ];
 
 const periodTouchesYear = (process: Process, year: string) => {
@@ -79,9 +88,10 @@ const progressColor = (percent: number) => {
 const processBelongsToConciliator = (process: Process, key: ConciliatorKey) => {
   const banks = process.bancos.map((item) => item.banco);
   const hasPrimaryBank = banks.some((bank) => processProgressBanks.includes(bank));
-  if (key === "bancos") return hasPrimaryBank || !banks.includes("Notas") && !banks.includes("Apropriações");
+  if (key === "bancos") return hasPrimaryBank || !banks.includes("Notas") && !banks.includes("Apropriações") && !banks.includes("Folha de Pagamento");
   if (key === "notas") return banks.includes("Notas");
-  return banks.includes("Apropriações");
+  if (key === "despesas") return banks.includes("Apropriações");
+  return banks.includes("Folha de Pagamento");
 };
 
 const processVisibleInConciliator = (process: Process, key: ConciliatorKey) =>
@@ -367,7 +377,7 @@ export default function EntryPage() {
                          {(activeConciliator === "bancos" ? processProgressBanks : [activeOption.area]).map((bankName) => {
                            const bank = process.bancos.find((item) => item.banco === bankName);
                            const progress = bank?.progresso_regras ?? { total: 0, cobertos: 0, percentual: 0 };
-                           const AreaIcon = bankName === "Notas" ? ReceiptText : bankName === "Apropriações" ? WalletCards : null;
+                           const AreaIcon = bankName === "Notas" ? ReceiptText : bankName === "Apropriações" ? WalletCards : bankName === "Folha de Pagamento" ? FileSpreadsheet : null;
                            return (
                              <span
                                className="inline-flex min-w-0 items-center justify-center gap-1 rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5"
@@ -381,7 +391,7 @@ export default function EntryPage() {
                                ) : (
                                  <img src={bankLogos[bankName] ?? "/bancos/apropriacoes.png"} alt="" className="h-3.5 w-3.5 shrink-0 rounded-sm object-contain" />
                                )}
-                               {activeConciliator !== "bancos" && <span className="truncate text-[10px] font-semibold text-slate-600">{activeConciliator === "despesas" ? "Despesas" : bankName}</span>}
+                               {activeConciliator !== "bancos" && <span className="truncate text-[10px] font-semibold text-slate-600">{activeConciliator === "despesas" ? "Despesas" : activeConciliator === "folha" ? "Folha" : bankName}</span>}
                                <span className={`text-[10px] font-bold leading-none tabular-nums ${progressColor(progress.percentual)}`}>{progress.percentual}%</span>
                              </span>
                            );

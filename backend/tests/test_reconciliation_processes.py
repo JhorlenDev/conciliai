@@ -222,6 +222,37 @@ def test_delete_notes_area_keeps_process_and_bank_reconciliations(tmp_path):
     assert not file_path.exists()
 
 
+def test_note_source_rule_can_use_payment_type_as_trigger():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.commit()
+    process = create_reconciliation_process(ProcessoConciliacaoInput(cliente_id=client.id, data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31)), session)
+    notes = resume_process_bank(process["id"], ProcessoBancoInput(banco="Notas"), session)
+    file = Arquivo(conciliacao_id=notes["id"], tipo_documento="nota", banco_selecionado="Notas", nome_original="notas.pdf", caminho="/tmp/notas.pdf")
+    session.add(file); session.flush()
+    session.add(NotaFiscal(
+        conciliacao_id=notes["id"],
+        arquivo_id=file.id,
+        pagina_numero=1,
+        data_emissao=date(2024, 1, 3),
+        fornecedor="ANDERSON DA SILVA CUNHA",
+        numero_nota="1195",
+        valor_total=Decimal("120.00"),
+        dados_originais={"tipo_pagamento_label": "Cartão de crédito", "tipo_pagamento": "CARTAO_CREDITO", "data_pagamento": "2024-01-03", "gera_lancamento": True},
+    ))
+    session.commit()
+
+    data = source_accounting_rules(notes["id"], "nota", session)
+    assert data["pendentes"][0]["tipo_pagamento_label"] == "Cartão crédito"
+
+    result = create_source_accounting_rule(notes["id"], "nota", RegraFonteInput(gatilho="cartao credito", conta_debito="Clientes diversos", conta_credito="Cartão", historico="Venda cartão", complemento="1195"), session)
+
+    assert result["regras"]["resumo"] == {"total": 1, "classificados": 1, "pendentes": 0}
+    assert result["regras"]["salvas"][0]["cobertos"] == 1
+
+
 def test_reprocessing_statement_clears_previous_reconciliation_results(tmp_path):
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)

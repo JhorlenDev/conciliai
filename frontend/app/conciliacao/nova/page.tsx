@@ -10,6 +10,7 @@ import {
   Check,
   ClipboardList,
   Download,
+  Eye,
   FileSpreadsheet,
   FileText,
   FolderOpen,
@@ -18,8 +19,10 @@ import {
   PlayCircle,
   RotateCcw,
   Save,
+  Trash2,
   UploadCloud,
   WandSparkles,
+  X,
 } from "lucide-react";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -29,19 +32,23 @@ type BankProgress = { total: number; cobertos: number; percentual: number };
 type Reconciliation = { id: string; banco: string; status?: string; progresso_regras?: BankProgress };
 type Process = { id: string; cliente_id?: string; cliente_nome?: string; data_inicio?: string; data_fim?: string; bancos: Reconciliation[] };
 type UploadStatus = Record<string, { status: "uploading" | "done" | "error" | "processed"; message: string }>;
+type Viewer = { arquivoId: string; pagina: number; titulo: string };
 type Review = {
   extratos?: unknown[];
   comprovantes?: unknown[];
   maquininhas?: unknown[];
   emprestimos?: unknown[];
+  folhas?: unknown[];
   notas?: unknown[];
   rfb?: unknown[];
   arquivos?: { id: string; nome: string; tipo: string; status: string; erro: string | null }[];
 };
 type RulesPayload = {
   pendentes?: unknown[];
+  classificados?: unknown[];
   salvas?: unknown[];
   ignoradas?: unknown[];
+  resumo?: { total?: number; classificados?: number; pendentes?: number };
   integridade?: { csv_permitido?: boolean };
 };
 type ResultRow = {
@@ -52,6 +59,12 @@ type ResultRow = {
   situacao?: string;
   fonte_regra?: string;
   lancamentos?: unknown[];
+  extrato_arquivo_id?: string | null;
+  extrato_pagina?: number | null;
+  comprovante_arquivo_id?: string | null;
+  comprovante_pagina?: number | null;
+  rfb_arquivo_id?: string | null;
+  rfb_pagina?: number | null;
 };
 type RuleForm = {
   gatilho: string;
@@ -68,7 +81,7 @@ type RulePreview = {
   motivo?: string;
   lancamentos?: { data?: string; historico?: string; componente?: string; fonte?: string }[];
 };
-type FlowType = "bancos" | "notas" | "despesas";
+type FlowType = "bancos" | "notas" | "despesas" | "folha";
 
 const flowConfigs: Record<FlowType, { title: string; area: string; support: string[]; step2: string; step2Desc: string; summary: string }> = {
   bancos: {
@@ -95,6 +108,14 @@ const flowConfigs: Record<FlowType, { title: string; area: string; support: stri
     step2Desc: "Documentos avulsos e regras",
     summary: "Documentos gerais fora do fluxo bancário, com regras e exportação próprios.",
   },
+  folha: {
+    title: "Conciliador de Folha de Pagamento",
+    area: "Folha de Pagamento",
+    support: [],
+    step2: "Folha de pagamento",
+    step2Desc: "Relatórios e regras",
+    summary: "Relatórios de folha com conferência, regras próprias e exportação separada.",
+  },
 };
 
 const steps = [
@@ -119,6 +140,7 @@ const supportOptions = [
   { name: "Conta Caixa", hint: "Movimentos em espécie fora do banco.", icon: Banknote },
   { name: "Apropriações", hint: "Lançamentos de provisão e ajustes.", icon: ClipboardList },
   { name: "Empréstimos/Financiamentos", hint: "Contratos, PDFs e planilhas de amortização.", icon: FileSpreadsheet },
+  { name: "Folha de Pagamento", hint: "Líquido da folha para conciliar com o banco.", icon: FileSpreadsheet },
 ];
 
 const bankNames = bankOptions.map((bank) => bank.name);
@@ -127,6 +149,7 @@ const loanAccept = "application/pdf,.pdf,.xlsx,.xlsm,.csv,text/csv";
 function uploadDocumentsFor(area: string, support: string[] = []) {
   if (area === "Notas") return [{ type: "nota", label: "NFS-e", accept: "application/pdf,.pdf", multiple: true }];
   if (area === "Apropriações") return [{ type: "comprovante", label: "Despesas gerais", accept: "application/pdf,.pdf", multiple: true }];
+  if (area === "Folha de Pagamento") return [{ type: "folha_pagamento", label: "Folha de pagamento", accept: "application/pdf,.pdf", multiple: true }];
   if (bankNames.includes(area)) {
     const documents = [
       { type: "extrato", label: "Extrato", accept: "application/pdf,.pdf" },
@@ -135,6 +158,7 @@ function uploadDocumentsFor(area: string, support: string[] = []) {
       { type: "maquininha_extrato", label: area === "Santander" ? "Extrato Getnet" : "Maquininhas", accept: "application/pdf,.pdf", multiple: true },
     ];
     if (support.includes("Empréstimos/Financiamentos")) documents.push({ type: "emprestimo", label: "Emprést./Fin.", accept: loanAccept, multiple: true });
+    if (support.includes("Folha de Pagamento")) documents.push({ type: "folha_pagamento", label: "Folha", accept: "application/pdf,.pdf", multiple: true });
     return documents;
   }
   return [];
@@ -194,15 +218,18 @@ export default function GuidedReconciliationPage() {
   const [rules, setRules] = useState<RulesPayload>({});
   const [results, setResults] = useState<ResultRow[]>([]);
   const [panelLoading, setPanelLoading] = useState(false);
+  const [viewer, setViewer] = useState<Viewer | null>(null);
   const [ruleForm, setRuleForm] = useState<RuleForm>({ gatilho: "", texto_exclusao: "", natureza: "Crédito", conta_debito: "", conta_credito: "", historico: "", complemento: "Conforme extrato bancário", tipo_componente: "PRINCIPAL" });
   const [rulePreview, setRulePreview] = useState<RulePreview | null>(null);
   const [ruleBusy, setRuleBusy] = useState("");
+  const [rulesTab, setRulesTab] = useState<"pending" | "saved" | "hidden">("pending");
+  const [ruleSuggestions, setRuleSuggestions] = useState<string[]>([]);
   const [editingRuleId, setEditingRuleId] = useState("");
   const [expandedRuleId, setExpandedRuleId] = useState("");
 
   useEffect(() => {
     const param = new URLSearchParams(window.location.search).get("tipo");
-    const nextType: FlowType = param === "notas" || param === "despesas" ? param : "bancos";
+    const nextType: FlowType = param === "notas" || param === "despesas" || param === "folha" ? param : "bancos";
     const config = flowConfigs[nextType];
     setFlowType(nextType);
     setSelectedBanks([config.area]);
@@ -238,6 +265,7 @@ export default function GuidedReconciliationPage() {
   const activeUploadDocument = activeDocuments.find((item) => item.type === uploadTab) ?? activeDocuments[0];
   const selectedExistingBank = matchingProcess?.bancos.find((item) => item.banco === selectedBanks[0]);
   const selectedBankLocked = bankHasGuidedLock(selectedExistingBank);
+  const isNotesRules = activeArea === "Notas";
 
   useEffect(() => {
     if (activeDocuments.length && !activeDocuments.some((item) => item.type === uploadTab)) setUploadTab(activeDocuments[0].type);
@@ -257,10 +285,13 @@ export default function GuidedReconciliationPage() {
     if (!activeReconciliation || ![4, 5, 6, 7].includes(activeStep)) return;
     let cancelled = false;
     setPanelLoading(true);
+    const rulesUrl = activeReconciliation.banco === "Notas"
+      ? `${API}/api/conciliacoes/${activeReconciliation.id}/regras-fonte/nota`
+      : `${API}/api/conciliacoes/${activeReconciliation.id}/regras-contabeis`;
     Promise.all([
       fetch(`${API}/api/conciliacoes/${activeReconciliation.id}/revisao`, { cache: "no-store" }).then((response) => (response.ok ? response.json() : {})),
       fetch(`${API}/api/conciliacoes/${activeReconciliation.id}/resultado`, { cache: "no-store" }).then((response) => (response.ok ? response.json() : [])),
-      fetch(`${API}/api/conciliacoes/${activeReconciliation.id}/regras-contabeis`, { cache: "no-store" }).then((response) => (response.ok ? response.json() : {})),
+      fetch(rulesUrl, { cache: "no-store" }).then((response) => (response.ok ? response.json() : {})),
     ])
       .then(([nextReview, nextResults, nextRules]) => {
         if (cancelled) return;
@@ -374,6 +405,26 @@ export default function GuidedReconciliationPage() {
     }
   }
 
+  async function deleteDocument(fileId: string) {
+    if (!activeReconciliation) return;
+    const key = `${activeReconciliation.id}:delete`;
+    setUploadStatus((current) => ({ ...current, [key]: { status: "uploading", message: "Excluindo arquivo..." } }));
+    try {
+      const response = await fetch(`${API}/api/arquivos/${fileId}`, { method: "DELETE" });
+      if (!response.ok) throw new Error((await response.json()).detail ?? "Não foi possível excluir o arquivo.");
+      const reviewResponse = await fetch(`${API}/api/conciliacoes/${activeReconciliation.id}/revisao`, { cache: "no-store" });
+      if (reviewResponse.ok) setReview(await reviewResponse.json());
+      await refreshRules();
+      setResults([]);
+      setUploadStatus((current) => ({ ...current, [key]: { status: "done", message: "Arquivo excluído." } }));
+      setMessage("Arquivo excluído. Processe novamente quando terminar os envios.");
+    } catch (error) {
+      const fallback = error instanceof Error ? error.message : "Não foi possível excluir o arquivo.";
+      setUploadStatus((current) => ({ ...current, [key]: { status: "error", message: fallback } }));
+      setMessage(fallback);
+    }
+  }
+
   async function processActive() {
     if (!activeReconciliation) return;
     const key = `${activeReconciliation.id}:processar`;
@@ -390,7 +441,20 @@ export default function GuidedReconciliationPage() {
 
   function selectPendingRule(raw: unknown) {
     const row = raw as Record<string, unknown>;
-    const history = String(row.historico ?? row.gatilho_sugerido ?? "");
+    const paymentTrigger = isNotesRules && row.tipo_pagamento_label && row.tipo_pagamento_label !== "Não identificado" ? String(row.tipo_pagamento_label) : "";
+    const history = paymentTrigger || String(row.historico ?? row.gatilho_sugerido ?? row.texto ?? "");
+    const suggestions = [
+      row.gatilho_sugerido,
+      row.historico,
+      row.texto,
+      row.tipo_pagamento_label,
+      row.forma_pagamento,
+      row.documento,
+      row.valor,
+    ]
+      .map((item) => String(item ?? "").trim())
+      .filter((item) => item && item !== "—" && item !== "Não identificado");
+    setRuleSuggestions(Array.from(new Set(suggestions)).slice(0, 6));
     setRulePreview(null);
     setRuleForm({
       gatilho: history,
@@ -399,8 +463,8 @@ export default function GuidedReconciliationPage() {
       conta_debito: "",
       conta_credito: "",
       historico: history,
-      complemento: "Conforme extrato bancário",
-      tipo_componente: String(row.tipo_componente ?? "PRINCIPAL"),
+      complemento: isNotesRules ? String(row.documento && row.documento !== "—" ? row.documento : "Conforme nota fiscal") : "Conforme extrato bancário",
+      tipo_componente: String(row.tipo_componente ?? row.tipo_lancamento ?? "PRINCIPAL"),
     });
   }
 
@@ -408,6 +472,7 @@ export default function GuidedReconciliationPage() {
     const row = raw as Record<string, unknown>;
     setEditingRuleId(String(row.id ?? ""));
     setExpandedRuleId(String(row.id ?? ""));
+    setRuleSuggestions([]);
     setRulePreview(null);
     setRuleForm({
       gatilho: String(row.gatilho ?? ""),
@@ -425,6 +490,7 @@ export default function GuidedReconciliationPage() {
   function newGuidedRule() {
     setEditingRuleId("");
     setRulePreview(null);
+    setRuleSuggestions([]);
     setRuleForm({ gatilho: "", texto_exclusao: "", natureza: "Crédito", conta_debito: "", conta_credito: "", historico: "", complemento: "Conforme extrato bancário", tipo_componente: "PRINCIPAL" });
     setActiveStep(5);
   }
@@ -443,7 +509,7 @@ export default function GuidedReconciliationPage() {
     }
     setRuleBusy("preview");
     try {
-      const response = await fetch(`${API}/api/conciliacoes/${activeReconciliation.id}/regras-contabeis/previa`, {
+      const response = await fetch(`${API}/api/conciliacoes/${activeReconciliation.id}/${isNotesRules ? "regras-fonte/nota/previa" : "regras-contabeis/previa"}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -480,8 +546,11 @@ export default function GuidedReconciliationPage() {
     setMessage("Salvando regra...");
     setRuleBusy("save");
     try {
-      const response = await fetch(`${API}/api/conciliacoes/${activeReconciliation.id}/regras-contabeis${editingRuleId ? `/${editingRuleId}` : ""}`, {
-        method: editingRuleId ? "PATCH" : "POST",
+      const url = isNotesRules
+        ? `${API}/api/conciliacoes/${activeReconciliation.id}/regras-fonte/nota`
+        : `${API}/api/conciliacoes/${activeReconciliation.id}/regras-contabeis${editingRuleId ? `/${editingRuleId}` : ""}`;
+      const response = await fetch(url, {
+        method: editingRuleId && !isNotesRules ? "PATCH" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(ruleForm),
       });
@@ -490,7 +559,8 @@ export default function GuidedReconciliationPage() {
       if (result.regras) setRules(result.regras);
       setRulePreview(null);
       setEditingRuleId("");
-      setMessage(editingRuleId ? "Regra atualizada." : `Regra salva e aplicada a ${result.movimentos_aplicados ?? 0} lançamento(s).`);
+      setRulesTab("saved");
+      setMessage(isNotesRules ? "Regra de notas salva." : editingRuleId ? "Regra atualizada." : `Regra salva e aplicada a ${result.movimentos_aplicados ?? 0} lançamento(s).`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Não foi possível salvar a regra.");
     } finally {
@@ -500,7 +570,7 @@ export default function GuidedReconciliationPage() {
 
   async function refreshRules() {
     if (!activeReconciliation) return;
-    const response = await fetch(`${API}/api/conciliacoes/${activeReconciliation.id}/regras-contabeis`, { cache: "no-store" });
+    const response = await fetch(`${API}/api/conciliacoes/${activeReconciliation.id}/${isNotesRules ? "regras-fonte/nota" : "regras-contabeis"}`, { cache: "no-store" });
     if (response.ok) setRules(await response.json());
   }
 
@@ -508,7 +578,12 @@ export default function GuidedReconciliationPage() {
     if (!activeReconciliation) return;
     setRuleBusy(ruleId);
     try {
-      const response = await fetch(`${API}/api/conciliacoes/${activeReconciliation.id}/regras-contabeis/${ruleId}${scope === "periodo" ? "/periodo" : ""}`, { method: "DELETE" });
+      const response = await fetch(
+        isNotesRules
+          ? `${API}/api/conciliacoes/${activeReconciliation.id}/regras-fonte/nota/${ruleId}`
+          : `${API}/api/conciliacoes/${activeReconciliation.id}/regras-contabeis/${ruleId}${scope === "periodo" ? "/periodo" : ""}`,
+        { method: "DELETE" },
+      );
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.detail ?? "Não foi possível remover a regra.");
       if (result.regras) setRules(result.regras);
@@ -722,7 +797,7 @@ export default function GuidedReconciliationPage() {
                     </div> : (
                       <div className="rounded-lg border border-teal-200 bg-teal-50 p-4">
                         <span className="text-xs font-bold uppercase tracking-wide text-teal-700">{flowConfig.title}</span>
-                        <h3 className="mt-1 text-lg font-black text-slate-900">{flowType === "notas" ? "Notas fiscais" : "Despesas Gerais"}</h3>
+                        <h3 className="mt-1 text-lg font-black text-slate-900">{displayAreaName(flowConfig.area, flowType)}</h3>
                         <p className="mt-1 text-sm font-medium text-slate-600">{flowConfig.summary}</p>
                         {matchingProcess && (
                           <p className="mt-3 text-xs font-semibold text-amber-800">
@@ -790,11 +865,14 @@ export default function GuidedReconciliationPage() {
                             <input type="file" className="hidden" accept={doc.accept} multiple={doc.multiple} disabled={busy || !activeReconciliation} onChange={(event) => activeReconciliation && uploadFile(activeReconciliation.id, doc.type, event)} />
                           </label>
                           {status && <p className={`mt-3 text-xs font-semibold ${status.status === "error" ? "text-red-700" : "text-teal-700"}`}>{status.message}</p>}
+                          {uploadStatus[`${activeReconciliation?.id}:delete`]?.message && <p className={`mt-2 text-xs font-semibold ${uploadStatus[`${activeReconciliation?.id}:delete`]?.status === "error" ? "text-red-700" : "text-teal-700"}`}>{uploadStatus[`${activeReconciliation?.id}:delete`]?.message}</p>}
                           <div className="mt-5 rounded-lg border border-slate-200 bg-white text-left">
                             {(review.arquivos ?? []).filter((file) => file.tipo === doc.type).slice(0, 8).map((file) => (
                               <div className="flex items-center justify-between gap-3 border-b border-slate-100 px-3 py-2 last:border-b-0" key={file.id}>
                                 <span className="min-w-0 truncate text-xs font-semibold">{file.nome}</span>
                                 <span className={`rounded px-2 py-1 text-[11px] font-bold ${file.status === "concluido" ? "bg-teal-100 text-teal-800" : file.status === "erro" ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-800"}`}>{file.status}</span>
+                                <button type="button" onClick={() => setViewer({ arquivoId: file.id, pagina: 1, titulo: file.nome })} title="Visualizar arquivo" aria-label={`Visualizar ${file.nome}`} className="rounded p-1 text-slate-700 hover:bg-slate-100"><Eye size={15} /></button>
+                                <button type="button" onClick={() => deleteDocument(file.id)} title="Excluir arquivo" aria-label={`Excluir ${file.nome}`} className="rounded p-1 text-red-600 hover:bg-red-50"><Trash2 size={15} /></button>
                               </div>
                             ))}
                             {!(review.arquivos ?? []).some((file) => file.tipo === doc.type) && <p className="px-3 py-3 text-xs text-slate-500">Nenhum arquivo enviado nesta aba.</p>}
@@ -809,38 +887,86 @@ export default function GuidedReconciliationPage() {
 
             {activeStep === 4 && (
               <GuidedPanel title="Conciliação" loading={panelLoading} action={<button onClick={processActive} disabled={!activeReconciliation} className="inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800 disabled:opacity-60"><PlayCircle size={15} />Reprocessar</button>}>
-                <StatsGrid items={[["Extrato", count(review.extratos)], ["Comprovantes", count(review.comprovantes)], ["RFB", count(review.rfb)], ["Resultados", results.length]]} />
-                <MiniTable rows={results.slice(0, 12)} />
+                <StatsGrid items={isNotesRules ? [["Notas extraídas", count(review.notas)], ["Regras criadas", count(rules.salvas)], ["Pendentes", count(rules.pendentes)]] : [["Extrato", count(review.extratos)], ["Comprovantes", count(review.comprovantes)], ["Folha", count(review.folhas)], ["RFB", count(review.rfb)], ["Resultados", results.length]]} />
+                {isNotesRules ? <NotesReviewTable rows={review.notas ?? []} onView={setViewer} /> : <MiniTable rows={results} onView={setViewer} />}
               </GuidedPanel>
             )}
 
             {activeStep === 5 && (
-              <GuidedPanel title="Criar regras" loading={panelLoading} action={<button onClick={() => setActiveStep(6)} className="inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800"><WandSparkles size={15} />Regras salvas</button>}>
-                <StatsGrid items={[["Regras a criar", count(rules.pendentes)], ["Ocultas", count(rules.ignoradas)], ["Salvas", count(rules.salvas)]]} />
-                <div className="grid gap-4 xl:grid-cols-[1fr_420px]">
-                  <PendingRules rows={rules.pendentes ?? []} onSelect={selectPendingRule} />
-                  <form onSubmit={saveGuidedRule} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <h3 className="font-bold">{editingRuleId ? "Editar regra" : "Nova regra"}</h3>
-                      {editingRuleId && <button type="button" onClick={newGuidedRule} className="rounded border border-slate-200 bg-white px-2 py-1 text-xs font-bold text-slate-700">Cancelar edição</button>}
+              <GuidedPanel title="Criar regras" loading={panelLoading}>
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                  <div className="flex flex-wrap gap-1.5">
+                    <button type="button" onClick={() => setRulesTab("pending")} className={`rounded-full px-3 py-1 text-xs font-bold ${rulesTab === "pending" ? "bg-slate-900 text-white" : "border border-slate-200 bg-white text-slate-700"}`}>Regras a criar · {count(rules.pendentes)}</button>
+                    <button type="button" onClick={() => setRulesTab("saved")} className={`rounded-full px-3 py-1 text-xs font-bold ${rulesTab === "saved" ? "bg-teal-700 text-white" : "border border-teal-200 bg-white text-teal-800"}`}>Salvas · {count(rules.salvas)}</button>
+                    <button type="button" onClick={() => setRulesTab("hidden")} className={`rounded-full px-3 py-1 text-xs font-bold ${rulesTab === "hidden" ? "bg-violet-700 text-white" : "border border-violet-200 bg-white text-violet-800"}`}>Ocultas · {count(rules.ignoradas)}</button>
+                  </div>
+                  <span className="text-[11px] font-semibold text-slate-500">Selecione uma pendência, valide a cobertura e salve a regra.</span>
+                </div>
+                {rulesTab === "pending" && <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_390px]">
+                  <PendingRules rows={rules.pendentes ?? []} onSelect={selectPendingRule} onView={setViewer} showNotePayment={isNotesRules} />
+                  <form onSubmit={saveGuidedRule} className="h-fit rounded-xl border border-slate-200 bg-white p-3 shadow-sm">
+                    <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-2">
+                      <div>
+                        <span className="rounded bg-teal-50 px-2 py-1 text-[10px] font-black uppercase tracking-wide text-teal-800">Regra contábil</span>
+                        <h3 className="mt-2 text-sm font-black text-slate-900">{editingRuleId ? "Editar regra" : "Nova regra"}</h3>
+                      </div>
+                      {editingRuleId && <button type="button" onClick={newGuidedRule} className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-bold text-slate-700 hover:bg-slate-50">Nova</button>}
                     </div>
-                    <div className="mt-3 grid gap-3">
-                      <label className="text-xs font-bold text-slate-600">Gatilho<input required value={ruleForm.gatilho} onChange={(event) => updateRuleForm({ gatilho: event.target.value })} className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal" /></label>
-                      <label className="text-xs font-bold text-slate-600">Não contém<input value={ruleForm.texto_exclusao} onChange={(event) => updateRuleForm({ texto_exclusao: event.target.value })} className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal" /></label>
-                      <div className="grid gap-3 md:grid-cols-2">
-                        <label className="text-xs font-bold text-slate-600">Natureza<select value={ruleForm.natureza} onChange={(event) => updateRuleForm({ natureza: event.target.value })} className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal"><option>Crédito</option><option>Débito</option></select></label>
-                        <label className="text-xs font-bold text-slate-600">Tipo<input value={ruleForm.tipo_componente} onChange={(event) => updateRuleForm({ tipo_componente: event.target.value })} className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal" /></label>
+                    <div className="mt-3 grid gap-2.5">
+                      <RuleField label="Gatilho">
+                        <input required value={ruleForm.gatilho} onChange={(event) => updateRuleForm({ gatilho: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="palavra chave..." />
+                      </RuleField>
+                      {!!ruleSuggestions.length && (
+                        <div className="flex flex-wrap gap-1.5">
+                          {ruleSuggestions.map((suggestion) => (
+                            <button
+                              type="button"
+                              key={suggestion}
+                              onClick={() => updateRuleForm({ gatilho: suggestion })}
+                              className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-bold text-slate-600 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                              title={suggestion}
+                            >
+                              {suggestion.length > 28 ? `${suggestion.slice(0, 28)}...` : suggestion}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      <RuleField label="Não contém">
+                        <input value={ruleForm.texto_exclusao} onChange={(event) => updateRuleForm({ texto_exclusao: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="texto de exclusão..." />
+                      </RuleField>
+                      <div className="grid grid-cols-[1fr_1fr] gap-2">
+                        <RuleField label="Natureza">
+                          <select value={ruleForm.natureza} onChange={(event) => updateRuleForm({ natureza: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800"><option>Crédito</option><option>Débito</option></select>
+                        </RuleField>
+                        <RuleField label="Tipo">
+                          <input value={ruleForm.tipo_componente} onChange={(event) => updateRuleForm({ tipo_componente: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800" />
+                        </RuleField>
                       </div>
-                      <div className="grid gap-3 md:grid-cols-2">
-                        <label className="text-xs font-bold text-slate-600">Débito<input required value={ruleForm.conta_debito} onChange={(event) => updateRuleForm({ conta_debito: event.target.value })} className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal" /></label>
-                        <label className="text-xs font-bold text-slate-600">Crédito<input required value={ruleForm.conta_credito} onChange={(event) => updateRuleForm({ conta_credito: event.target.value })} className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal" /></label>
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 p-2.5">
+                        <div className="mb-2 flex items-center justify-between">
+                          <span className="text-[10px] font-black uppercase tracking-wide text-slate-500">Lançamento</span>
+                          <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-bold text-slate-500">D → C</span>
+                        </div>
+                        <div className="grid grid-cols-[1fr_auto_1fr] items-end gap-2">
+                          <RuleField label="Débito">
+                            <input required value={ruleForm.conta_debito} onChange={(event) => updateRuleForm({ conta_debito: event.target.value })} className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="Selecionar" />
+                          </RuleField>
+                          <span className="mb-1.5 text-slate-400"><ArrowRight size={15} /></span>
+                          <RuleField label="Crédito">
+                            <input required value={ruleForm.conta_credito} onChange={(event) => updateRuleForm({ conta_credito: event.target.value })} className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="Selecionar" />
+                          </RuleField>
+                        </div>
                       </div>
-                      <label className="text-xs font-bold text-slate-600">Histórico<input required value={ruleForm.historico} onChange={(event) => updateRuleForm({ historico: event.target.value })} className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal" /></label>
-                      <label className="text-xs font-bold text-slate-600">Complemento<input value={ruleForm.complemento} onChange={(event) => updateRuleForm({ complemento: event.target.value })} className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-normal" /></label>
-                      <div className="rounded-lg border border-slate-200 bg-white p-3">
+                      <RuleField label="Histórico contábil">
+                        <input required value={ruleForm.historico} onChange={(event) => updateRuleForm({ historico: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800" />
+                      </RuleField>
+                      <RuleField label="Complemento">
+                        <input value={ruleForm.complemento} onChange={(event) => updateRuleForm({ complemento: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800" />
+                      </RuleField>
+                      <div className="rounded-lg border border-teal-100 bg-teal-50 p-2.5">
                         <div className="flex items-center justify-between gap-3">
-                          <strong className="text-sm">Cobertura</strong>
-                          <button type="button" disabled={ruleBusy === "preview"} onClick={() => calculateRuleCoverage()} className="rounded bg-slate-900 px-3 py-1.5 text-xs font-bold text-white disabled:cursor-wait disabled:opacity-60">{ruleBusy === "preview" ? "Validando..." : "Ver cobertura"}</button>
+                          <strong className="text-xs text-teal-950">Cobertura</strong>
+                          <button type="button" disabled={ruleBusy === "preview"} onClick={() => calculateRuleCoverage()} className="rounded-full bg-slate-900 px-2.5 py-1 text-[11px] font-bold text-white disabled:cursor-wait disabled:opacity-60">{ruleBusy === "preview" ? "Validando..." : "Ver cobertura"}</button>
                         </div>
                         {rulePreview ? (
                           <div className="mt-3">
@@ -848,7 +974,7 @@ export default function GuidedReconciliationPage() {
                               {rulePreview.quantidade > 0 ? `Vai cobrir ${rulePreview.quantidade} lançamento(s).` : rulePreview.motivo || "Não cobre lançamentos elegíveis."}
                             </p>
                             {!!rulePreview.lancamentos?.length && (
-                              <div className="mt-2 max-h-36 overflow-y-auto rounded border border-slate-100">
+                              <div className="mt-2 max-h-32 overflow-y-auto rounded border border-teal-100 bg-white">
                                 {rulePreview.lancamentos.slice(0, 8).map((item, index) => (
                                   <div className="border-b border-slate-100 px-2 py-1.5 text-[11px] last:border-b-0" key={index}>
                                     <strong>{item.data ?? "—"}</strong> · {item.historico ?? "—"} · {item.componente ?? "PRINCIPAL"}
@@ -859,10 +985,12 @@ export default function GuidedReconciliationPage() {
                           </div>
                         ) : <p className="mt-2 text-xs text-slate-500">Valide antes de salvar.</p>}
                       </div>
-                      <button disabled={ruleBusy === "save"} className="inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800 disabled:cursor-wait disabled:opacity-60">{ruleBusy === "save" ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}{editingRuleId ? "Atualizar" : "Salvar"}</button>
+                      <button disabled={ruleBusy === "save"} className="inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800 disabled:cursor-wait disabled:opacity-60">{ruleBusy === "save" ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}{editingRuleId ? "Atualizar regra" : "Salvar regra"}</button>
                     </div>
                   </form>
-                </div>
+                </div>}
+                {rulesTab === "saved" && <SavedRules rows={rules.salvas ?? []} expandedRuleId={expandedRuleId} busyId={ruleBusy} onToggle={setExpandedRuleId} onEdit={isNotesRules ? () => setMessage("Para alterar regra de notas, exclua e crie novamente com o novo gatilho.") : editSavedRule} onRemovePeriod={(id) => removeRule(id, "periodo")} onRemoveGlobal={(id) => removeRule(id, "global")} />}
+                {rulesTab === "hidden" && (isNotesRules ? <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">Notas não usam regras ocultas por período.</div> : <HiddenRules rows={rules.ignoradas ?? []} busyId={ruleBusy} onRestore={restoreRule} />)}
               </GuidedPanel>
             )}
 
@@ -886,6 +1014,7 @@ export default function GuidedReconciliationPage() {
           </div>
         </section>
       </div>
+      {viewer && <PdfModal viewer={viewer} onClose={() => setViewer(null)} />}
       <style jsx global>{`
         .guided-compact {
           font-size: 13px;
@@ -924,6 +1053,24 @@ export default function GuidedReconciliationPage() {
         }
       `}</style>
     </main>
+  );
+}
+
+function PdfModal({ viewer, onClose }: { viewer: Viewer; onClose: () => void }) {
+  const url = `${API}/api/arquivos/${viewer.arquivoId}/visualizar#page=${viewer.pagina}`;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+      <section className="flex h-[90vh] w-full max-w-6xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl">
+        <div className="flex items-center justify-between border-b border-slate-200 px-4 py-2">
+          <div>
+            <strong className="text-sm text-slate-900">{viewer.titulo}</strong>
+            <p className="text-xs text-slate-500">Página {viewer.pagina}</p>
+          </div>
+          <button type="button" onClick={onClose} title="Fechar" aria-label="Fechar visualizador" className="rounded p-1 text-slate-600 hover:bg-slate-100"><X size={20} /></button>
+        </div>
+        <iframe src={url} className="min-h-0 flex-1" title={viewer.titulo} />
+      </section>
+    </div>
   );
 }
 
@@ -1000,6 +1147,15 @@ function StatsGrid({ items }: { items: [string, number][] }) {
   );
 }
 
+function RuleField({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <label className="block text-[10px] font-black uppercase tracking-wide text-slate-500">
+      {label}
+      <div className="mt-1">{children}</div>
+    </label>
+  );
+}
+
 function CadastroTable({ headers, rows }: { headers: string[]; rows: string[][] }) {
   return (
     <div className="overflow-x-auto rounded-lg border border-slate-200">
@@ -1015,13 +1171,13 @@ function CadastroTable({ headers, rows }: { headers: string[]; rows: string[][] 
   );
 }
 
-function MiniTable({ rows }: { rows: ResultRow[] }) {
+function MiniTable({ rows, onView }: { rows: ResultRow[]; onView: (viewer: Viewer) => void }) {
   if (!rows.length) return <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">Nenhum resultado processado ainda.</div>;
   return (
-    <div className="overflow-x-auto rounded-lg border border-slate-200">
+    <div className="max-h-[calc(100dvh-330px)] overflow-auto rounded-lg border border-slate-200">
       <table className="min-w-full text-sm">
-        <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
-          <tr><th className="px-3 py-2">Data</th><th className="px-3 py-2">Tipo</th><th className="px-3 py-2">Extrato</th><th className="px-3 py-2">Valor</th><th className="px-3 py-2">Situação</th><th className="px-3 py-2">Regra</th></tr>
+        <thead className="sticky top-0 z-10 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+          <tr><th className="px-3 py-2">Data</th><th className="px-3 py-2">Tipo</th><th className="px-3 py-2">Extrato</th><th className="px-3 py-2">Valor</th><th className="px-3 py-2">Situação</th><th className="px-3 py-2">Regra</th><th className="px-3 py-2">Doc.</th></tr>
         </thead>
         <tbody>
           {rows.map((row, index) => (
@@ -1032,6 +1188,11 @@ function MiniTable({ rows }: { rows: ResultRow[] }) {
               <td className="whitespace-nowrap px-3 py-2 font-semibold">{row.valor ?? "—"}</td>
               <td className="px-3 py-2 font-semibold">{row.situacao ?? "—"}</td>
               <td className="px-3 py-2">{row.fonte_regra ?? "—"} · {row.lancamentos?.length ?? 0} linha(s)</td>
+              <td className="whitespace-nowrap px-3 py-2">
+                {row.extrato_arquivo_id && <button type="button" onClick={() => onView({ arquivoId: row.extrato_arquivo_id!, pagina: Number(row.extrato_pagina || 1), titulo: "Extrato" })} title="Visualizar extrato" aria-label="Visualizar extrato" className="rounded p-1 text-slate-700 hover:bg-slate-100"><Eye size={14} /></button>}
+                {row.comprovante_arquivo_id && <button type="button" onClick={() => onView({ arquivoId: row.comprovante_arquivo_id!, pagina: Number(row.comprovante_pagina || 1), titulo: "Comprovante" })} title="Visualizar comprovante" aria-label="Visualizar comprovante" className="rounded p-1 text-teal-700 hover:bg-teal-50"><Eye size={14} /></button>}
+                {row.rfb_arquivo_id && <button type="button" onClick={() => onView({ arquivoId: row.rfb_arquivo_id!, pagina: Number(row.rfb_pagina || 1), titulo: "Comprovante RFB" })} title="Visualizar RFB" aria-label="Visualizar RFB" className="rounded p-1 text-violet-700 hover:bg-violet-50"><Eye size={14} /></button>}
+              </td>
             </tr>
           ))}
         </tbody>
@@ -1040,28 +1201,69 @@ function MiniTable({ rows }: { rows: ResultRow[] }) {
   );
 }
 
-function PendingRules({ rows, onSelect }: { rows: unknown[]; onSelect: (row: unknown) => void }) {
-  if (!rows.length) return <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">Nenhuma regra pendente para este banco.</div>;
+function NotesReviewTable({ rows, onView }: { rows: unknown[]; onView: (viewer: Viewer) => void }) {
+  if (!rows.length) return <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">Nenhuma nota extraída ainda.</div>;
   return (
-    <div className="overflow-x-auto rounded-lg border border-slate-200">
+    <div className="max-h-[calc(100dvh-330px)] overflow-auto rounded-lg border border-slate-200">
       <table className="min-w-full text-sm">
-        <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
-          <tr><th className="px-3 py-2">Histórico</th><th className="px-3 py-2">Valor</th><th className="px-3 py-2">Tipo</th><th className="px-3 py-2">Ação</th></tr>
+        <thead className="sticky top-0 z-10 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+          <tr><th className="px-3 py-2">Emissão</th><th className="px-3 py-2">Tomador</th><th className="px-3 py-2">Nota</th><th className="px-3 py-2">Pagamento</th><th className="px-3 py-2">Valor</th><th className="px-3 py-2">Doc.</th></tr>
         </thead>
         <tbody>
-          {rows.slice(0, 12).map((raw, index) => {
+          {rows.map((raw, index) => {
             const row = raw as Record<string, unknown>;
+            const data = row.dados_originais && typeof row.dados_originais === "object" ? row.dados_originais as Record<string, unknown> : {};
             return (
               <tr className="border-t border-slate-100" key={String(row.id ?? index)}>
-                <td className="max-w-[520px] px-3 py-2 text-xs font-semibold text-slate-700">{String(row.historico ?? row.gatilho ?? "—")}</td>
-                <td className="whitespace-nowrap px-3 py-2">{String(row.valor ?? "—")}</td>
-                <td className="px-3 py-2">{String(row.tipo_componente ?? "Principal")}</td>
-                <td className="px-3 py-2"><button type="button" onClick={() => onSelect(raw)} className="rounded bg-amber-100 px-2 py-1 text-xs font-bold text-amber-900 hover:bg-amber-200">Criar regra</button></td>
+                <td className="whitespace-nowrap px-3 py-2 font-mono text-xs">{String(row.data_emissao ?? data.data_emissao ?? "—")}</td>
+                <td className="max-w-[420px] px-3 py-2 text-xs font-semibold text-slate-700">{String(row.fornecedor ?? row.tomador ?? "—")}</td>
+                <td className="whitespace-nowrap px-3 py-2">{String(row.numero_nota ?? data.numero_nota ?? "—")}</td>
+                <td className="px-3 py-2">{String(row.tipo_pagamento_label ?? row.tipo_pagamento ?? row.forma_pagamento ?? data.tipo_pagamento_label ?? data.forma_pagamento ?? "—")}</td>
+                <td className="whitespace-nowrap px-3 py-2 font-semibold">{String(row.valor_total ?? data.valor_total ?? "—")}</td>
+                <td className="whitespace-nowrap px-3 py-2">{Boolean(row.arquivo_id) && <button type="button" onClick={() => onView({ arquivoId: String(row.arquivo_id), pagina: Number(row.pagina || 1), titulo: "Nota fiscal" })} title="Visualizar nota" aria-label="Visualizar nota" className="rounded p-1 text-slate-700 hover:bg-slate-100"><Eye size={14} /></button>}</td>
               </tr>
             );
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function PendingRules({ rows, onSelect, onView, showNotePayment = false }: { rows: unknown[]; onSelect: (row: unknown) => void; onView: (viewer: Viewer) => void; showNotePayment?: boolean }) {
+  if (!rows.length) return <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">Nenhuma regra pendente para este banco.</div>;
+  return (
+    <div className="max-h-[640px] space-y-2 overflow-y-auto pr-1">
+      {rows.slice(0, 24).map((raw, index) => {
+        const row = raw as Record<string, unknown>;
+        const history = String(row.historico ?? row.gatilho ?? row.texto ?? "—");
+        const date = String(row.data ?? row.data_emissao ?? "—");
+        const payment = String(row.tipo_pagamento_label ?? row.forma_pagamento ?? "");
+        const countText = row.cobertos ? `${String(row.cobertos)} cobertos` : "pendente";
+        return (
+          <article className="grid gap-3 rounded-xl border border-slate-200 bg-white p-3 shadow-sm transition hover:border-teal-300 hover:bg-slate-50 lg:grid-cols-[minmax(0,1fr)_110px_92px]" key={String(row.id ?? index)}>
+            <div className="min-w-0">
+              <span className="mb-1.5 inline-flex rounded bg-amber-50 px-2 py-0.5 text-[10px] font-black uppercase tracking-wide text-amber-800">{countText}</span>
+              <h3 className="line-clamp-2 text-xs font-black leading-5 text-slate-800" title={history}>{date} · {history}</h3>
+              <p className="mt-1 text-[11px] font-semibold text-slate-500">
+                Tipo: {String(row.tipo_componente ?? row.tipo_lancamento_label ?? "Principal")}
+                {showNotePayment && payment && payment !== "—" ? ` · Pagamento: ${payment}` : ""}
+              </p>
+            </div>
+            <div className="flex items-center justify-between gap-2 rounded-lg border border-slate-100 bg-slate-50 px-2 py-1.5 lg:block">
+              <span className="text-[10px] font-black uppercase tracking-wide text-slate-400">Valor</span>
+              <strong className="block text-xs text-slate-900 lg:mt-1">{String(row.valor ?? "—")}</strong>
+            </div>
+            <div className="flex items-center justify-end gap-1.5">
+              {Boolean(row.arquivo_id) && <button type="button" onClick={() => onView({ arquivoId: String(row.arquivo_id), pagina: Number(row.pagina || 1), titulo: "Documento" })} title="Visualizar documento" aria-label="Visualizar documento" className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50"><Eye size={14} /></button>}
+              <button type="button" onClick={() => onSelect(raw)} className="inline-flex h-8 items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3 text-xs font-bold text-white hover:bg-slate-800">
+                <WandSparkles size={14} />
+                Criar
+              </button>
+            </div>
+          </article>
+        );
+      })}
     </div>
   );
 }

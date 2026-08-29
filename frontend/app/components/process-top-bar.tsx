@@ -15,6 +15,7 @@ const banks = [
   "Notas",
   "Apropriações",
   "Empréstimos/Financiamentos",
+  "Folha de Pagamento",
 ];
 const bankLogos: Record<string, string> = {
   "Banco do Brasil": "/bancos/banco-do-brasil.png",
@@ -27,6 +28,7 @@ const bankLogos: Record<string, string> = {
   Apropriações: "/bancos/apropriacoes.png",
   "Empréstimos/Financeiro": "/bancos/emprestimos.svg",
   "Empréstimos/Financiamentos": "/bancos/emprestimos.svg",
+  "Folha de Pagamento": "/bancos/emprestimos.svg",
 };
 
 function visibleBankName(value: string) {

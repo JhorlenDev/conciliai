@@ -28,21 +28,35 @@ from app.core.database import get_db
 from app.models import Arquivo, Cliente, Comprovante, ComprovanteRfb, ComprovanteRfbItem, Conciliacao, ContaBancaria, Correspondencia, DocumentoImportante, LancamentoContabil, MovimentoExtrato, NotaFiscal, ProcessoConciliacao, RegraContabil, RegraContabilExcecao
 from app.services.normalization import accounting_nature, is_statement_debit, normalize_name, normalize_rule_accounting_nature, normalize_statement_nature
 from app.services.matching import names_similar
-from app.services.parsers import deduplicate_statement_records, extract_basa_pdfplumber_pages, extract_getnet_pdfplumber_pages, extract_invoices, extract_loan_receipts, extract_loan_spreadsheet, extract_receipts, extract_santander_pdfplumber_statement, extract_statement_pages, parse_brl
+from app.services.parsers import deduplicate_statement_records, extract_basa_pdfplumber_pages, extract_getnet_pdfplumber_pages, extract_invoices, extract_loan_receipts, extract_loan_spreadsheet, extract_payroll_receipts, extract_receipts, extract_santander_pdfplumber_statement, extract_statement_pages, parse_brl
 from app.services.getnet_adjustments import GETNET_ADJUSTMENT_COMPONENT, GETNET_ADJUSTMENT_DESCRIPTION, is_getnet_adjustment_movement, is_santander_getnet_credit, sync_getnet_anticipation_adjustments
 from app.services.rfb import belongs_to_selected_bank, extract_competence, parse_rfb_page
 from app.services.rule_source import choose_rule_source
 
 router = APIRouter()
-PRIMARY_BANKS = ["Banco do Brasil", "Santander", "BASA", "Bradesco", "Caixa", "Conta Caixa", "Notas", "Apropriações", "Empréstimos/Financiamentos"]
+PRIMARY_BANKS = ["Banco do Brasil", "Santander", "BASA", "Bradesco", "Caixa", "Conta Caixa", "Notas", "Apropriações", "Empréstimos/Financiamentos", "Folha de Pagamento"]
 LEGACY_BANKS = ["Vendas com Cartão", "Comissões Getnet", "Empréstimos/Financeiro"]
 BANKS = [*PRIMARY_BANKS, *LEGACY_BANKS]
 MACHINE_STATEMENT_DOCUMENT_TYPES = {"maquininha_extrato", "getnet_extrato", "getnet_vendas", "getnet_comissoes"}
 LOAN_DOCUMENT_TYPE = "emprestimo"
 INVOICE_DOCUMENT_TYPE = "nota"
-RECEIPT_DOCUMENT_TYPES = {"comprovante", LOAN_DOCUMENT_TYPE, *MACHINE_STATEMENT_DOCUMENT_TYPES}
+PAYROLL_DOCUMENT_TYPE = "folha_pagamento"
+RECEIPT_DOCUMENT_TYPES = {"comprovante", LOAN_DOCUMENT_TYPE, PAYROLL_DOCUMENT_TYPE, *MACHINE_STATEMENT_DOCUMENT_TYPES}
 DOCUMENT_TYPES = {"extrato", *RECEIPT_DOCUMENT_TYPES, INVOICE_DOCUMENT_TYPE, "rfb"}
 logger = logging.getLogger(__name__)
+
+
+def extract_support_records(tipo_documento: str, page_text: str, page_number: int):
+    if tipo_documento == "rfb":
+        parsed = parse_rfb_page(page_text, page_number)
+        return [parsed] if parsed else []
+    if tipo_documento == INVOICE_DOCUMENT_TYPE:
+        return extract_invoices(page_text, page_number)
+    if tipo_documento == LOAN_DOCUMENT_TYPE:
+        return extract_loan_receipts(page_text, page_number)
+    if tipo_documento == PAYROLL_DOCUMENT_TYPE:
+        return extract_payroll_receipts(page_text, page_number)
+    return extract_receipts(page_text, page_number)
 SCANNED_PDF_OCR_MESSAGE = "PDF escaneado sem texto pesquisável. Instale o OCR Tesseract (tesseract-ocr e tesseract-ocr-por) para extrair este documento."
 INVOICE_ANTICIPATION_ACCOUNT = "Antecipação de clientes"
 INVOICE_ANTICIPATION_HISTORY = "Antecipação de clientes"
@@ -1461,7 +1475,7 @@ def source_rule_bank(reconciliation: Conciliacao, source: str) -> str:
 
 
 def source_rule_text(row) -> str:
-    return " ".join(str(value or "") for value in [row.texto, row.documento, getattr(row, "forma_pagamento", ""), getattr(row, "servico", ""), getattr(row, "tipo_lancamento_label", "")]).strip()
+    return " ".join(str(value or "") for value in [row.texto, row.documento, getattr(row, "forma_pagamento", ""), getattr(row, "tipo_pagamento_label", ""), getattr(row, "servico", ""), getattr(row, "tipo_lancamento_label", "")]).strip()
 
 
 def invoice_metadata(item: NotaFiscal) -> dict:
@@ -2404,9 +2418,8 @@ def upload(conciliacao_id: str, tipo_documento: str, file: UploadFile = File(...
         pages, extracted = extract_loan_spreadsheet(path) if is_loan_spreadsheet else extract_statement_document(path, reconciliation.banco, tipo_documento) if tipo_documento == "extrato" else (extract_pdf_pages(path, reconciliation.banco, tipo_documento), [])
         record.texto_bruto = "\n\f\n".join(pages); record.paginas = len(pages)
         for number, page_text in enumerate(pages, 1):
-            parsed_rfb = parse_rfb_page(page_text, number) if tipo_documento == "rfb" else None
             if tipo_documento != "extrato" and not is_loan_spreadsheet:
-                extracted.extend([parsed_rfb] if parsed_rfb else [] if tipo_documento == "rfb" else extract_invoices(page_text, number) if tipo_documento == INVOICE_DOCUMENT_TYPE else extract_loan_receipts(page_text, number) if tipo_documento == LOAN_DOCUMENT_TYPE else extract_receipts(page_text, number))
+                extracted.extend(extract_support_records(tipo_documento, page_text, number))
         if tipo_documento == "extrato" and reconciliation.banco == "Banco do Brasil":
             extracted = deduplicate_statement_records(extracted)
         for position, item in enumerate(extracted, 1):
@@ -2532,9 +2545,8 @@ def reprocess_document(arquivo_id: str, db: Session = Depends(get_db)):
         extracted = extract_statement_pages(pages, record.banco_selecionado) if record.tipo_documento == "extrato" else []
     record.texto_bruto = "\n\f\n".join(pages); record.paginas = len(pages)
     for number, page_text in enumerate(pages, 1):
-        parsed_rfb = parse_rfb_page(page_text, number) if record.tipo_documento == "rfb" else None
         if record.tipo_documento != "extrato" and not is_loan_spreadsheet:
-            extracted.extend([parsed_rfb] if parsed_rfb else [] if record.tipo_documento == "rfb" else extract_invoices(page_text, number) if record.tipo_documento == INVOICE_DOCUMENT_TYPE else extract_loan_receipts(page_text, number) if record.tipo_documento == LOAN_DOCUMENT_TYPE else extract_receipts(page_text, number))
+            extracted.extend(extract_support_records(record.tipo_documento, page_text, number))
     if record.tipo_documento == "extrato" and record.banco_selecionado == "Banco do Brasil":
         extracted = deduplicate_statement_records(extracted)
     for position, item in enumerate(extracted, 1):
@@ -2807,12 +2819,14 @@ def unused_documents(conciliacao_id: str, db: Session = Depends(get_db), respons
     receipts = db.query(Comprovante).filter_by(conciliacao_id=conciliacao_id, ativo=True).all()
     bank_receipts = [item for item in receipts if files.get(item.arquivo_id) and files[item.arquivo_id].tipo_documento == "comprovante"]
     loan_receipts = [item for item in receipts if files.get(item.arquivo_id) and files[item.arquivo_id].tipo_documento == LOAN_DOCUMENT_TYPE]
+    payroll_receipts = [item for item in receipts if files.get(item.arquivo_id) and files[item.arquivo_id].tipo_documento == PAYROLL_DOCUMENT_TYPE]
     rfb_receipts = [item for item in db.query(ComprovanteRfb).filter_by(conciliacao_id=conciliacao_id) if belongs_to_selected_bank(item, reconciliation.banco)]
     unused_receipts = [{"id": item.id, "data": display_date(item.data), "hora": item.hora or "—", "documento": item.numero_documento, "favorecido": item.beneficiario_final or item.beneficiario or item.favorecido, "valor_pago": str(item.valor_pago), "tipo": item.tipo_operacao, "situacao": "Sem movimento no extrato" if in_period(item.data) else "Fora do período"} for item in bank_receipts if item.id not in used_receipts]
     unused_loans = [{"id": item.id, "data": display_date(item.data), "documento": item.numero_documento, "favorecido": item.beneficiario_final or item.beneficiario or item.favorecido, "valor_pago": str(item.valor_pago), "tipo": item.tipo_operacao, "situacao": "Sem movimento no extrato" if in_period(item.data) else "Fora do período"} for item in loan_receipts if item.id not in used_receipts]
+    unused_payroll = [{"id": item.id, "data": display_date(item.data), "documento": item.numero_documento, "favorecido": item.favorecido, "valor_pago": str(item.valor_pago), "tipo": item.tipo_operacao, "situacao": "Sem movimento no extrato" if in_period(item.data) else "Fora do período"} for item in payroll_receipts if item.id not in used_receipts]
     unused_rfb = [{"id": item.id, "tipo": item.tipo, "data_arrecadacao": display_date(item.data_arrecadacao), "documento": item.numero_documento, "banco": item.nome_banco, "total": str(item.valor_total), "situacao": "Sem movimento no extrato" if in_period(item.data_arrecadacao) else "Fora do período"} for item in rfb_receipts if item.id not in used_rfb]
     def summary(items, used, date_field): return {"total": len(items), "utilizados": sum(item.id in used for item in items), "nao_utilizados": sum(item.id not in used for item in items), "fora_periodo": sum(not in_period(getattr(item, date_field)) for item in items)}
-    return {"comprovantes": unused_receipts, "emprestimos": unused_loans, "rfb": unused_rfb, "resumo": {"comprovantes": summary(bank_receipts, used_receipts, "data"), "emprestimos": summary(loan_receipts, used_receipts, "data"), "rfb": summary(rfb_receipts, used_rfb, "data_arrecadacao")}}
+    return {"comprovantes": unused_receipts, "emprestimos": unused_loans, "folhas": unused_payroll, "rfb": unused_rfb, "resumo": {"comprovantes": summary(bank_receipts, used_receipts, "data"), "emprestimos": summary(loan_receipts, used_receipts, "data"), "folhas": summary(payroll_receipts, used_receipts, "data"), "rfb": summary(rfb_receipts, used_rfb, "data_arrecadacao")}}
 
 
 @router.get("/conciliacoes/{conciliacao_id}/revisao")
@@ -2873,6 +2887,7 @@ def review(conciliacao_id: str, db: Session = Depends(get_db), response: FastAPI
         "comprovantes": [item for item in receipt_payloads if receipt_type_by_id.get(item["id"]) == "comprovante"],
         "maquininhas": [item for item in receipt_payloads if receipt_type_by_id.get(item["id"]) in MACHINE_STATEMENT_DOCUMENT_TYPES],
         "emprestimos": [item for item in receipt_payloads if receipt_type_by_id.get(item["id"]) == LOAN_DOCUMENT_TYPE],
+        "folhas": [item for item in receipt_payloads if receipt_type_by_id.get(item["id"]) == PAYROLL_DOCUMENT_TYPE],
         "notas": [base(x, {
             "data_emissao": display_date(x.data_emissao),
             "data_vencimento": display_metadata_date(invoice_metadata(x).get("data_vencimento", "")),

@@ -7,7 +7,7 @@ from openpyxl.styles import Font
 
 from app.services.normalization import accounting_nature, names_similar, normalize_statement_nature
 from app.services.matching import invoice_is_candidate
-from app.services.parsers import ParsedStatement, _validate_santander_expected_statement, deduplicate_statement_records, extract_financial_values, extract_invoices, extract_loan_receipts, extract_loan_spreadsheet, extract_receipts, extract_santander_words_statement, extract_statement, extract_statement_pages, parse_brl, parse_date_time
+from app.services.parsers import ParsedStatement, _validate_santander_expected_statement, deduplicate_statement_records, extract_financial_values, extract_invoices, extract_loan_receipts, extract_loan_spreadsheet, extract_payroll_receipts, extract_receipts, extract_santander_words_statement, extract_statement, extract_statement_pages, parse_brl, parse_date_time
 from app.api.routes import receipt_match_criterion
 from app.models import Comprovante
 
@@ -37,6 +37,40 @@ VALOR TOTAL: 2.817,00
     assert record.financeiros.valor_juros == Decimal("733.67")
     assert record.tipo_operacao == "EMPRESTIMO"
     assert len(record.tipo_operacao) <= 20
+
+
+def test_payroll_receipts_extract_workers_net_amounts_and_totals():
+    text = """CENTRO ODONTOLOGICO FIGUEIRO LTDA (8)                                                                   Data/Hora: 29/08/2026 14:00:15
+CNPJ: 08.695.575/0001-88         TRABALHADOR: TOTAL LÍQUIDO A RECEBER
+SISTEMA DE FOLHA DE PAGAMENTO         PERÍODO: 01/01/2024 À 31/01/2024                                                    Página 1 de 1
+
+TRABALHADOR                   CPF              CARGO                           VENCIMENTOS     DESCONTOS     DT. PGTO.        LÍQUIDO
+
+LEANDRO BARBOSA FIGUEIRO      050.957.296-01   ADMINISTRADOR                        6.000,00      1.243,54   31/01/2024        4.756,46
+
+LIA DA SILVA ALEXANDRE        037.770.722-81   Auxiliar em saúde bucal               880,21         66,02    31/01/2024         814,19
+
+RAQUEL OLIVEIRA DE JESUS      108.970.956-00   Auxiliar em saúde bucal              3.024,60       261,77    20/01/2024        2.762,83
+
+RENATA KAMILE DE S FIGUEIRO   947.190.472-20   ADMINISTRADOR                        5.208,00       964,05    31/01/2024        4.243,95
+
+SILANE LIMA DA SILVA          013.316.922-70   Secretária executiva                 1.429,21       107,44    31/01/2024        1.321,77
+
+Quant. Trab.: 5                                                 TOTAL GERAL:       16.542,02      2.642,82                   13.899,20
+"""
+    records = extract_payroll_receipts(text, 1)
+
+    assert len(records) == 5
+    assert records[0].favorecido == "LEANDRO BARBOSA FIGUEIRO"
+    assert records[0].numero_documento == "050.957.296-01"
+    assert records[0].data == date(2024, 1, 31)
+    assert records[0].tipo_operacao == "FOLHA"
+    assert records[0].valor == Decimal("4756.46")
+    assert records[0].financeiros.valor_original == Decimal("6000.00")
+    assert records[0].financeiros.valor_desconto == Decimal("1243.54")
+    assert records[1].financeiros.detalhes["cargo"] == "Auxiliar em saúde bucal"
+    assert records[2].data == date(2024, 1, 20)
+    assert sum((item.valor or Decimal("0.00") for item in records), Decimal("0.00")) == Decimal("13899.20")
 
 
 def test_banco_do_brasil_loan_schedule_groups_interest_and_capital_by_date():

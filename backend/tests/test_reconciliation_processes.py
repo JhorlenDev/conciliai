@@ -63,6 +63,21 @@ def test_process_resumes_the_same_bank_without_cross_bank_rule_source():
     assert rules["salvas"] == []
 
 
+def test_process_creation_reuses_existing_period_and_adds_requested_module():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    client = Cliente(nome="Cliente")
+    session.add(client); session.commit()
+
+    first = create_reconciliation_process(ProcessoConciliacaoInput(cliente_id=client.id, data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31), banco="Banco do Brasil"), session)
+    second = create_reconciliation_process(ProcessoConciliacaoInput(cliente_id=client.id, data_inicio=date(2024, 1, 1), data_fim=date(2024, 1, 31), banco="Folha de Pagamento"), session)
+
+    assert second["id"] == first["id"]
+    assert session.query(ProcessoConciliacao).count() == 1
+    assert {item["banco"] for item in second["bancos"]} == {"Banco do Brasil", "Folha de Pagamento"}
+
+
 def test_process_list_includes_compact_rule_progress_by_bank():
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)

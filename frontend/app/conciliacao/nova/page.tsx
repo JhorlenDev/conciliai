@@ -68,6 +68,7 @@ type ResultRow = {
 };
 type RuleForm = {
   gatilho: string;
+  gatilho_comprovante: string;
   texto_exclusao: string;
   natureza: string;
   conta_debito: string;
@@ -75,13 +76,17 @@ type RuleForm = {
   historico: string;
   complemento: string;
   tipo_componente: string;
+  aplicar_existentes: boolean;
 };
 type RulePreview = {
   quantidade: number;
   motivo?: string;
   lancamentos?: { data?: string; historico?: string; componente?: string; fonte?: string }[];
 };
+type RuleSuggestion = { id: string; label: string; value: string; target: "extrato" | "comprovante" | "exclusao" };
 type FlowType = "bancos" | "notas" | "despesas" | "folha";
+
+const defaultRuleForm: RuleForm = { gatilho: "", gatilho_comprovante: "", texto_exclusao: "", natureza: "Crédito", conta_debito: "", conta_credito: "", historico: "", complemento: "Conforme extrato bancário", tipo_componente: "PRINCIPAL", aplicar_existentes: true };
 
 const flowConfigs: Record<FlowType, { title: string; area: string; support: string[]; step2: string; step2Desc: string; summary: string }> = {
   bancos: {
@@ -219,11 +224,12 @@ export default function GuidedReconciliationPage() {
   const [results, setResults] = useState<ResultRow[]>([]);
   const [panelLoading, setPanelLoading] = useState(false);
   const [viewer, setViewer] = useState<Viewer | null>(null);
-  const [ruleForm, setRuleForm] = useState<RuleForm>({ gatilho: "", texto_exclusao: "", natureza: "Crédito", conta_debito: "", conta_credito: "", historico: "", complemento: "Conforme extrato bancário", tipo_componente: "PRINCIPAL" });
+  const [ruleForm, setRuleForm] = useState<RuleForm>(defaultRuleForm);
   const [rulePreview, setRulePreview] = useState<RulePreview | null>(null);
   const [ruleBusy, setRuleBusy] = useState("");
   const [rulesTab, setRulesTab] = useState<"pending" | "saved" | "hidden">("pending");
-  const [ruleSuggestions, setRuleSuggestions] = useState<string[]>([]);
+  const [ruleSuggestions, setRuleSuggestions] = useState<RuleSuggestion[]>([]);
+  const [selectedRuleSuggestions, setSelectedRuleSuggestions] = useState<string[]>([]);
   const [editingRuleId, setEditingRuleId] = useState("");
   const [expandedRuleId, setExpandedRuleId] = useState("");
 
@@ -340,7 +346,7 @@ export default function GuidedReconciliationPage() {
       setActiveStep(2);
       return;
     }
-    if (selectedBankLocked && matchingProcess) {
+    if (flowType === "bancos" && selectedBankLocked && matchingProcess) {
       setProcess(matchingProcess);
       setActiveArea(selectedExistingBank?.banco ?? matchingProcess.bancos[0]?.banco ?? selectedBanks[0]);
       setMessage("Este banco já foi iniciado neste período. Abra pela conciliação normal para preservar o trabalho feito.");
@@ -374,7 +380,7 @@ export default function GuidedReconciliationPage() {
       setProcesses((current) => [updated, ...current.filter((item) => item.id !== updated.id)]);
       setActiveArea(selectedBanks[0]);
       setActiveStep(3);
-      setMessage(matchingProcess ? "Período existente retomado. Envie os arquivos deste banco." : "Processo criado. Envie os arquivos para continuar.");
+      setMessage(matchingProcess ? "Período existente retomado. O módulo selecionado está dentro da mesma competência." : "Processo criado. Envie os arquivos para continuar.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Não foi possível criar o processo.");
     } finally {
@@ -439,25 +445,49 @@ export default function GuidedReconciliationPage() {
     }
   }
 
+  function buildRuleSuggestions(row: Record<string, unknown>) {
+    const fields: { label: string; value: unknown; target: RuleSuggestion["target"] }[] = [
+      { label: "Histórico contém", value: row.historico ?? row.gatilho_sugerido ?? row.texto, target: "extrato" },
+      { label: "Comprovante contém", value: row.texto_comprovante ?? row.favorecido ?? row.beneficiario ?? row.documento, target: "comprovante" },
+      { label: "Forma de pagamento", value: row.tipo_pagamento_label ?? row.forma_pagamento, target: isNotesRules ? "extrato" : "comprovante" },
+      { label: "Documento", value: row.documento, target: "comprovante" },
+      { label: "Valor", value: row.valor, target: "extrato" },
+    ];
+    const seen = new Set<string>();
+    return fields
+      .map((item) => ({ ...item, value: String(item.value ?? "").trim() }))
+      .filter((item) => item.value && item.value !== "—" && item.value !== "Não identificado")
+      .filter((item) => {
+        const key = `${item.target}:${item.label}:${item.value}`.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, 8)
+      .map((item, index) => ({ id: `${item.target}-${index}`, label: item.label, value: item.value, target: item.target }));
+  }
+
+  function applyRuleSuggestion(suggestion: RuleSuggestion, checked: boolean) {
+    setSelectedRuleSuggestions((current) => checked ? Array.from(new Set([...current, suggestion.id])) : current.filter((item) => item !== suggestion.id));
+    if (!checked) return;
+    if (suggestion.target === "extrato") updateRuleForm({ gatilho: suggestion.value });
+    if (suggestion.target === "comprovante") updateRuleForm({ gatilho_comprovante: suggestion.value });
+    if (suggestion.target === "exclusao") updateRuleForm({ texto_exclusao: suggestion.value });
+  }
+
   function selectPendingRule(raw: unknown) {
     const row = raw as Record<string, unknown>;
     const paymentTrigger = isNotesRules && row.tipo_pagamento_label && row.tipo_pagamento_label !== "Não identificado" ? String(row.tipo_pagamento_label) : "";
     const history = paymentTrigger || String(row.historico ?? row.gatilho_sugerido ?? row.texto ?? "");
-    const suggestions = [
-      row.gatilho_sugerido,
-      row.historico,
-      row.texto,
-      row.tipo_pagamento_label,
-      row.forma_pagamento,
-      row.documento,
-      row.valor,
-    ]
-      .map((item) => String(item ?? "").trim())
-      .filter((item) => item && item !== "—" && item !== "Não identificado");
-    setRuleSuggestions(Array.from(new Set(suggestions)).slice(0, 6));
+    const suggestions = buildRuleSuggestions(row);
+    const primary = suggestions.find((item) => item.target === "extrato")?.id;
+    setRuleSuggestions(suggestions);
+    setSelectedRuleSuggestions(primary ? [primary] : []);
     setRulePreview(null);
     setRuleForm({
+      ...defaultRuleForm,
       gatilho: history,
+      gatilho_comprovante: "",
       texto_exclusao: "",
       natureza: String(row.natureza_contabil ?? row.natureza ?? "Crédito"),
       conta_debito: "",
@@ -465,6 +495,7 @@ export default function GuidedReconciliationPage() {
       historico: history,
       complemento: isNotesRules ? String(row.documento && row.documento !== "—" ? row.documento : "Conforme nota fiscal") : "Conforme extrato bancário",
       tipo_componente: String(row.tipo_componente ?? row.tipo_lancamento ?? "PRINCIPAL"),
+      aplicar_existentes: true,
     });
   }
 
@@ -473,9 +504,12 @@ export default function GuidedReconciliationPage() {
     setEditingRuleId(String(row.id ?? ""));
     setExpandedRuleId(String(row.id ?? ""));
     setRuleSuggestions([]);
+    setSelectedRuleSuggestions([]);
     setRulePreview(null);
     setRuleForm({
+      ...defaultRuleForm,
       gatilho: String(row.gatilho ?? ""),
+      gatilho_comprovante: String(row.gatilho_comprovante ?? ""),
       texto_exclusao: String(row.texto_exclusao ?? ""),
       natureza: String(row.natureza ?? "Crédito"),
       conta_debito: String(row.conta_debito ?? ""),
@@ -483,6 +517,7 @@ export default function GuidedReconciliationPage() {
       historico: String(row.historico ?? ""),
       complemento: String(row.complemento ?? ""),
       tipo_componente: String(row.tipo_componente ?? "PRINCIPAL"),
+      aplicar_existentes: true,
     });
     setActiveStep(5);
   }
@@ -491,7 +526,8 @@ export default function GuidedReconciliationPage() {
     setEditingRuleId("");
     setRulePreview(null);
     setRuleSuggestions([]);
-    setRuleForm({ gatilho: "", texto_exclusao: "", natureza: "Crédito", conta_debito: "", conta_credito: "", historico: "", complemento: "Conforme extrato bancário", tipo_componente: "PRINCIPAL" });
+    setSelectedRuleSuggestions([]);
+    setRuleForm(defaultRuleForm);
     setActiveStep(5);
   }
 
@@ -502,9 +538,9 @@ export default function GuidedReconciliationPage() {
 
   async function calculateRuleCoverage(showMessage = true) {
     if (!activeReconciliation) return 0;
-    if (!ruleForm.gatilho.trim()) {
-      setRulePreview({ quantidade: 0, motivo: "Informe um gatilho para validar a regra.", lancamentos: [] });
-      setMessage("Informe um gatilho para validar a regra.");
+    if (!ruleForm.gatilho.trim() && !ruleForm.gatilho_comprovante.trim()) {
+      setRulePreview({ quantidade: 0, motivo: "Informe pelo menos uma condição para validar a regra.", lancamentos: [] });
+      setMessage("Informe pelo menos uma condição para validar a regra.");
       return 0;
     }
     setRuleBusy("preview");
@@ -514,7 +550,7 @@ export default function GuidedReconciliationPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           gatilho: ruleForm.gatilho,
-          gatilho_comprovante: "",
+          gatilho_comprovante: ruleForm.gatilho_comprovante,
           texto_exclusao: ruleForm.texto_exclusao,
           natureza: ruleForm.natureza,
           tipo_componente: ruleForm.tipo_componente,
@@ -643,27 +679,27 @@ export default function GuidedReconciliationPage() {
 
   return (
     <main className="guided-compact min-h-screen bg-slate-100 text-slate-900">
-      <div className="grid min-h-screen lg:grid-cols-[264px_1fr]">
-        <aside className="hidden max-h-screen overflow-y-auto bg-slate-950 p-3 text-slate-200 lg:flex lg:flex-col">
-          <Link href="/" className="mb-3 flex items-center gap-2 rounded-lg border-b border-slate-800 px-2 py-2 text-sm font-bold text-white">
-            <span className="rounded-md bg-teal-600 p-1.5"><Building2 size={16} /></span>
+      <div className="grid min-h-screen lg:grid-cols-[232px_1fr]">
+        <aside className="hidden max-h-screen overflow-y-auto bg-slate-950 p-2.5 text-slate-200 lg:flex lg:flex-col">
+          <Link href="/" className="mb-2 flex items-center gap-2 rounded-md border-b border-slate-800 px-2 py-1.5 text-sm font-bold text-white">
+            <span className="rounded bg-teal-600 p-1"><Building2 size={15} /></span>
             ConcilIA
           </Link>
-          <div className="mb-3 rounded-lg border border-slate-800 bg-slate-900 p-2.5 text-xs">
+          <div className="mb-2 rounded-md border border-slate-800 bg-slate-900 p-2 text-[11px]">
             <span className="block font-semibold text-slate-400">Contexto ativo</span>
             <strong className="mt-1 block text-white">{selectedClient?.nome ?? "Selecione um cliente"}</strong>
             <span className="mt-1 block text-slate-400">{flowConfig.title} · {areaLabel} · {monthRange(start, end)}</span>
           </div>
-          <nav className="space-y-1 text-sm">
-            <Link href="/" className="flex items-center gap-2 rounded-lg px-3 py-2 text-slate-300 hover:bg-slate-900"><LayoutDashboard size={16} />Central</Link>
-            <Link href="/conciliacao" className="mb-3 flex items-center gap-2 rounded-lg px-3 py-2 text-slate-300 hover:bg-slate-900"><FolderOpen size={16} />Conciliação atual</Link>
+          <nav className="space-y-1 text-xs">
+            <Link href="/" className="flex items-center gap-2 rounded-md px-2 py-1.5 text-slate-300 hover:bg-slate-900"><LayoutDashboard size={14} />Central</Link>
+            <Link href="/conciliacao" className="mb-2 flex items-center gap-2 rounded-md px-2 py-1.5 text-slate-300 hover:bg-slate-900"><FolderOpen size={14} />Conciliação atual</Link>
             {displayedSteps.map((step) => {
               const Icon = step.icon;
               return (
-                <button type="button" key={step.id} onClick={() => setActiveStep(step.id)} className={`flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left ${activeStep === step.id ? "bg-teal-500 font-semibold text-slate-950" : "text-slate-300 hover:bg-slate-900"}`}>
+                <button type="button" key={step.id} onClick={() => setActiveStep(step.id)} className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left ${activeStep === step.id ? "bg-teal-500 font-semibold text-slate-950" : "text-slate-300 hover:bg-slate-900"}`}>
                   <span className={`grid h-5 w-5 place-items-center rounded-full text-[10px] ${activeStep === step.id ? "bg-white" : "bg-slate-900 text-slate-400"}`}>{step.id}</span>
-                  <Icon size={15} />
-                  <span className="min-w-0"><span className="block">{step.title}</span><span className={`block text-[11px] ${activeStep === step.id ? "text-teal-950" : "text-slate-500"}`}>{step.desc}</span></span>
+                  <Icon size={14} />
+                  <span className="min-w-0"><span className="block leading-tight">{step.title}</span><span className={`block truncate text-[10px] ${activeStep === step.id ? "text-teal-950" : "text-slate-500"}`}>{step.desc}</span></span>
                 </button>
               );
             })}
@@ -671,7 +707,7 @@ export default function GuidedReconciliationPage() {
         </aside>
 
         <section className="min-w-0">
-          <header className="border-b border-slate-200 bg-white px-5 py-3">
+          <header className="border-b border-slate-200 bg-white px-4 py-2.5">
             <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3">
               <div>
                 <div className="mb-1 flex flex-wrap items-center gap-1.5 text-[11px] font-bold text-slate-500">
@@ -681,48 +717,48 @@ export default function GuidedReconciliationPage() {
                   <span>/</span>
                   <span>{monthRange(start, end)}</span>
                 </div>
-                <p className="text-xs font-semibold uppercase tracking-wide text-teal-700">Etapa {activeStep} de 7</p>
-                <h1 className="text-lg font-bold">{activeMeta.title}</h1>
-                <p className="text-sm text-slate-500">{activeMeta.desc}</p>
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-teal-700">Etapa {activeStep} de 7</p>
+                <h1 className="text-base font-bold leading-tight">{activeMeta.title}</h1>
+                <p className="text-xs text-slate-500">{activeMeta.desc}</p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 {process && (
-                  <select value={activeArea} onChange={(event) => setActiveArea(event.target.value)} className="rounded-md border border-slate-300 px-3 py-2 text-sm font-semibold">
+                  <select value={activeArea} onChange={(event) => setActiveArea(event.target.value)} className="rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold">
                     {process.bancos.map((item) => <option value={item.banco} key={item.id}>{item.banco}</option>)}
                   </select>
                 )}
-                <Link href="/" className="inline-flex items-center gap-2 rounded-md border border-slate-200 px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50"><RotateCcw size={16} />Voltar</Link>
+                <Link href="/" className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"><RotateCcw size={14} />Voltar</Link>
               </div>
             </div>
           </header>
 
-          <div className="mx-auto max-w-7xl space-y-3 px-4 py-4">
-            {message && <p className="rounded-md bg-teal-50 px-3 py-2 text-sm font-semibold text-teal-800">{message}</p>}
+          <div className="mx-auto max-w-7xl space-y-2.5 px-3 py-3">
+            {message && <p className="rounded-md bg-teal-50 px-2.5 py-1.5 text-xs font-semibold text-teal-800">{message}</p>}
             <ContextMap items={contextItems} existing={!!matchingProcess} />
 
             {activeStep === 1 && (
-              <form onSubmit={(event) => { event.preventDefault(); setActiveStep(2); }} className="grid gap-4 xl:grid-cols-[1fr_360px]">
-                <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-                  <div className="mb-4 flex items-center gap-2 text-teal-800"><Building2 size={18} /><h2 className="font-bold">Cadastro</h2></div>
-                  <div className="mb-4 flex flex-wrap gap-2">
+              <form onSubmit={(event) => { event.preventDefault(); setActiveStep(2); }} className="grid gap-3 xl:grid-cols-[1fr_310px]">
+                <section className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+                  <div className="mb-2 flex items-center gap-2 text-teal-800"><Building2 size={18} /><h2 className="font-bold">Cadastro</h2></div>
+                  <div className="mb-3 flex flex-wrap gap-1.5">
                     {["clientes", "bancos", "plano", "historico"].map((tab) => (
-                      <button type="button" key={tab} onClick={() => setCadTab(tab)} className={`rounded-full border px-4 py-2 text-xs font-bold capitalize ${cadTab === tab ? "border-slate-900 bg-slate-900 text-white" : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"}`}>{tab}</button>
+                      <button type="button" key={tab} onClick={() => setCadTab(tab)} className={`rounded-full border px-3 py-1 text-[11px] font-bold capitalize ${cadTab === tab ? "border-slate-900 bg-slate-900 text-white" : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"}`}>{tab}</button>
                     ))}
                   </div>
                   {cadTab === "clientes" && (
-                    <div className="space-y-4">
-                      <div className="grid gap-3 md:grid-cols-[1fr_180px_180px]">
-                        <label className="text-sm font-semibold">Cliente
-                          <select required value={clientId} onChange={(event) => setClientId(event.target.value)} className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 font-normal">
+                    <div className="space-y-3">
+                      <div className="grid gap-3 md:grid-cols-[1fr_160px_160px]">
+                        <label className="text-xs font-semibold">Cliente
+                          <select required value={clientId} onChange={(event) => setClientId(event.target.value)} className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 font-normal">
                             <option value="">Selecionar cliente</option>
                             {clients.map((client) => <option value={client.id} key={client.id}>{client.nome}</option>)}
                           </select>
                         </label>
-                        <label className="text-sm font-semibold">Início
-                          <input required type="date" value={start} onChange={(event) => setStart(event.target.value)} className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 font-normal" />
+                        <label className="text-xs font-semibold">Início
+                          <input required type="date" value={start} onChange={(event) => setStart(event.target.value)} className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 font-normal" />
                         </label>
-                        <label className="text-sm font-semibold">Fim
-                          <input required type="date" value={end} onChange={(event) => setEnd(event.target.value)} className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 font-normal" />
+                        <label className="text-xs font-semibold">Fim
+                          <input required type="date" value={end} onChange={(event) => setEnd(event.target.value)} className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 font-normal" />
                         </label>
                       </div>
                       <div className="rounded-lg border border-slate-200">
@@ -736,7 +772,7 @@ export default function GuidedReconciliationPage() {
                   {cadTab === "bancos" && <CadastroTable rows={bankOptions.map((bank) => [bank.code, bank.name, bank.hint])} headers={["Código", "Banco", "Documentos"]} />}
                   {cadTab === "plano" && <CadastroTable rows={[["219", "Banco Brasil"], ["232", "Clientes Diversos"], ["258", "Leandro Barbosa Figueiro"], ["387", "Anuidades"]]} headers={["Código", "Conta"]} />}
                   {cadTab === "historico" && <CadastroTable rows={[["52", "Tarifa Bancária"], ["307", "Pagto. de Duplic. Fornecedor"], ["310", "Transferência entre contas"], ["467", "Recebimento via PIX conforme extrato."]]} headers={["Código", "Histórico"]} />}
-                  <div className="mt-4 flex justify-end">
+                  <div className="mt-3 flex justify-end">
                     <button className="inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800">Próxima<ArrowRight size={15} /></button>
                   </div>
                 </section>
@@ -745,12 +781,12 @@ export default function GuidedReconciliationPage() {
             )}
 
             {activeStep === 2 && (
-              <section className="grid gap-4 xl:grid-cols-[1fr_360px]">
-                <div className="space-y-4">
-                  <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-                    <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-                      <div className="flex items-center gap-2 text-teal-800"><Banknote size={18} /><h2 className="font-bold">Bancos</h2></div>
-                      {matchingProcess && <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-bold text-amber-900">Período existente encontrado</span>}
+              <section className="grid gap-3 xl:grid-cols-[1fr_310px]">
+                <div className="space-y-3">
+                  <section className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+                    <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 text-teal-800"><Banknote size={16} /><h2 className="font-bold">Bancos</h2></div>
+                      {matchingProcess && <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-bold text-amber-900">Período existente</span>}
                     </div>
                     {flowType === "bancos" ? <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-5">
                       {bankOptions.map((bank) => {
@@ -767,7 +803,7 @@ export default function GuidedReconciliationPage() {
                             onKeyDown={(event) => {
                               if (!locked && (event.key === "Enter" || event.key === " ")) selectBank(bank.name);
                             }}
-                            className={`rounded-lg border p-2 text-left ${locked ? "border-slate-200 bg-slate-50 opacity-90" : active ? "cursor-pointer border-teal-600 bg-teal-50" : "cursor-pointer border-slate-200 bg-white hover:border-slate-300"}`}
+                            className={`rounded-md border p-2 text-left ${locked ? "border-slate-200 bg-slate-50 opacity-90" : active ? "cursor-pointer border-teal-600 bg-teal-50" : "cursor-pointer border-slate-200 bg-white hover:border-slate-300"}`}
                             key={bank.name}
                           >
                             <div className="flex items-center gap-2">
@@ -782,7 +818,7 @@ export default function GuidedReconciliationPage() {
                                 <strong className="block truncate text-xs leading-tight" title={bank.name}>{bank.name}</strong>
                               </div>
                             </div>
-                            <span className="mt-2 flex items-center justify-between gap-2 rounded bg-white/70 px-1.5 py-1">
+                            <span className="mt-1.5 flex items-center justify-between gap-2 rounded bg-white/70 px-1.5 py-0.5">
                               <span className={`truncate text-[11px] font-bold ${locked ? "text-slate-600" : created ? "text-teal-700" : "text-slate-500"}`}>{locked ? "Já iniciado" : created ? "Continuar" : "Disponível"}</span>
                               <span className={`text-xs font-black tabular-nums ${progressColor(progress.percentual)}`}>{progress.percentual}%</span>
                             </span>
@@ -795,31 +831,31 @@ export default function GuidedReconciliationPage() {
                         );
                       })}
                     </div> : (
-                      <div className="rounded-lg border border-teal-200 bg-teal-50 p-4">
+                      <div className="rounded-md border border-teal-200 bg-teal-50 p-3">
                         <span className="text-xs font-bold uppercase tracking-wide text-teal-700">{flowConfig.title}</span>
-                        <h3 className="mt-1 text-lg font-black text-slate-900">{displayAreaName(flowConfig.area, flowType)}</h3>
-                        <p className="mt-1 text-sm font-medium text-slate-600">{flowConfig.summary}</p>
+                        <h3 className="mt-1 text-base font-black text-slate-900">{displayAreaName(flowConfig.area, flowType)}</h3>
+                        <p className="mt-1 text-xs font-medium text-slate-600">{flowConfig.summary}</p>
                         {matchingProcess && (
-                          <p className="mt-3 text-xs font-semibold text-amber-800">
+                          <p className="mt-2 text-[11px] font-semibold text-amber-800">
                             Se este fluxo já tiver sido iniciado neste período, continue pela conciliação normal para revisar regras e exportações.
                           </p>
                         )}
                       </div>
                     )}
                     {matchingProcess && (
-                      <p className="mt-3 rounded-md bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-600">
+                      <p className="mt-2 rounded-md bg-slate-50 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600">
                         Bancos já trabalhados ficam protegidos no acesso guiado. Para revisar regras, editar ou excluir lançamentos, abra pela conciliação normal.
                       </p>
                     )}
                   </section>
-                  {flowType === "bancos" && <section className="rounded-xl border border-slate-200 bg-white p-3 shadow-sm">
+                  {flowType === "bancos" && <section className="rounded-lg border border-slate-200 bg-white p-2.5 shadow-sm">
                     <div className="mb-2 flex items-center gap-2 text-teal-800"><FileText size={16} /><h2 className="font-bold">Áreas auxiliares</h2></div>
-                    <div className="grid gap-2 md:grid-cols-3">
+                    <div className="grid gap-1.5 md:grid-cols-4">
                       {supportOptions.map((option) => {
                         const Icon = option.icon;
                         const active = selectedSupport.includes(option.name);
                         return (
-                          <button type="button" onClick={() => toggle(option.name, selectedSupport, setSelectedSupport)} className={`flex min-h-10 items-center gap-2 rounded-lg border px-2.5 py-2 text-left ${active ? "border-teal-600 bg-teal-50" : "border-slate-200 bg-white hover:border-slate-300"}`} key={option.name} title={option.hint}>
+                          <button type="button" onClick={() => toggle(option.name, selectedSupport, setSelectedSupport)} className={`flex min-h-8 items-center gap-2 rounded-md border px-2 py-1.5 text-left ${active ? "border-teal-600 bg-teal-50" : "border-slate-200 bg-white hover:border-slate-300"}`} key={option.name} title={option.hint}>
                             <Icon size={15} className={active ? "text-teal-700" : "text-slate-500"} />
                             <strong className="block truncate text-xs">{option.name}</strong>
                           </button>
@@ -828,7 +864,7 @@ export default function GuidedReconciliationPage() {
                     </div>
                   </section>}
                   <div className="flex justify-end">
-                    <button disabled={loading || selectedBankLocked} onClick={ensureProcess} className="inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800 disabled:cursor-not-allowed disabled:opacity-70">
+                    <button disabled={loading || (flowType === "bancos" && selectedBankLocked)} onClick={ensureProcess} className="inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800 disabled:cursor-not-allowed disabled:opacity-70">
                       {loading ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
                       {matchingProcess ? "Continuar" : "Criar e enviar"}
                     </button>
@@ -844,9 +880,9 @@ export default function GuidedReconciliationPage() {
                   <EmptyAction text="Crie o processo antes de enviar arquivos." onClick={() => setActiveStep(1)} />
                 ) : (
                   <div>
-                    <div className="mb-4 flex flex-wrap gap-2">
+                    <div className="mb-3 flex flex-wrap gap-1.5">
                       {activeDocuments.map((doc) => (
-                        <button type="button" key={doc.type} onClick={() => setUploadTab(doc.type)} className={`rounded-full border px-3 py-1.5 text-xs font-bold ${uploadTab === doc.type ? "border-slate-900 bg-slate-900 text-white" : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"}`}>{doc.label}</button>
+                        <button type="button" key={doc.type} onClick={() => setUploadTab(doc.type)} className={`rounded-full border px-2.5 py-1 text-[11px] font-bold ${uploadTab === doc.type ? "border-slate-900 bg-slate-900 text-white" : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"}`}>{doc.label}</button>
                       ))}
                     </div>
                     {activeUploadDocument ? (() => {
@@ -855,20 +891,20 @@ export default function GuidedReconciliationPage() {
                       const status = uploadStatus[key];
                       const busy = status?.status === "uploading";
                       return (
-                        <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5 text-center">
-                          <UploadCloud className="mx-auto text-teal-700" size={24} />
-                          <h3 className="mt-2 text-sm font-bold">{doc.label} — {activeArea}</h3>
+                        <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 p-3 text-center">
+                          <UploadCloud className="mx-auto text-teal-700" size={20} />
+                          <h3 className="mt-1.5 text-xs font-bold">{doc.label} — {activeArea}</h3>
                           <p className="mt-1 text-xs text-slate-500">{doc.accept.includes("xlsx") ? "PDF, XLSX ou CSV" : "PDF"}{doc.multiple ? " · múltiplos arquivos" : ""}</p>
-                          <label className={`mt-3 inline-flex cursor-pointer items-center gap-2 rounded-md px-3 py-1.5 text-xs font-bold ${busy ? "bg-slate-300 text-slate-600" : "bg-teal-700 text-white hover:bg-teal-800"}`}>
-                            {busy ? <Loader2 size={15} className="animate-spin" /> : <UploadCloud size={15} />}
+                          <label className={`mt-2 inline-flex cursor-pointer items-center gap-1.5 rounded-md px-2.5 py-1 text-[11px] font-bold ${busy ? "bg-slate-300 text-slate-600" : "bg-teal-700 text-white hover:bg-teal-800"}`}>
+                            {busy ? <Loader2 size={14} className="animate-spin" /> : <UploadCloud size={14} />}
                             Selecionar arquivo
                             <input type="file" className="hidden" accept={doc.accept} multiple={doc.multiple} disabled={busy || !activeReconciliation} onChange={(event) => activeReconciliation && uploadFile(activeReconciliation.id, doc.type, event)} />
                           </label>
                           {status && <p className={`mt-3 text-xs font-semibold ${status.status === "error" ? "text-red-700" : "text-teal-700"}`}>{status.message}</p>}
                           {uploadStatus[`${activeReconciliation?.id}:delete`]?.message && <p className={`mt-2 text-xs font-semibold ${uploadStatus[`${activeReconciliation?.id}:delete`]?.status === "error" ? "text-red-700" : "text-teal-700"}`}>{uploadStatus[`${activeReconciliation?.id}:delete`]?.message}</p>}
-                          <div className="mt-5 rounded-lg border border-slate-200 bg-white text-left">
+                          <div className="mt-3 rounded-md border border-slate-200 bg-white text-left">
                             {(review.arquivos ?? []).filter((file) => file.tipo === doc.type).slice(0, 8).map((file) => (
-                              <div className="flex items-center justify-between gap-3 border-b border-slate-100 px-3 py-2 last:border-b-0" key={file.id}>
+                              <div className="flex items-center justify-between gap-2 border-b border-slate-100 px-2.5 py-1.5 last:border-b-0" key={file.id}>
                                 <span className="min-w-0 truncate text-xs font-semibold">{file.nome}</span>
                                 <span className={`rounded px-2 py-1 text-[11px] font-bold ${file.status === "concluido" ? "bg-teal-100 text-teal-800" : file.status === "erro" ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-800"}`}>{file.status}</span>
                                 <button type="button" onClick={() => setViewer({ arquivoId: file.id, pagina: 1, titulo: file.nome })} title="Visualizar arquivo" aria-label={`Visualizar ${file.nome}`} className="rounded p-1 text-slate-700 hover:bg-slate-100"><Eye size={15} /></button>
@@ -888,62 +924,70 @@ export default function GuidedReconciliationPage() {
             {activeStep === 4 && (
               <GuidedPanel title="Conciliação" loading={panelLoading} action={<button onClick={processActive} disabled={!activeReconciliation} className="inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800 disabled:opacity-60"><PlayCircle size={15} />Reprocessar</button>}>
                 <StatsGrid items={isNotesRules ? [["Notas extraídas", count(review.notas)], ["Regras criadas", count(rules.salvas)], ["Pendentes", count(rules.pendentes)]] : [["Extrato", count(review.extratos)], ["Comprovantes", count(review.comprovantes)], ["Folha", count(review.folhas)], ["RFB", count(review.rfb)], ["Resultados", results.length]]} />
-                {isNotesRules ? <NotesReviewTable rows={review.notas ?? []} onView={setViewer} /> : <MiniTable rows={results} onView={setViewer} />}
+                {isNotesRules ? <NotesReviewTable rows={review.notas ?? []} onView={setViewer} /> : <MiniTable rows={results} onView={setViewer} onCreateRule={(row) => { selectPendingRule(row); setRulesTab("pending"); setActiveStep(5); }} />}
               </GuidedPanel>
             )}
 
             {activeStep === 5 && (
               <GuidedPanel title="Criar regras" loading={panelLoading}>
-                <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1.5">
                   <div className="flex flex-wrap gap-1.5">
-                    <button type="button" onClick={() => setRulesTab("pending")} className={`rounded-full px-3 py-1 text-xs font-bold ${rulesTab === "pending" ? "bg-slate-900 text-white" : "border border-slate-200 bg-white text-slate-700"}`}>Regras a criar · {count(rules.pendentes)}</button>
-                    <button type="button" onClick={() => setRulesTab("saved")} className={`rounded-full px-3 py-1 text-xs font-bold ${rulesTab === "saved" ? "bg-teal-700 text-white" : "border border-teal-200 bg-white text-teal-800"}`}>Salvas · {count(rules.salvas)}</button>
-                    <button type="button" onClick={() => setRulesTab("hidden")} className={`rounded-full px-3 py-1 text-xs font-bold ${rulesTab === "hidden" ? "bg-violet-700 text-white" : "border border-violet-200 bg-white text-violet-800"}`}>Ocultas · {count(rules.ignoradas)}</button>
+                    <button type="button" onClick={() => setRulesTab("pending")} className={`rounded-full px-2.5 py-1 text-[11px] font-bold ${rulesTab === "pending" ? "bg-slate-900 text-white" : "border border-slate-200 bg-white text-slate-700"}`}>A criar · {count(rules.pendentes)}</button>
+                    <button type="button" onClick={() => setRulesTab("saved")} className={`rounded-full px-2.5 py-1 text-[11px] font-bold ${rulesTab === "saved" ? "bg-teal-700 text-white" : "border border-teal-200 bg-white text-teal-800"}`}>Salvas · {count(rules.salvas)}</button>
+                    <button type="button" onClick={() => setRulesTab("hidden")} className={`rounded-full px-2.5 py-1 text-[11px] font-bold ${rulesTab === "hidden" ? "bg-violet-700 text-white" : "border border-violet-200 bg-white text-violet-800"}`}>Ocultas · {count(rules.ignoradas)}</button>
                   </div>
                   <span className="text-[11px] font-semibold text-slate-500">Selecione uma pendência, valide a cobertura e salve a regra.</span>
                 </div>
-                {rulesTab === "pending" && <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_390px]">
+                {rulesTab === "pending" && <div className="grid gap-2.5 xl:grid-cols-[minmax(0,1fr)_410px]">
                   <PendingRules rows={rules.pendentes ?? []} onSelect={selectPendingRule} onView={setViewer} showNotePayment={isNotesRules} />
-                  <form onSubmit={saveGuidedRule} className="h-fit rounded-xl border border-slate-200 bg-white p-3 shadow-sm">
-                    <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-2">
+                  <form onSubmit={saveGuidedRule} className="h-fit rounded-lg border border-slate-200 bg-white p-2.5 shadow-sm">
+                    <div className="flex items-center justify-between gap-2 border-b border-slate-100 pb-1.5">
                       <div>
-                        <span className="rounded bg-teal-50 px-2 py-1 text-[10px] font-black uppercase tracking-wide text-teal-800">Regra contábil</span>
-                        <h3 className="mt-2 text-sm font-black text-slate-900">{editingRuleId ? "Editar regra" : "Nova regra"}</h3>
+                        <span className="rounded bg-teal-50 px-1.5 py-0.5 text-[10px] font-black uppercase tracking-wide text-teal-800">Regra contábil</span>
+                        <h3 className="mt-1 text-xs font-black text-slate-900">{editingRuleId ? "Editar regra" : "Nova regra"}</h3>
                       </div>
                       {editingRuleId && <button type="button" onClick={newGuidedRule} className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-bold text-slate-700 hover:bg-slate-50">Nova</button>}
                     </div>
-                    <div className="mt-3 grid gap-2.5">
-                      <RuleField label="Gatilho">
-                        <input required value={ruleForm.gatilho} onChange={(event) => updateRuleForm({ gatilho: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="palavra chave..." />
-                      </RuleField>
+                    <div className="mt-2 grid gap-2">
                       {!!ruleSuggestions.length && (
-                        <div className="flex flex-wrap gap-1.5">
-                          {ruleSuggestions.map((suggestion) => (
-                            <button
-                              type="button"
-                              key={suggestion}
-                              onClick={() => updateRuleForm({ gatilho: suggestion })}
-                              className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-bold text-slate-600 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                              title={suggestion}
-                            >
-                              {suggestion.length > 28 ? `${suggestion.slice(0, 28)}...` : suggestion}
-                            </button>
-                          ))}
+                        <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
+                          <div className="mb-1.5 flex items-center justify-between gap-2">
+                            <span className="text-[10px] font-black uppercase tracking-wide text-slate-500">Condições sugeridas</span>
+                            <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-bold text-slate-500">use só o que fizer sentido</span>
+                          </div>
+                          <div className="grid gap-1">
+                            {ruleSuggestions.map((suggestion) => (
+                              <label key={suggestion.id} className="flex cursor-pointer items-center gap-2 rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-700 hover:border-teal-200 hover:bg-teal-50">
+                                <input type="checkbox" checked={selectedRuleSuggestions.includes(suggestion.id)} onChange={(event) => applyRuleSuggestion(suggestion, event.target.checked)} className="h-3.5 w-3.5 accent-teal-700" />
+                                <span className="shrink-0 text-slate-500">{suggestion.label}</span>
+                                <strong className="min-w-0 truncate text-slate-900" title={suggestion.value}>{suggestion.value}</strong>
+                              </label>
+                            ))}
+                          </div>
                         </div>
                       )}
+                      <div className="grid grid-cols-[1fr_1fr] gap-2">
+                      <RuleField label="Palavra-chave no extrato">
+                        <input value={ruleForm.gatilho} onChange={(event) => updateRuleForm({ gatilho: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="palavra chave..." />
+                      </RuleField>
+                      <RuleField label="Palavra-chave no comprovante">
+                        <input value={ruleForm.gatilho_comprovante} onChange={(event) => updateRuleForm({ gatilho_comprovante: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="favorecido, doc, CPF..." />
+                      </RuleField>
+                      </div>
                       <RuleField label="Não contém">
                         <input value={ruleForm.texto_exclusao} onChange={(event) => updateRuleForm({ texto_exclusao: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="texto de exclusão..." />
                       </RuleField>
-                      <div className="grid grid-cols-[1fr_1fr] gap-2">
+                      <div className="grid grid-cols-[1fr_1fr_auto] gap-2">
                         <RuleField label="Natureza">
                           <select value={ruleForm.natureza} onChange={(event) => updateRuleForm({ natureza: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800"><option>Crédito</option><option>Débito</option></select>
                         </RuleField>
                         <RuleField label="Tipo">
                           <input value={ruleForm.tipo_componente} onChange={(event) => updateRuleForm({ tipo_componente: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800" />
                         </RuleField>
+                        <button type="button" title="Desdobrar lançamento" className="mt-4 inline-flex h-8 items-center justify-center rounded-md border border-slate-200 bg-white px-2 text-[11px] font-bold text-slate-700 hover:bg-slate-50">Desd. Lancto</button>
                       </div>
-                      <div className="rounded-lg border border-slate-200 bg-slate-50 p-2.5">
-                        <div className="mb-2 flex items-center justify-between">
+                      <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
+                        <div className="mb-1.5 flex items-center justify-between">
                           <span className="text-[10px] font-black uppercase tracking-wide text-slate-500">Lançamento</span>
                           <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-bold text-slate-500">D → C</span>
                         </div>
@@ -963,7 +1007,11 @@ export default function GuidedReconciliationPage() {
                       <RuleField label="Complemento">
                         <input value={ruleForm.complemento} onChange={(event) => updateRuleForm({ complemento: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800" />
                       </RuleField>
-                      <div className="rounded-lg border border-teal-100 bg-teal-50 p-2.5">
+                      <label className="flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5 text-[11px] font-bold text-slate-700">
+                        <input type="checkbox" checked={ruleForm.aplicar_existentes} readOnly className="h-3.5 w-3.5 accent-teal-700" />
+                        Aplicar esta regra aos lançamentos existentes
+                      </label>
+                      <div className="rounded-md border border-teal-100 bg-teal-50 p-2">
                         <div className="flex items-center justify-between gap-3">
                           <strong className="text-xs text-teal-950">Cobertura</strong>
                           <button type="button" disabled={ruleBusy === "preview"} onClick={() => calculateRuleCoverage()} className="rounded-full bg-slate-900 px-2.5 py-1 text-[11px] font-bold text-white disabled:cursor-wait disabled:opacity-60">{ruleBusy === "preview" ? "Validando..." : "Ver cobertura"}</button>
@@ -974,9 +1022,9 @@ export default function GuidedReconciliationPage() {
                               {rulePreview.quantidade > 0 ? `Vai cobrir ${rulePreview.quantidade} lançamento(s).` : rulePreview.motivo || "Não cobre lançamentos elegíveis."}
                             </p>
                             {!!rulePreview.lancamentos?.length && (
-                              <div className="mt-2 max-h-32 overflow-y-auto rounded border border-teal-100 bg-white">
-                                {rulePreview.lancamentos.slice(0, 8).map((item, index) => (
-                                  <div className="border-b border-slate-100 px-2 py-1.5 text-[11px] last:border-b-0" key={index}>
+                              <div className="mt-1.5 max-h-24 overflow-y-auto rounded border border-teal-100 bg-white">
+                                {rulePreview.lancamentos.slice(0, 5).map((item, index) => (
+                                  <div className="border-b border-slate-100 px-2 py-1 text-[11px] last:border-b-0" key={index}>
                                     <strong>{item.data ?? "—"}</strong> · {item.historico ?? "—"} · {item.componente ?? "PRINCIPAL"}
                                   </div>
                                 ))}
@@ -985,7 +1033,7 @@ export default function GuidedReconciliationPage() {
                           </div>
                         ) : <p className="mt-2 text-xs text-slate-500">Valide antes de salvar.</p>}
                       </div>
-                      <button disabled={ruleBusy === "save"} className="inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800 disabled:cursor-wait disabled:opacity-60">{ruleBusy === "save" ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}{editingRuleId ? "Atualizar regra" : "Salvar regra"}</button>
+                      <button disabled={ruleBusy === "save"} className="inline-flex items-center justify-center gap-1.5 rounded-md bg-teal-700 px-2.5 py-1.5 text-xs font-bold text-white hover:bg-teal-800 disabled:cursor-wait disabled:opacity-60">{ruleBusy === "save" ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}{editingRuleId ? "Atualizar" : "Salvar"}</button>
                     </div>
                   </form>
                 </div>}
@@ -1076,14 +1124,14 @@ function PdfModal({ viewer, onClose }: { viewer: Viewer; onClose: () => void }) 
 
 function SummaryCard({ selectedClient, start, end, selectedAreas, matchingProcess, title, summary }: { selectedClient?: Client; start: string; end: string; selectedAreas: string[]; matchingProcess?: Process | null; title: string; summary: string }) {
   return (
-    <aside className="rounded-xl border border-teal-200 bg-white p-3 shadow-sm">
-      <div className="mb-2 flex items-center gap-2 text-teal-800"><CalendarDays size={16} /><h2 className="font-bold">Resumo</h2></div>
-      <dl className="space-y-2 text-xs">
-        <div><dt className="text-xs font-semibold uppercase tracking-wide text-slate-400">Fluxo</dt><dd className="mt-0.5 font-medium">{title}</dd><dd className="mt-1 text-xs text-slate-500">{summary}</dd></div>
-        <div><dt className="text-xs font-semibold uppercase tracking-wide text-slate-400">Cliente</dt><dd className="mt-0.5 font-medium">{selectedClient?.nome ?? "Selecione um cliente"}</dd></div>
-        <div><dt className="text-xs font-semibold uppercase tracking-wide text-slate-400">Período</dt><dd className="mt-0.5 font-medium">{monthRange(start, end)}</dd></div>
-        {matchingProcess && <div><dt className="text-xs font-semibold uppercase tracking-wide text-slate-400">Situação</dt><dd className="mt-0.5 font-medium text-amber-800">Este período já existe. O guiado vai reaproveitar o processo.</dd></div>}
-        <div><dt className="text-xs font-semibold uppercase tracking-wide text-slate-400">Blocos</dt><dd className="mt-1 flex flex-wrap gap-1">{selectedAreas.map((area) => <span className="rounded bg-slate-100 px-2 py-1 text-xs font-semibold" key={area}>{area}</span>)}</dd></div>
+    <aside className="rounded-lg border border-teal-200 bg-white p-2.5 shadow-sm">
+      <div className="mb-1.5 flex items-center gap-1.5 text-teal-800"><CalendarDays size={14} /><h2 className="font-bold">Resumo</h2></div>
+      <dl className="space-y-1.5 text-[11px]">
+        <div><dt className="font-semibold uppercase tracking-wide text-slate-400">Fluxo</dt><dd className="mt-0.5 font-medium">{title}</dd><dd className="mt-0.5 text-slate-500">{summary}</dd></div>
+        <div><dt className="font-semibold uppercase tracking-wide text-slate-400">Cliente</dt><dd className="mt-0.5 font-medium">{selectedClient?.nome ?? "Selecione um cliente"}</dd></div>
+        <div><dt className="font-semibold uppercase tracking-wide text-slate-400">Período</dt><dd className="mt-0.5 font-medium">{monthRange(start, end)}</dd></div>
+        {matchingProcess && <div><dt className="font-semibold uppercase tracking-wide text-slate-400">Situação</dt><dd className="mt-0.5 font-medium text-amber-800">Período existente reaproveitado.</dd></div>}
+        <div><dt className="font-semibold uppercase tracking-wide text-slate-400">Blocos</dt><dd className="mt-1 flex flex-wrap gap-1">{selectedAreas.map((area) => <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-semibold" key={area}>{area}</span>)}</dd></div>
       </dl>
     </aside>
   );
@@ -1091,12 +1139,12 @@ function SummaryCard({ selectedClient, start, end, selectedAreas, matchingProces
 
 function ContextMap({ items, existing }: { items: string[][]; existing: boolean }) {
   return (
-    <section className="rounded-xl border border-slate-200 bg-white p-2.5 shadow-sm">
-      <div className="grid gap-2 md:grid-cols-3 xl:grid-cols-6">
+    <section className="rounded-lg border border-slate-200 bg-white p-2 shadow-sm">
+      <div className="grid gap-1.5 md:grid-cols-3 xl:grid-cols-6">
         {items.map(([label, value]) => {
           const isPeriod = label === "Período";
           return (
-            <div className={`min-w-0 rounded-lg border px-2.5 py-2 ${isPeriod ? "border-emerald-300 bg-emerald-50" : "border-slate-200 bg-slate-50"}`} key={label}>
+            <div className={`min-w-0 rounded-md border px-2 py-1.5 ${isPeriod ? "border-emerald-300 bg-emerald-50" : "border-slate-200 bg-slate-50"}`} key={label}>
               <dt className={`text-[10px] font-black uppercase tracking-wide ${isPeriod ? "text-emerald-800" : "text-slate-400"}`}>{label}</dt>
               <dd className={`mt-0.5 truncate text-xs font-bold ${isPeriod ? "text-emerald-950" : "text-slate-800"}`} title={value}>{value}</dd>
             </div>
@@ -1104,7 +1152,7 @@ function ContextMap({ items, existing }: { items: string[][]; existing: boolean 
         })}
       </div>
       {existing && (
-        <p className="mt-2 rounded-md bg-amber-50 px-2.5 py-1.5 text-[11px] font-semibold text-amber-900">
+        <p className="mt-1.5 rounded-md bg-amber-50 px-2 py-1 text-[11px] font-semibold text-amber-900">
           Período já existente: novos bancos ou áreas entram no mesmo processo. Itens já iniciados devem ser revisados pela conciliação normal.
         </p>
       )}
@@ -1114,8 +1162,8 @@ function ContextMap({ items, existing }: { items: string[][]; existing: boolean 
 
 function GuidedPanel({ title, action, loading, children }: { title: string; action?: ReactNode; loading?: boolean; children: ReactNode }) {
   return (
-    <section className="rounded-xl border border-slate-200 bg-white p-3 shadow-sm">
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+    <section className="rounded-lg border border-slate-200 bg-white p-2.5 shadow-sm">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
         <h2 className="font-bold">{title}</h2>
         <div className="flex items-center gap-2">{loading && <Loader2 size={16} className="animate-spin text-slate-500" />}{action}</div>
       </div>
@@ -1127,8 +1175,8 @@ function GuidedPanel({ title, action, loading, children }: { title: string; acti
 function EmptyAction({ text, onClick, href }: { text: string; onClick?: () => void; href?: string }) {
   const className = "inline-flex items-center gap-2 rounded-md bg-teal-700 px-3 py-1.5 text-xs font-bold text-white hover:bg-teal-800";
   return (
-    <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 p-4 text-center text-sm text-slate-600">
-      <p className="mb-3 font-semibold">{text}</p>
+    <div className="rounded-lg border border-dashed border-slate-300 bg-slate-50 p-3 text-center text-sm text-slate-600">
+      <p className="mb-2 font-semibold">{text}</p>
       {href ? <Link href={href} className={className}><FolderOpen size={15} />Abrir</Link> : <button onClick={onClick} className={className}>Começar</button>}
     </div>
   );
@@ -1136,11 +1184,11 @@ function EmptyAction({ text, onClick, href }: { text: string; onClick?: () => vo
 
 function StatsGrid({ items }: { items: [string, number][] }) {
   return (
-    <div className="mb-3 grid gap-2 md:grid-cols-3 xl:grid-cols-4">
+    <div className="mb-2 grid gap-1.5 md:grid-cols-3 xl:grid-cols-5">
       {items.map(([label, value]) => (
-        <div className="rounded-lg border border-slate-200 bg-slate-50 p-2.5" key={label}>
-          <div className="text-xl font-bold text-slate-900">{value}</div>
-          <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</div>
+        <div className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5" key={label}>
+          <div className="text-base font-bold leading-tight text-slate-900">{value}</div>
+          <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">{label}</div>
         </div>
       ))}
     </div>
@@ -1171,27 +1219,28 @@ function CadastroTable({ headers, rows }: { headers: string[]; rows: string[][] 
   );
 }
 
-function MiniTable({ rows, onView }: { rows: ResultRow[]; onView: (viewer: Viewer) => void }) {
+function MiniTable({ rows, onView, onCreateRule }: { rows: ResultRow[]; onView: (viewer: Viewer) => void; onCreateRule: (row: ResultRow) => void }) {
   if (!rows.length) return <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">Nenhum resultado processado ainda.</div>;
   return (
-    <div className="max-h-[calc(100dvh-330px)] overflow-auto rounded-lg border border-slate-200">
-      <table className="min-w-full text-sm">
+    <div className="max-h-[calc(100dvh-285px)] overflow-auto rounded-lg border border-slate-200">
+      <table className="min-w-full text-xs">
         <thead className="sticky top-0 z-10 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
-          <tr><th className="px-3 py-2">Data</th><th className="px-3 py-2">Tipo</th><th className="px-3 py-2">Extrato</th><th className="px-3 py-2">Valor</th><th className="px-3 py-2">Situação</th><th className="px-3 py-2">Regra</th><th className="px-3 py-2">Doc.</th></tr>
+          <tr><th className="px-3 py-2">Data</th><th className="px-3 py-2">Tipo</th><th className="px-3 py-2">Extrato</th><th className="px-3 py-2">Valor</th><th className="px-3 py-2">Situação</th><th className="px-3 py-2">Regra</th><th className="px-3 py-2">Ações</th></tr>
         </thead>
         <tbody>
           {rows.map((row, index) => (
             <tr className="border-t border-slate-100" key={index}>
-              <td className="whitespace-nowrap px-3 py-2 font-mono text-xs">{row.data ?? "—"}</td>
-              <td className="px-3 py-2">{row.tipo_pagamento ?? "—"}</td>
-              <td className="max-w-[460px] px-3 py-2 text-xs text-slate-600">{String(row.extrato ?? "—").split("\n").slice(0, 2).join(" · ")}</td>
-              <td className="whitespace-nowrap px-3 py-2 font-semibold">{row.valor ?? "—"}</td>
-              <td className="px-3 py-2 font-semibold">{row.situacao ?? "—"}</td>
-              <td className="px-3 py-2">{row.fonte_regra ?? "—"} · {row.lancamentos?.length ?? 0} linha(s)</td>
-              <td className="whitespace-nowrap px-3 py-2">
+              <td className="whitespace-nowrap px-2 py-1.5 font-mono text-[11px]">{row.data ?? "—"}</td>
+              <td className="px-2 py-1.5">{row.tipo_pagamento ?? "—"}</td>
+              <td className="max-w-[520px] px-2 py-1.5 text-[11px] text-slate-600">{String(row.extrato ?? "—").split("\n").slice(0, 2).join(" · ")}</td>
+              <td className="whitespace-nowrap px-2 py-1.5 font-semibold">{row.valor ?? "—"}</td>
+              <td className="px-2 py-1.5 font-semibold">{row.situacao ?? "—"}</td>
+              <td className="px-2 py-1.5">{row.fonte_regra ?? "—"} · {row.lancamentos?.length ?? 0} linha(s)</td>
+              <td className="whitespace-nowrap px-2 py-1.5">
                 {row.extrato_arquivo_id && <button type="button" onClick={() => onView({ arquivoId: row.extrato_arquivo_id!, pagina: Number(row.extrato_pagina || 1), titulo: "Extrato" })} title="Visualizar extrato" aria-label="Visualizar extrato" className="rounded p-1 text-slate-700 hover:bg-slate-100"><Eye size={14} /></button>}
                 {row.comprovante_arquivo_id && <button type="button" onClick={() => onView({ arquivoId: row.comprovante_arquivo_id!, pagina: Number(row.comprovante_pagina || 1), titulo: "Comprovante" })} title="Visualizar comprovante" aria-label="Visualizar comprovante" className="rounded p-1 text-teal-700 hover:bg-teal-50"><Eye size={14} /></button>}
                 {row.rfb_arquivo_id && <button type="button" onClick={() => onView({ arquivoId: row.rfb_arquivo_id!, pagina: Number(row.rfb_pagina || 1), titulo: "Comprovante RFB" })} title="Visualizar RFB" aria-label="Visualizar RFB" className="rounded p-1 text-violet-700 hover:bg-violet-50"><Eye size={14} /></button>}
+                <button type="button" onClick={() => onCreateRule(row)} title="Criar regra a partir deste lançamento" aria-label="Criar regra a partir deste lançamento" className="ml-1 rounded bg-slate-900 px-1.5 py-0.5 text-[10px] font-bold text-white hover:bg-slate-800">Regra</button>
               </td>
             </tr>
           ))}
@@ -1204,7 +1253,7 @@ function MiniTable({ rows, onView }: { rows: ResultRow[]; onView: (viewer: Viewe
 function NotesReviewTable({ rows, onView }: { rows: unknown[]; onView: (viewer: Viewer) => void }) {
   if (!rows.length) return <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">Nenhuma nota extraída ainda.</div>;
   return (
-    <div className="max-h-[calc(100dvh-330px)] overflow-auto rounded-lg border border-slate-200">
+    <div className="max-h-[calc(100dvh-285px)] overflow-auto rounded-lg border border-slate-200">
       <table className="min-w-full text-sm">
         <thead className="sticky top-0 z-10 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
           <tr><th className="px-3 py-2">Emissão</th><th className="px-3 py-2">Tomador</th><th className="px-3 py-2">Nota</th><th className="px-3 py-2">Pagamento</th><th className="px-3 py-2">Valor</th><th className="px-3 py-2">Doc.</th></tr>
@@ -1233,7 +1282,7 @@ function NotesReviewTable({ rows, onView }: { rows: unknown[]; onView: (viewer: 
 function PendingRules({ rows, onSelect, onView, showNotePayment = false }: { rows: unknown[]; onSelect: (row: unknown) => void; onView: (viewer: Viewer) => void; showNotePayment?: boolean }) {
   if (!rows.length) return <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">Nenhuma regra pendente para este banco.</div>;
   return (
-    <div className="max-h-[640px] space-y-2 overflow-y-auto pr-1">
+    <div className="max-h-[calc(100dvh-310px)] space-y-1.5 overflow-y-auto pr-1">
       {rows.slice(0, 24).map((raw, index) => {
         const row = raw as Record<string, unknown>;
         const history = String(row.historico ?? row.gatilho ?? row.texto ?? "—");
@@ -1241,23 +1290,23 @@ function PendingRules({ rows, onSelect, onView, showNotePayment = false }: { row
         const payment = String(row.tipo_pagamento_label ?? row.forma_pagamento ?? "");
         const countText = row.cobertos ? `${String(row.cobertos)} cobertos` : "pendente";
         return (
-          <article className="grid gap-3 rounded-xl border border-slate-200 bg-white p-3 shadow-sm transition hover:border-teal-300 hover:bg-slate-50 lg:grid-cols-[minmax(0,1fr)_110px_92px]" key={String(row.id ?? index)}>
+          <article className="grid gap-2 rounded-lg border border-slate-200 bg-white p-2.5 shadow-sm transition hover:border-teal-300 hover:bg-slate-50 lg:grid-cols-[minmax(0,1fr)_96px_82px]" key={String(row.id ?? index)}>
             <div className="min-w-0">
-              <span className="mb-1.5 inline-flex rounded bg-amber-50 px-2 py-0.5 text-[10px] font-black uppercase tracking-wide text-amber-800">{countText}</span>
-              <h3 className="line-clamp-2 text-xs font-black leading-5 text-slate-800" title={history}>{date} · {history}</h3>
-              <p className="mt-1 text-[11px] font-semibold text-slate-500">
+              <span className="mb-1 inline-flex rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-black uppercase tracking-wide text-amber-800">{countText}</span>
+              <h3 className="line-clamp-2 text-[11px] font-black leading-4 text-slate-800" title={history}>{date} · {history}</h3>
+              <p className="mt-0.5 text-[10px] font-semibold text-slate-500">
                 Tipo: {String(row.tipo_componente ?? row.tipo_lancamento_label ?? "Principal")}
                 {showNotePayment && payment && payment !== "—" ? ` · Pagamento: ${payment}` : ""}
               </p>
             </div>
-            <div className="flex items-center justify-between gap-2 rounded-lg border border-slate-100 bg-slate-50 px-2 py-1.5 lg:block">
+            <div className="flex items-center justify-between gap-2 rounded-md border border-slate-100 bg-slate-50 px-2 py-1 lg:block">
               <span className="text-[10px] font-black uppercase tracking-wide text-slate-400">Valor</span>
-              <strong className="block text-xs text-slate-900 lg:mt-1">{String(row.valor ?? "—")}</strong>
+              <strong className="block text-[11px] text-slate-900 lg:mt-0.5">{String(row.valor ?? "—")}</strong>
             </div>
             <div className="flex items-center justify-end gap-1.5">
-              {Boolean(row.arquivo_id) && <button type="button" onClick={() => onView({ arquivoId: String(row.arquivo_id), pagina: Number(row.pagina || 1), titulo: "Documento" })} title="Visualizar documento" aria-label="Visualizar documento" className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50"><Eye size={14} /></button>}
-              <button type="button" onClick={() => onSelect(raw)} className="inline-flex h-8 items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3 text-xs font-bold text-white hover:bg-slate-800">
-                <WandSparkles size={14} />
+              {Boolean(row.arquivo_id) && <button type="button" onClick={() => onView({ arquivoId: String(row.arquivo_id), pagina: Number(row.pagina || 1), titulo: "Documento" })} title="Visualizar documento" aria-label="Visualizar documento" className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-slate-200 text-slate-700 hover:bg-slate-50"><Eye size={13} /></button>}
+              <button type="button" onClick={() => onSelect(raw)} className="inline-flex h-7 items-center justify-center gap-1 rounded-md bg-slate-900 px-2 text-[11px] font-bold text-white hover:bg-slate-800">
+                <WandSparkles size={13} />
                 Criar
               </button>
             </div>

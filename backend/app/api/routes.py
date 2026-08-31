@@ -342,6 +342,7 @@ class RegraContabilInput(BaseModel):
     complemento: str = ""
     tipo_componente: str = ""
     escopo: str = "global"
+    aplicar_existentes: bool = True
 
 
 class RegraContabilPreviaInput(BaseModel):
@@ -776,9 +777,12 @@ def create_reconciliation_process(payload: ProcessoConciliacaoInput, db: Session
         raise HTTPException(422, "Cliente ou período inválido")
     if payload.banco and payload.banco not in BANKS:
         raise HTTPException(422, "Banco inválido")
-    process = ProcessoConciliacao(cliente_id=payload.cliente_id, data_inicio=payload.data_inicio, data_fim=payload.data_fim)
-    db.add(process); db.flush()
-    if payload.banco:
+    process = db.query(ProcessoConciliacao).filter_by(cliente_id=payload.cliente_id, data_inicio=payload.data_inicio, data_fim=payload.data_fim).first()
+    if not process:
+        process = ProcessoConciliacao(cliente_id=payload.cliente_id, data_inicio=payload.data_inicio, data_fim=payload.data_fim)
+        db.add(process); db.flush()
+    if payload.banco and not db.query(Conciliacao).filter_by(processo_id=process.id, banco=payload.banco).first():
+        process.status = "em_andamento"
         db.add(Conciliacao(cliente_id=process.cliente_id, processo_id=process.id, banco=payload.banco, data_inicio=process.data_inicio, data_fim=process.data_fim))
     db.commit(); db.refresh(process)
     return process_payload(process, db)

@@ -1841,6 +1841,46 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
                 covered_by_rule[entry.regra_contabil_id].append((movement_id, entry))
                 covered_components.add((movement_id, rule_component_key(entry.componente)))
     integrity = accounting_integrity(reconciliation, db)
+    def money_label(amount):
+        value = amount or Decimal("0.00")
+        return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    def receipt_financial_details(receipt: Comprovante | None, rfb: ComprovanteRfb | None, rfb_items: list[ComprovanteRfbItem], movement: MovimentoExtrato, receipt_type: str):
+        values = []
+        components = []
+        if rfb:
+            tax_principal = sum((item.valor_principal or Decimal("0.00") for item in rfb_items), Decimal("0.00")) or (rfb.valor_principal or Decimal("0.00"))
+            fields = [
+                ("Principal", tax_principal, "PRINCIPAL"),
+                ("Juros", rfb.valor_juros, "JUROS"),
+                ("Multa", rfb.valor_multa, "MULTA"),
+                ("Outras taxas", Decimal("0.00"), "ENCARGOS"),
+                ("Total pago", rfb.valor_total, "PRINCIPAL"),
+            ]
+            for label, amount, component in fields:
+                values.append({"label": label, "valor": money_label(amount)})
+                if amount and amount > 0 and label != "Total pago":
+                    components.append({"tipo": component, "label": label, "valor": money_label(amount)})
+            return {"origem": rfb.tipo or "Comprovante RFB", "pagina": rfb.pagina_numero, "arquivo_id": rfb.arquivo_id, "confere": rfb.status != "composição divergente", "valores": values, "componentes": components}
+        if not receipt:
+            return None
+        discount = (receipt.valor_desconto or Decimal("0.00")) + (receipt.valor_abatimento or Decimal("0.00")) + (receipt.valor_desconto_abatimento or Decimal("0.00"))
+        other_fees = (receipt.valor_encargos or Decimal("0.00")) + (receipt.valor_tarifa or Decimal("0.00"))
+        principal = receipt.valor_original or receipt.valor_pago or movement.valor or Decimal("0.00")
+        total_paid = receipt.valor_pago or movement.valor or Decimal("0.00")
+        fields = [
+            ("Principal", principal, "PRINCIPAL"),
+            ("Juros", receipt.valor_juros, "JUROS"),
+            ("Multa", receipt.valor_multa, "MULTA"),
+            ("Desconto", discount, "DESCONTO"),
+            ("Tarifa", receipt.valor_tarifa, "TARIFA"),
+            ("Outras taxas", other_fees, "ENCARGOS"),
+            ("Total pago", total_paid, "PRINCIPAL"),
+        ]
+        for label, amount, component in fields:
+            values.append({"label": label, "valor": money_label(amount)})
+            if amount and amount > 0 and label != "Total pago":
+                components.append({"tipo": component, "label": label, "valor": money_label(amount)})
+        return {"origem": "Empréstimo/Financiamento" if receipt_type == "emprestimo" else "Comprovante bancário", "pagina": receipt.pagina_numero, "arquivo_id": receipt.arquivo_id, "confere": receipt.status_revisao != "revisao", "valores": values, "componentes": components}
     def pending_payload(item: MovimentoExtrato, component: str = "PRINCIPAL", value: Decimal | None = None, document_components: list[str] | None = None, covered_document_components: list[dict] | None = None):
         match = matches.get(item.id)
         receipt = receipts_by_id.get(match.comprovante_id) if match and match.comprovante_id else None
@@ -1872,17 +1912,17 @@ def accounting_rules(conciliacao_id: str, db: Session = Depends(get_db), respons
             composition = "Composição:\n- " + "\n- ".join(lines) + f"\nTotal do documento: {money(rfb.valor_total or 0)}"
         receipt_type = "emprestimo" if is_loan_receipt(receipt) else "comprovante" if receipt else ""
         if receipt_type == "emprestimo":
-            money = lambda amount: f"R$ {amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
             lines = []
             if receipt.valor_original:
-                lines.append(f"Principal/Capital: {money(receipt.valor_original)}")
+                lines.append(f"Principal/Capital: {money_label(receipt.valor_original)}")
             if receipt.valor_juros:
-                lines.append(f"Juros: {money(receipt.valor_juros)}")
+                lines.append(f"Juros: {money_label(receipt.valor_juros)}")
             if receipt.valor_encargos:
-                lines.append(f"Encargos: {money(receipt.valor_encargos)}")
-            composition = "Comprovante de empréstimo/financiamento\n- " + "\n- ".join(lines) + f"\nTotal do extrato: {money(item.valor or 0)}"
+                lines.append(f"Encargos: {money_label(receipt.valor_encargos)}")
+            composition = "Comprovante de empréstimo/financiamento\n- " + "\n- ".join(lines) + f"\nTotal do extrato: {money_label(item.valor or 0)}"
         document_components = document_components or [component]
-        return {"id": f"{item.id}:{component}", "movimento_id": item.id, "usado_no_periodo": movement_used_in_period(item), "data": item.data.strftime("%d/%m/%y") if item.data else "—", "historico": history, "valor": str(value if value is not None else item.valor or 0), "natureza": normalize_statement_nature(item.natureza), "natureza_contabil": accounting_nature(item.natureza), "tipo_componente": component, "movimento_composto": len(document_components) > 1, "componentes_documento": document_components, "componentes_cobertos": covered_document_components or [], "palavras_comprovante": receipt_words, "palavras_comprovante_banco": bank_receipt_words, "palavras_comprovante_rfb": rfb_words, "valor_documento": str(receipt.valor_original) if receipt and receipt.valor_original else "", "composicao_simples": composition, "tarifa_no_extrato": tariff_in_statement, "tarifa_referente_ao_comprovante": tariff_reference, "tarifa_referencia_nome": (receipt.beneficiario or receipt.favorecido) if tariff_reference else "", "tarifa_referencia_valor": str(receipt.valor_pago or 0) if tariff_reference else "", "tarifa_referencia_data": receipt.data.strftime("%d/%m/%Y") if tariff_reference and receipt.data else "", "pagina": item.pagina_numero, "arquivo_id": item.arquivo_id, "comprovante_tipo": receipt_type, "comprovante_arquivo_id": receipt.arquivo_id if receipt else None, "comprovante_pagina": receipt.pagina_numero if receipt else None, "comprovante_rfb_arquivo_id": rfb.arquivo_id if rfb else None, "comprovante_rfb_pagina": rfb.pagina_numero if rfb else None, "comprovante_confere": bool((receipt or rfb) and match and match.status.startswith("Conciliado")), "ajuste_getnet": is_getnet_adjustment, "gatilho_sugerido": "JUROS ANTECIPACOES GETNET" if is_getnet_adjustment else "", "complemento_sugerido": "DIFERENÇA ENTRE GETNET E RECEBIMENTOS NO SANTANDER" if is_getnet_adjustment else ""}
+        receipt_details = receipt_financial_details(receipt, rfb, rfb_items, item, receipt_type)
+        return {"id": f"{item.id}:{component}", "movimento_id": item.id, "usado_no_periodo": movement_used_in_period(item), "data": item.data.strftime("%d/%m/%y") if item.data else "—", "historico": history, "valor": str(value if value is not None else item.valor or 0), "natureza": normalize_statement_nature(item.natureza), "natureza_contabil": accounting_nature(item.natureza), "tipo_componente": component, "movimento_composto": len(document_components) > 1, "componentes_documento": document_components, "componentes_cobertos": covered_document_components or [], "palavras_comprovante": receipt_words, "palavras_comprovante_banco": bank_receipt_words, "palavras_comprovante_rfb": rfb_words, "valor_documento": str(receipt.valor_original) if receipt and receipt.valor_original else "", "composicao_simples": composition, "dados_comprovante": receipt_details, "tarifa_no_extrato": tariff_in_statement, "tarifa_referente_ao_comprovante": tariff_reference, "tarifa_referencia_nome": (receipt.beneficiario or receipt.favorecido) if tariff_reference else "", "tarifa_referencia_valor": str(receipt.valor_pago or 0) if tariff_reference else "", "tarifa_referencia_data": receipt.data.strftime("%d/%m/%Y") if tariff_reference and receipt.data else "", "pagina": item.pagina_numero, "arquivo_id": item.arquivo_id, "comprovante_tipo": receipt_type, "comprovante_arquivo_id": receipt.arquivo_id if receipt else None, "comprovante_pagina": receipt.pagina_numero if receipt else None, "comprovante_rfb_arquivo_id": rfb.arquivo_id if rfb else None, "comprovante_rfb_pagina": rfb.pagina_numero if rfb else None, "comprovante_confere": bool((receipt or rfb) and match and match.status.startswith("Conciliado")), "ajuste_getnet": is_getnet_adjustment, "gatilho_sugerido": "JUROS ANTECIPACOES GETNET" if is_getnet_adjustment else "", "complemento_sugerido": "DIFERENÇA ENTRE GETNET E RECEBIMENTOS NO SANTANDER" if is_getnet_adjustment else ""}
     pending = []
     for movement in movements:
         match = matches.get(movement.id)

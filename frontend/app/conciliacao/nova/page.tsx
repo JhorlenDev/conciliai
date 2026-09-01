@@ -78,16 +78,37 @@ type RuleForm = {
   tipo_componente: string;
   aplicar_existentes: boolean;
 };
+type RuleLineForm = {
+  id: string;
+  tipo_componente: string;
+  label: string;
+  valor: string;
+  conta_debito: string;
+  conta_credito: string;
+  historico: string;
+  complemento: string;
+};
 type RulePreview = {
   quantidade: number;
   motivo?: string;
   lancamentos?: { data?: string; historico?: string; componente?: string; fonte?: string }[];
 };
 type RuleSuggestion = { id: string; label: string; value: string; target: "extrato" | "comprovante" | "exclusao" };
+type ReceiptDetail = {
+  origem: string;
+  pagina?: number;
+  arquivoId?: string;
+  confere?: boolean;
+  valores: { label: string; valor: string }[];
+  componentes: { tipo: string; label: string; valor: string }[];
+};
+type SelectedRuleContext = { data: string; historico: string; valor: string; tipo: string; comprovante?: ReceiptDetail };
+type AccountSide = "conta_debito" | "conta_credito";
 type FlowType = "bancos" | "notas" | "despesas" | "folha";
 type Catalog = { contas: string[]; historicos: string[] };
 
 const defaultRuleForm: RuleForm = { gatilho: "", gatilho_comprovante: "", texto_exclusao: "", natureza: "Crédito", conta_debito: "", conta_credito: "", historico: "", complemento: "Conforme extrato bancário", tipo_componente: "PRINCIPAL", aplicar_existentes: true };
+const defaultRuleLine: RuleLineForm = { id: "PRINCIPAL", tipo_componente: "PRINCIPAL", label: "Principal", valor: "", conta_debito: "", conta_credito: "", historico: "", complemento: "Conforme extrato bancário" };
 
 const flowConfigs: Record<FlowType, { title: string; area: string; support: string[]; step2: string; step2Desc: string; summary: string }> = {
   bancos: {
@@ -186,6 +207,14 @@ function catalogCode(value: string) {
   return String(value ?? "").match(/^\s*(\d+(?:[.-]\d+)*)/)?.[1] ?? String(value ?? "").trim();
 }
 
+function formatCurrency(value: unknown) {
+  const raw = String(value ?? "0").replace(/[^\d,.-]/g, "");
+  const normalized = raw.includes(",") ? raw.replace(/\./g, "").replace(",", ".") : raw;
+  const numeric = Number(normalized);
+  if (!Number.isFinite(numeric)) return "R$ 0,00";
+  return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(numeric);
+}
+
 function samePeriod(process: Process, clientId: string, start: string, end: string) {
   return process.cliente_id === clientId && process.data_inicio === start && process.data_fim === end;
 }
@@ -205,6 +234,55 @@ function progressColor(percent: number) {
 
 function displayAreaName(area: string, flowType: FlowType) {
   return area === "Apropriações" && flowType === "despesas" ? "Despesas Gerais" : area;
+}
+
+function bankAccountSide(natureza: string): AccountSide {
+  return String(natureza).toLowerCase().startsWith("d") ? "conta_debito" : "conta_credito";
+}
+
+function selectedReceiptDetail(row: Record<string, unknown>): ReceiptDetail | undefined {
+  const raw = row.dados_comprovante as Record<string, unknown> | null | undefined;
+  if (!raw) return undefined;
+  const values = Array.isArray(raw.valores)
+    ? raw.valores.map((item) => {
+        const value = item as Record<string, unknown>;
+        return { label: String(value.label ?? ""), valor: String(value.valor ?? "") };
+      }).filter((item) => item.label && item.valor)
+    : [];
+  const components = Array.isArray(raw.componentes)
+    ? raw.componentes.map((item) => {
+        const value = item as Record<string, unknown>;
+        return { tipo: String(value.tipo ?? ""), label: String(value.label ?? ""), valor: String(value.valor ?? "") };
+      }).filter((item) => item.tipo && item.valor)
+    : [];
+  if (!values.length && !components.length) return undefined;
+  return {
+    origem: String(raw.origem ?? "Comprovante"),
+    pagina: raw.pagina ? Number(raw.pagina) : undefined,
+    arquivoId: raw.arquivo_id ? String(raw.arquivo_id) : undefined,
+    confere: typeof raw.confere === "boolean" ? raw.confere : undefined,
+    valores: values,
+    componentes: components,
+  };
+}
+
+function lineFromComponent(component: { tipo: string; label: string; valor: string }, fallbackComplement: string, index: number): RuleLineForm {
+  return {
+    ...defaultRuleLine,
+    id: `${index}:${component.tipo}:${component.valor}`,
+    tipo_componente: component.tipo || "PRINCIPAL",
+    label: component.label || component.tipo || "Principal",
+    valor: component.valor,
+    complemento: fallbackComplement,
+  };
+}
+
+function linesFromContext(context: SelectedRuleContext | null, fallbackComplement: string) {
+  const components = context?.comprovante?.componentes ?? [];
+  if (!components.length) {
+    return [{ ...defaultRuleLine, id: context?.tipo || "PRINCIPAL", tipo_componente: context?.tipo || "PRINCIPAL", label: context?.tipo || "Principal", valor: context?.valor || "", complemento: fallbackComplement }];
+  }
+  return components.map((component, index) => lineFromComponent(component, fallbackComplement, index));
 }
 
 export default function GuidedReconciliationPage() {
@@ -238,6 +316,11 @@ export default function GuidedReconciliationPage() {
   const [editingRuleId, setEditingRuleId] = useState("");
   const [expandedRuleId, setExpandedRuleId] = useState("");
   const [catalog, setCatalog] = useState<Catalog>({ contas: [], historicos: [] });
+  const [selectedRuleContext, setSelectedRuleContext] = useState<SelectedRuleContext | null>(null);
+  const [bankAccountCode, setBankAccountCode] = useState("");
+  const [manualAccountFields, setManualAccountFields] = useState<Record<AccountSide, boolean>>({ conta_debito: false, conta_credito: false });
+  const [ruleLines, setRuleLines] = useState<RuleLineForm[]>([defaultRuleLine]);
+  const [manualLineAccounts, setManualLineAccounts] = useState<Record<string, Record<AccountSide, boolean>>>({});
 
   useEffect(() => {
     const param = new URLSearchParams(window.location.search).get("tipo");
@@ -288,6 +371,39 @@ export default function GuidedReconciliationPage() {
   const selectedExistingBank = matchingProcess?.bancos.find((item) => item.banco === selectedBanks[0]);
   const selectedBankLocked = bankHasGuidedLock(selectedExistingBank);
   const isNotesRules = activeArea === "Notas";
+
+  useEffect(() => {
+    if (!activeReconciliation || isNotesRules) {
+      setBankAccountCode("");
+      return;
+    }
+    let cancelled = false;
+    fetch(`${API}/api/conciliacoes/${activeReconciliation.id}/conta-bancaria`, { cache: "no-store" })
+      .then((response) => (response.ok ? response.json() : { conta_contabil: "" }))
+      .then((payload) => {
+        if (!cancelled) setBankAccountCode(String(payload.conta_contabil ?? "").trim());
+      })
+      .catch(() => !cancelled && setBankAccountCode(""));
+    return () => {
+      cancelled = true;
+    };
+  }, [activeReconciliation, isNotesRules]);
+
+  useEffect(() => {
+    if (!bankAccountCode || editingRuleId || isNotesRules) return;
+    const target = bankAccountSide(ruleForm.natureza);
+    if (manualAccountFields[target] || ruleForm[target]) return;
+    setRuleForm((current) => ({ ...current, [target]: bankAccountCode }));
+  }, [bankAccountCode, editingRuleId, isNotesRules, manualAccountFields, ruleForm]);
+
+  useEffect(() => {
+    if (!bankAccountCode || editingRuleId || isNotesRules) return;
+    const target = bankAccountSide(ruleForm.natureza);
+    setRuleLines((current) => current.map((line) => {
+      if (manualLineAccounts[line.id]?.[target] || line[target]) return line;
+      return { ...line, [target]: bankAccountCode };
+    }));
+  }, [bankAccountCode, editingRuleId, isNotesRules, manualLineAccounts, ruleForm.natureza]);
 
   useEffect(() => {
     if (activeDocuments.length && !activeDocuments.some((item) => item.type === uploadTab)) setUploadTab(activeDocuments[0].type);
@@ -485,7 +601,12 @@ export default function GuidedReconciliationPage() {
 
   function applyRuleSuggestion(suggestion: RuleSuggestion, checked: boolean) {
     setSelectedRuleSuggestions((current) => checked ? Array.from(new Set([...current, suggestion.id])) : current.filter((item) => item !== suggestion.id));
-    if (!checked) return;
+    if (!checked) {
+      if (suggestion.target === "extrato" && ruleForm.gatilho === suggestion.value) updateRuleForm({ gatilho: "" });
+      if (suggestion.target === "comprovante" && ruleForm.gatilho_comprovante === suggestion.value) updateRuleForm({ gatilho_comprovante: "" });
+      if (suggestion.target === "exclusao" && ruleForm.texto_exclusao === suggestion.value) updateRuleForm({ texto_exclusao: "" });
+      return;
+    }
     if (suggestion.target === "extrato") updateRuleForm({ gatilho: suggestion.value });
     if (suggestion.target === "comprovante") updateRuleForm({ gatilho_comprovante: suggestion.value });
     if (suggestion.target === "exclusao") updateRuleForm({ texto_exclusao: suggestion.value });
@@ -493,23 +614,36 @@ export default function GuidedReconciliationPage() {
 
   function selectPendingRule(raw: unknown) {
     const row = raw as Record<string, unknown>;
-    const paymentTrigger = isNotesRules && row.tipo_pagamento_label && row.tipo_pagamento_label !== "Não identificado" ? String(row.tipo_pagamento_label) : "";
-    const history = paymentTrigger || String(row.historico ?? row.gatilho_sugerido ?? row.texto ?? "");
     const suggestions = buildRuleSuggestions(row);
-    const primary = suggestions.find((item) => item.target === "extrato")?.id;
+    const receiptDetail = selectedReceiptDetail(row);
+    const natureza = String(row.natureza_contabil ?? row.natureza ?? "Crédito");
+    const context = {
+      data: String(row.data ?? row.data_emissao ?? "—"),
+      historico: String(row.historico ?? row.gatilho_sugerido ?? row.texto ?? "—"),
+      valor: formatCurrency(row.valor),
+      tipo: String(row.tipo_componente ?? row.tipo_lancamento_label ?? natureza ?? "Principal"),
+      comprovante: receiptDetail,
+    };
+    const complement = isNotesRules ? String(row.documento && row.documento !== "—" ? row.documento : "Conforme nota fiscal") : "Conforme extrato bancário";
+    const generatedLines = linesFromContext(context, complement);
+    const target = bankAccountSide(natureza);
     setRuleSuggestions(suggestions);
-    setSelectedRuleSuggestions(primary ? [primary] : []);
+    setSelectedRuleSuggestions([]);
+    setSelectedRuleContext(context);
     setRulePreview(null);
+    setManualAccountFields({ conta_debito: false, conta_credito: false });
+    setManualLineAccounts({});
+    setRuleLines(bankAccountCode && !isNotesRules ? generatedLines.map((line) => ({ ...line, [target]: line[target] || bankAccountCode })) : generatedLines);
     setRuleForm({
       ...defaultRuleForm,
-      gatilho: history,
+      gatilho: "",
       gatilho_comprovante: "",
       texto_exclusao: "",
-      natureza: String(row.natureza_contabil ?? row.natureza ?? "Crédito"),
+      natureza,
       conta_debito: "",
       conta_credito: "",
       historico: "",
-      complemento: isNotesRules ? String(row.documento && row.documento !== "—" ? row.documento : "Conforme nota fiscal") : "Conforme extrato bancário",
+      complemento: complement,
       tipo_componente: String(row.tipo_componente ?? row.tipo_lancamento ?? "PRINCIPAL"),
       aplicar_existentes: true,
     });
@@ -521,6 +655,19 @@ export default function GuidedReconciliationPage() {
     setExpandedRuleId(String(row.id ?? ""));
     setRuleSuggestions([]);
     setSelectedRuleSuggestions([]);
+    setSelectedRuleContext(null);
+    setManualAccountFields({ conta_debito: true, conta_credito: true });
+    setManualLineAccounts({});
+    setRuleLines([{
+      id: String(row.tipo_componente ?? "PRINCIPAL"),
+      tipo_componente: String(row.tipo_componente ?? "PRINCIPAL"),
+      label: String(row.tipo_componente ?? "Principal"),
+      valor: "",
+      conta_debito: String(row.conta_debito ?? ""),
+      conta_credito: String(row.conta_credito ?? ""),
+      historico: String(row.historico ?? ""),
+      complemento: String(row.complemento ?? ""),
+    }]);
     setRulePreview(null);
     setRuleForm({
       ...defaultRuleForm,
@@ -543,6 +690,10 @@ export default function GuidedReconciliationPage() {
     setRulePreview(null);
     setRuleSuggestions([]);
     setSelectedRuleSuggestions([]);
+    setSelectedRuleContext(null);
+    setManualAccountFields({ conta_debito: false, conta_credito: false });
+    setManualLineAccounts({});
+    setRuleLines([defaultRuleLine]);
     setRuleForm(defaultRuleForm);
     setActiveStep(5);
   }
@@ -550,6 +701,24 @@ export default function GuidedReconciliationPage() {
   function updateRuleForm(next: Partial<RuleForm>) {
     setRulePreview(null);
     setRuleForm((current) => ({ ...current, ...next }));
+  }
+
+  function updateRuleLine(lineId: string, next: Partial<RuleLineForm>) {
+    setRulePreview(null);
+    setRuleLines((current) => current.map((line) => line.id === lineId ? { ...line, ...next } : line));
+  }
+
+  function updateRuleNatureza(natureza: string) {
+    setRulePreview(null);
+    const previousTarget = bankAccountSide(ruleForm.natureza);
+    const nextTarget = bankAccountSide(natureza);
+    setRuleForm((current) => ({ ...current, natureza }));
+    if (!bankAccountCode || editingRuleId || isNotesRules || previousTarget === nextTarget) return;
+    setRuleLines((current) => current.map((line) => ({
+      ...line,
+      [previousTarget]: !manualLineAccounts[line.id]?.[previousTarget] && line[previousTarget] === bankAccountCode ? "" : line[previousTarget],
+      [nextTarget]: !manualLineAccounts[line.id]?.[nextTarget] && !line[nextTarget] ? bankAccountCode : line[nextTarget],
+    })));
   }
 
   async function calculateRuleCoverage(showMessage = true) {
@@ -590,6 +759,19 @@ export default function GuidedReconciliationPage() {
   async function saveGuidedRule(event: FormEvent) {
     event.preventDefault();
     if (!activeReconciliation) return;
+    const linesToSave = ruleLines.length ? ruleLines : [{
+      ...defaultRuleLine,
+      tipo_componente: ruleForm.tipo_componente,
+      conta_debito: ruleForm.conta_debito,
+      conta_credito: ruleForm.conta_credito,
+      historico: ruleForm.historico,
+      complemento: ruleForm.complemento,
+    }];
+    const incompleteLine = linesToSave.find((line) => !line.conta_debito.trim() || !line.conta_credito.trim() || !line.historico.trim());
+    if (incompleteLine) {
+      setMessage(`Complete Débito, Crédito e Histórico do lançamento ${incompleteLine.label || incompleteLine.tipo_componente}.`);
+      return;
+    }
     const coverage = await calculateRuleCoverage(false);
     if (coverage <= 0) {
       setMessage("Essa regra não cobre nenhum lançamento elegível. Ajuste o gatilho antes de salvar.");
@@ -598,21 +780,33 @@ export default function GuidedReconciliationPage() {
     setMessage("Salvando regra...");
     setRuleBusy("save");
     try {
-      const url = isNotesRules
-        ? `${API}/api/conciliacoes/${activeReconciliation.id}/regras-fonte/nota`
-        : `${API}/api/conciliacoes/${activeReconciliation.id}/regras-contabeis${editingRuleId ? `/${editingRuleId}` : ""}`;
-      const response = await fetch(url, {
-        method: editingRuleId && !isNotesRules ? "PATCH" : "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(ruleForm),
-      });
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(result.detail ?? "Não foi possível salvar a regra.");
-      if (result.regras) setRules(result.regras);
+      let lastResult: Record<string, unknown> = {};
+      for (const [index, line] of linesToSave.entries()) {
+        const url = isNotesRules
+          ? `${API}/api/conciliacoes/${activeReconciliation.id}/regras-fonte/nota`
+          : `${API}/api/conciliacoes/${activeReconciliation.id}/regras-contabeis${editingRuleId && index === 0 ? `/${editingRuleId}` : ""}`;
+        const response = await fetch(url, {
+          method: editingRuleId && index === 0 && !isNotesRules ? "PATCH" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...ruleForm,
+            tipo_componente: line.tipo_componente,
+            conta_debito: line.conta_debito,
+            conta_credito: line.conta_credito,
+            historico: line.historico,
+            complemento: line.complemento,
+          }),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.detail ?? "Não foi possível salvar a regra.");
+        lastResult = result;
+      }
+      await refreshRules();
+      if (lastResult.regras) setRules(lastResult.regras as RulesPayload);
       setRulePreview(null);
       setEditingRuleId("");
       setRulesTab("saved");
-      setMessage(isNotesRules ? "Regra de notas salva." : editingRuleId ? "Regra atualizada." : `Regra salva e aplicada a ${result.movimentos_aplicados ?? 0} lançamento(s).`);
+      setMessage(isNotesRules ? "Regra de notas salva." : editingRuleId ? "Regra atualizada." : `Regra salva com ${linesToSave.length} lançamento(s) contábil(eis) e aplicada a ${lastResult.movimentos_aplicados ?? 0} lançamento(s).`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Não foi possível salvar a regra.");
     } finally {
@@ -692,9 +886,14 @@ export default function GuidedReconciliationPage() {
     [flowType === "bancos" ? "Banco" : "Área", areaLabel],
     ["Documento", activeStep >= 3 ? activeUploadDocument?.label ?? "Selecione um arquivo" : "Aguardando upload"],
   ];
+  const extratoTriggerSuggestion = ruleSuggestions.find((item) => item.target === "extrato" && item.label !== "Valor")?.value ?? selectedRuleContext?.historico ?? "";
+  const comprovanteTriggerSuggestion = ruleSuggestions.find((item) => item.target === "comprovante" && item.label !== "Documento")?.value ?? "";
+  const paymentTriggerSuggestion = isNotesRules
+    ? ruleSuggestions.find((item) => item.label === "Forma de pagamento")?.value ?? selectedRuleContext?.tipo ?? ""
+    : "";
 
   return (
-    <main className="guided-compact h-[calc(100dvh-36px)] overflow-hidden bg-[#f4f7fb] text-slate-900">
+    <main className="guided-compact h-[100dvh] overflow-hidden bg-[#f4f7fb] text-slate-900">
       <datalist id="guided-catalogo-contas">
         {catalog.contas.map((option) => (
           <option value={catalogCode(option)} label={option} key={option} />
@@ -729,11 +928,14 @@ export default function GuidedReconciliationPage() {
               );
             })}
           </nav>
+          <div className="mt-auto rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5 text-[10px] text-slate-500">
+            <span className="block truncate">Desenvolvido por <strong className="font-semibold text-slate-700">JVLAB</strong> · V12</span>
+          </div>
         </aside>
 
         <section className="flex min-h-0 min-w-0 flex-col">
           <header className="shrink-0 border-b border-slate-200 bg-white/95 px-4 py-2.5 shadow-sm">
-            <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3">
+            <div className="flex w-full flex-wrap items-center justify-between gap-3">
               <div>
                 <div className="mb-1 flex flex-wrap items-center gap-1.5 text-[11px] font-bold text-slate-500">
                   <span className="rounded-full bg-teal-50 px-2 py-0.5 text-teal-800">{flowConfig.title}</span>
@@ -759,7 +961,7 @@ export default function GuidedReconciliationPage() {
           </header>
 
           <div className="min-h-0 flex-1 overflow-hidden">
-          <div className="mx-auto h-full max-w-7xl space-y-2.5 overflow-hidden px-3 py-3">
+          <div className="h-full w-full space-y-2 overflow-hidden px-2 py-2.5">
             {message && <p className="rounded-md bg-teal-50 px-2.5 py-1.5 text-xs font-semibold text-teal-800">{message}</p>}
             <ContextMap items={contextItems} existing={!!matchingProcess} />
 
@@ -963,24 +1165,92 @@ export default function GuidedReconciliationPage() {
                   </div>
                   <span className="text-[11px] font-semibold text-slate-500">Selecione uma pendência, valide a cobertura e salve a regra.</span>
                 </div>
-                {rulesTab === "pending" && <div className="grid gap-2.5 xl:grid-cols-[minmax(0,1fr)_410px]">
+                {rulesTab === "pending" && <div className="grid min-h-0 gap-2 xl:grid-cols-[minmax(260px,0.64fr)_minmax(620px,1.36fr)]">
                   <PendingRules rows={rules.pendentes ?? []} onSelect={selectPendingRule} onView={setViewer} showNotePayment={isNotesRules} />
-                  <form onSubmit={saveGuidedRule} className="h-fit rounded-lg border border-slate-200 bg-white p-2.5 shadow-sm">
-                    <div className="flex items-center justify-between gap-2 border-b border-slate-100 pb-1.5">
-                      <div>
-                        <span className="rounded bg-teal-50 px-1.5 py-0.5 text-[10px] font-black uppercase tracking-wide text-teal-800">Regra contábil</span>
-                        <h3 className="mt-1 text-xs font-black text-slate-900">{editingRuleId ? "Editar regra" : "Nova regra"}</h3>
+                  <form onSubmit={saveGuidedRule} className="min-h-0 min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+                    <div className="flex items-start justify-between gap-3 border-b border-slate-100 px-4 py-3">
+                      <div className="min-w-0">
+                        <h3 className="text-base font-black leading-tight text-slate-950">{editingRuleId ? "Editar regra" : "Nova regra"}</h3>
+                        <p className="mt-1 text-[11px] font-semibold leading-4 text-slate-600">Gatilho da regra, lançamento contábil e cobertura no mesmo painel.</p>
                       </div>
                       {editingRuleId && <button type="button" onClick={newGuidedRule} className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-bold text-slate-700 hover:bg-slate-50">Nova</button>}
                     </div>
-                    <div className="mt-2 grid gap-2">
-                      {!!ruleSuggestions.length && (
-                        <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
+                    <div className="grid max-h-[calc(100dvh-250px)] gap-2 overflow-y-auto px-4 py-3 pr-3">
+                      {selectedRuleContext && (
+                        <div className="grid gap-1 rounded-md border border-blue-100 bg-blue-50 px-2 py-1.5 text-[11px] text-blue-950 md:grid-cols-[74px_minmax(0,1fr)_92px_86px]">
+                          <span className="font-mono font-bold">{selectedRuleContext.data}</span>
+                          <span className="truncate font-semibold" title={selectedRuleContext.historico}>{selectedRuleContext.historico}</span>
+                          <span className="font-bold">{selectedRuleContext.valor}</span>
+                          <span className="truncate text-blue-700" title={selectedRuleContext.tipo}>{selectedRuleContext.tipo}</span>
+                        </div>
+                      )}
+                      {selectedRuleContext?.comprovante && (
+                        <div className="rounded-xl border border-amber-200 bg-amber-50 p-2">
                           <div className="mb-1.5 flex items-center justify-between gap-2">
-                            <span className="text-[10px] font-black uppercase tracking-wide text-slate-500">Condições sugeridas</span>
-                            <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-bold text-slate-500">use só o que fizer sentido</span>
+                            <div className="min-w-0">
+                              <span className="text-[10px] font-black uppercase tracking-wide text-amber-800">Dados do comprovante</span>
+                              <p className="truncate text-[11px] font-semibold text-amber-950" title={selectedRuleContext.comprovante.origem}>
+                                {selectedRuleContext.comprovante.origem}
+                                {selectedRuleContext.comprovante.pagina ? ` · p. ${selectedRuleContext.comprovante.pagina}` : ""}
+                              </p>
+                            </div>
+                            <div className="flex shrink-0 items-center gap-1.5">
+                              {selectedRuleContext.comprovante.confere !== undefined && (
+                                <span className={`rounded-full px-2 py-0.5 text-[10px] font-black ${selectedRuleContext.comprovante.confere ? "bg-teal-100 text-teal-800" : "bg-red-100 text-red-700"}`}>
+                                  {selectedRuleContext.comprovante.confere ? "CONFERE" : "REVISAR"}
+                                </span>
+                              )}
+                              {selectedRuleContext.comprovante.arquivoId && (
+                                <button type="button" onClick={() => setViewer({ arquivoId: selectedRuleContext.comprovante?.arquivoId ?? "", pagina: selectedRuleContext.comprovante?.pagina ?? 1, titulo: "Comprovante" })} title="Visualizar comprovante" aria-label="Visualizar comprovante" className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-amber-200 bg-white text-amber-800 hover:bg-amber-100">
+                                  <Eye size={14} />
+                                </button>
+                              )}
+                            </div>
                           </div>
-                          <div className="grid gap-1">
+                          <div className="grid gap-1 sm:grid-cols-3 xl:grid-cols-4">
+                            {selectedRuleContext.comprovante.valores.map((item) => (
+                              <div key={`${item.label}:${item.valor}`} className="min-w-0 rounded-md border border-amber-100 bg-white px-2 py-1">
+                                <span className="block truncate text-[9px] font-black uppercase text-amber-700" title={item.label}>{item.label}</span>
+                                <strong className="block truncate text-[11px] text-slate-900" title={item.valor}>{item.valor}</strong>
+                              </div>
+                            ))}
+                          </div>
+                          {!!selectedRuleContext.comprovante.componentes.length && (
+                            <div className="mt-1.5 flex flex-wrap gap-1">
+                              {selectedRuleContext.comprovante.componentes.map((item) => (
+                                <span key={`${item.tipo}:${item.valor}`} title={`Componente ${item.label}`} className="rounded-full border border-amber-200 bg-white px-2 py-0.5 text-[10px] font-black uppercase text-amber-900">
+                                  {item.label}: {item.valor}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      <div>
+                        <p className="mb-1 text-[11px] font-black text-slate-800">Gatilho da regra — de onde vem a condição de disparo</p>
+                        <div className="grid gap-2 sm:grid-cols-3">
+                          <button type="button" onClick={() => updateRuleForm({ gatilho: extratoTriggerSuggestion })} disabled={!extratoTriggerSuggestion} className={`flex h-12 items-center justify-center gap-2 rounded-2xl border text-xs font-black disabled:cursor-not-allowed disabled:opacity-50 ${extratoTriggerSuggestion && ruleForm.gatilho === extratoTriggerSuggestion ? "border-teal-600 bg-teal-50 text-teal-800" : "border-slate-200 bg-white text-slate-700 hover:border-teal-200 hover:bg-teal-50"}`}>
+                            <Check size={15} className={extratoTriggerSuggestion && ruleForm.gatilho === extratoTriggerSuggestion ? "opacity-100" : "opacity-0"} />
+                            Extrato
+                          </button>
+                          <button type="button" onClick={() => updateRuleForm({ gatilho_comprovante: comprovanteTriggerSuggestion })} disabled={!comprovanteTriggerSuggestion} className={`flex h-12 items-center justify-center gap-2 rounded-2xl border text-xs font-black disabled:cursor-not-allowed disabled:opacity-50 ${ruleForm.gatilho_comprovante ? "border-teal-600 bg-teal-50 text-teal-800" : "border-slate-200 bg-white text-slate-700 hover:border-teal-200 hover:bg-teal-50"}`}>
+                            <Check size={15} className={ruleForm.gatilho_comprovante ? "opacity-100" : "opacity-0"} />
+                            Comprovante
+                          </button>
+                          <button type="button" onClick={() => updateRuleForm({ gatilho: paymentTriggerSuggestion })} disabled={!paymentTriggerSuggestion} className={`flex h-12 items-center justify-center gap-2 rounded-2xl border text-xs font-black disabled:cursor-not-allowed disabled:opacity-50 ${paymentTriggerSuggestion && ruleForm.gatilho === paymentTriggerSuggestion ? "border-teal-600 bg-teal-50 text-teal-800" : "border-slate-200 bg-white text-slate-700 hover:border-teal-200 hover:bg-teal-50"}`}>
+                            <Check size={15} className={paymentTriggerSuggestion && ruleForm.gatilho === paymentTriggerSuggestion ? "opacity-100" : "opacity-0"} />
+                            Forma de pagamento (NFS-e)
+                          </button>
+                        </div>
+                        <p className="mt-1.5 text-[11px] leading-4 text-slate-500">Marque uma sugestão ou preencha manualmente. Com dois ou mais marcados, valide a cobertura para confirmar se todos precisam bater.</p>
+                      </div>
+                      {!!ruleSuggestions.length && (
+                        <div className="rounded-md border border-slate-200 bg-slate-50 p-1.5">
+                          <div className="mb-1 flex items-center justify-between gap-2">
+                            <span className="text-[10px] font-black uppercase tracking-wide text-slate-500">Condições sugeridas</span>
+                            <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-bold text-slate-500">desmarcadas por padrão</span>
+                          </div>
+                          <div className="grid max-h-24 gap-1 overflow-y-auto pr-1">
                             {ruleSuggestions.map((suggestion) => (
                               <label key={suggestion.id} className="flex cursor-pointer items-center gap-2 rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-700 hover:border-teal-200 hover:bg-teal-50">
                                 <input type="checkbox" checked={selectedRuleSuggestions.includes(suggestion.id)} onChange={(event) => applyRuleSuggestion(suggestion, event.target.checked)} className="h-3.5 w-3.5 accent-teal-700" />
@@ -991,7 +1261,7 @@ export default function GuidedReconciliationPage() {
                           </div>
                         </div>
                       )}
-                      <div className="grid grid-cols-[1fr_1fr] gap-2">
+                      <div className="grid grid-cols-[1fr_1fr] gap-1.5">
                       <RuleField label="Palavra-chave no extrato">
                         <input value={ruleForm.gatilho} onChange={(event) => updateRuleForm({ gatilho: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="palavra chave..." />
                       </RuleField>
@@ -1002,38 +1272,61 @@ export default function GuidedReconciliationPage() {
                       <RuleField label="Não contém">
                         <input value={ruleForm.texto_exclusao} onChange={(event) => updateRuleForm({ texto_exclusao: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="texto de exclusão..." />
                       </RuleField>
-                      <div className="grid grid-cols-[1fr_1fr_auto] gap-2">
-                        <RuleField label="Natureza">
-                          <select value={ruleForm.natureza} onChange={(event) => updateRuleForm({ natureza: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800"><option>Crédito</option><option>Débito</option></select>
-                        </RuleField>
-                        <RuleField label="Tipo">
-                          <input value={ruleForm.tipo_componente} onChange={(event) => updateRuleForm({ tipo_componente: event.target.value })} className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-semibold text-slate-800" />
-                        </RuleField>
-                        <button type="button" title="Desdobrar lançamento" className="mt-4 inline-flex h-8 items-center justify-center rounded-md border border-slate-200 bg-white px-2 text-[11px] font-bold text-slate-700 hover:bg-slate-50">Desd. Lancto</button>
-                      </div>
-                      <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
-                        <div className="mb-1.5 flex items-center justify-between">
-                          <span className="text-[10px] font-black uppercase tracking-wide text-slate-500">Lançamento</span>
-                          <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-bold text-slate-500">Débito | Crédito | Histórico | Complemento</span>
+                      <div className="grid gap-1.5 rounded-xl border border-slate-200 bg-slate-50 p-1.5 md:grid-cols-3">
+                        <div className="flex h-8 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2">
+                          <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[9px] font-black uppercase ${ruleForm.natureza === "Débito" ? "bg-red-50 text-red-700" : "bg-teal-50 text-teal-800"}`}>NATUREZA: {ruleForm.natureza.toUpperCase()}</span>
+                          <select value={ruleForm.natureza} onChange={(event) => updateRuleNatureza(event.target.value)} className="min-w-0 flex-1 bg-transparent text-[10px] font-bold uppercase text-slate-600 outline-none">
+                              <option>Crédito</option>
+                              <option>Débito</option>
+                            </select>
                         </div>
-                        <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,0.9fr)_minmax(0,0.9fr)_minmax(0,1.15fr)]">
-                          <RuleField label="Débito">
-                            <input list="guided-catalogo-contas" required value={ruleForm.conta_debito} onChange={(event) => updateRuleForm({ conta_debito: event.target.value })} className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="Código da conta" />
-                          </RuleField>
-                          <RuleField label="Crédito">
-                            <input list="guided-catalogo-contas" required value={ruleForm.conta_credito} onChange={(event) => updateRuleForm({ conta_credito: event.target.value })} className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="Código da conta" />
-                          </RuleField>
-                          <RuleField label="Histórico contábil">
-                            <input list="guided-catalogo-historicos" required value={ruleForm.historico} onChange={(event) => updateRuleForm({ historico: event.target.value })} className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="Código do histórico" />
-                          </RuleField>
-                          <RuleField label="Complemento">
-                            <input value={ruleForm.complemento} onChange={(event) => updateRuleForm({ complemento: event.target.value })} className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="Texto complementar" />
-                          </RuleField>
+                        <label className="flex h-8 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2">
+                          <span className="shrink-0 rounded-full bg-blue-50 px-1.5 py-0.5 text-[9px] font-black uppercase text-blue-700">TIPO</span>
+                          <span className="min-w-0 flex-1 truncate text-[10px] font-black uppercase text-slate-800" title={ruleLines.map((line) => line.tipo_componente).join(" + ")}>
+                            {ruleLines.length > 1 ? `${ruleLines.length} LINHAS` : ruleLines[0]?.tipo_componente || ruleForm.tipo_componente}
+                          </span>
+                        </label>
+                        <button type="button" title="Desdobrar lançamento" className="flex h-8 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2 text-left text-[10px] font-black uppercase text-slate-800 hover:border-teal-200 hover:bg-teal-50">
+                          <span className="grid h-3.5 w-3.5 shrink-0 place-items-center rounded border border-slate-300 bg-slate-50" />
+                          <span className="truncate">DESDOBRAMENTO: NÃO</span>
+                        </button>
+                      </div>
+                      <div className="rounded-md border border-slate-200 bg-slate-50 p-1.5">
+                        <div className="mb-1 flex items-center justify-between">
+                          <span className="text-[10px] font-black uppercase tracking-wide text-slate-500">Lançamentos</span>
+                          <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-bold text-slate-500">{bankAccountCode ? `Conta do banco: ${bankAccountCode}` : "Débito | Crédito | Histórico | Complemento"}</span>
+                        </div>
+                        <div className="grid gap-1.5">
+                          {ruleLines.map((line, index) => (
+                            <div key={line.id} className="rounded-lg border border-slate-200 bg-white p-1.5">
+                              <div className="mb-1 flex flex-wrap items-center justify-between gap-1.5">
+                                <strong className="text-[10px] font-black uppercase text-slate-800">Lançamento {index + 1} · {line.label}</strong>
+                                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-black uppercase text-slate-700">{line.valor || selectedRuleContext?.valor || "R$ 0,00"}</span>
+                              </div>
+                              <div className="grid gap-1.5 md:grid-cols-2 xl:grid-cols-[minmax(0,0.82fr)_minmax(0,0.82fr)_minmax(0,0.72fr)_minmax(0,1.25fr)]">
+                                <RuleField label="Débito">
+                                  <input list="guided-catalogo-contas" required value={line.conta_debito} onChange={(event) => { setManualLineAccounts((current) => ({ ...current, [line.id]: { ...(current[line.id] ?? { conta_debito: false, conta_credito: false }), conta_debito: true } })); updateRuleLine(line.id, { conta_debito: event.target.value }); }} className={`w-full rounded-md border bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800 ${bankAccountCode && line.conta_debito === bankAccountCode ? "border-teal-300 ring-1 ring-teal-100" : "border-slate-300"}`} placeholder="Código da conta" />
+                                </RuleField>
+                                <RuleField label="Crédito">
+                                  <input list="guided-catalogo-contas" required value={line.conta_credito} onChange={(event) => { setManualLineAccounts((current) => ({ ...current, [line.id]: { ...(current[line.id] ?? { conta_debito: false, conta_credito: false }), conta_credito: true } })); updateRuleLine(line.id, { conta_credito: event.target.value }); }} className={`w-full rounded-md border bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800 ${bankAccountCode && line.conta_credito === bankAccountCode ? "border-teal-300 ring-1 ring-teal-100" : "border-slate-300"}`} placeholder="Código da conta" />
+                                </RuleField>
+                                <RuleField label="Histórico">
+                                  <input list="guided-catalogo-historicos" required value={line.historico} onChange={(event) => updateRuleLine(line.id, { historico: event.target.value })} className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="Código do histórico" />
+                                </RuleField>
+                                <RuleField label="Complemento">
+                                  <input value={line.complemento} onChange={(event) => updateRuleLine(line.id, { complemento: event.target.value })} className="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800" placeholder="Texto complementar" />
+                                </RuleField>
+                              </div>
+                            </div>
+                          ))}
                         </div>
                       </div>
-                      <label className="flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5 text-[11px] font-bold text-slate-700">
+                      <label className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-[11px] font-bold text-slate-700">
                         <input type="checkbox" checked={ruleForm.aplicar_existentes} readOnly className="h-3.5 w-3.5 accent-teal-700" />
-                        Aplicar esta regra aos lançamentos existentes
+                        <span className="min-w-0">
+                          <span className="block">Aplicar esta regra aos lançamentos existentes</span>
+                          <span className="block text-[10px] font-medium text-slate-500">Os lançamentos relacionados continuam sendo identificados na cobertura.</span>
+                        </span>
                       </label>
                       <div className="rounded-md border border-teal-100 bg-teal-50 p-2">
                         <div className="flex items-center justify-between gap-3">
@@ -1057,7 +1350,10 @@ export default function GuidedReconciliationPage() {
                           </div>
                         ) : <p className="mt-2 text-xs text-slate-500">Valide antes de salvar.</p>}
                       </div>
-                      <button disabled={ruleBusy === "save"} className="inline-flex items-center justify-center gap-1.5 rounded-md bg-teal-700 px-2.5 py-1.5 text-xs font-bold text-white hover:bg-teal-800 disabled:cursor-wait disabled:opacity-60">{ruleBusy === "save" ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}{editingRuleId ? "Atualizar" : "Salvar"}</button>
+                      <div className="flex items-center gap-2 pt-1">
+                        <button disabled={ruleBusy === "save"} className="inline-flex items-center justify-center gap-1.5 rounded-md bg-teal-700 px-4 py-2 text-xs font-bold text-white hover:bg-teal-800 disabled:cursor-wait disabled:opacity-60">{ruleBusy === "save" ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}{editingRuleId ? "Atualizar regra" : "Salvar regra"}</button>
+                        <button type="button" onClick={newGuidedRule} className="rounded-md border border-slate-200 px-4 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50">Cancelar</button>
+                      </div>
                     </div>
                   </form>
                 </div>}
@@ -1089,6 +1385,12 @@ export default function GuidedReconciliationPage() {
       </div>
       {viewer && <PdfModal viewer={viewer} onClose={() => setViewer(null)} />}
       <style jsx global>{`
+        .guided-compact + footer {
+          display: none;
+        }
+        body:has(.guided-compact) {
+          padding-bottom: 0 !important;
+        }
         .guided-compact {
           font-size: 13px;
         }
@@ -1308,39 +1610,56 @@ function NotesReviewTable({ rows, onView }: { rows: unknown[]; onView: (viewer: 
 }
 
 function PendingRules({ rows, onSelect, onView, showNotePayment = false }: { rows: unknown[]; onSelect: (row: unknown) => void; onView: (viewer: Viewer) => void; showNotePayment?: boolean }) {
+  const pageSize = 5;
+  const [page, setPage] = useState(0);
   if (!rows.length) return <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">Nenhuma regra pendente para este banco.</div>;
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const safePage = Math.min(page, totalPages - 1);
+  const visibleRows = rows.slice(safePage * pageSize, safePage * pageSize + pageSize);
   return (
-    <div className="max-h-[calc(100dvh-310px)] space-y-1.5 overflow-y-auto pr-1">
-      {rows.slice(0, 24).map((raw, index) => {
+    <div className="space-y-1.5">
+      <div className="max-h-[calc(100dvh-345px)] space-y-1 overflow-y-auto pr-1">
+      {visibleRows.map((raw, index) => {
         const row = raw as Record<string, unknown>;
         const history = String(row.historico ?? row.gatilho ?? row.texto ?? "—");
         const date = String(row.data ?? row.data_emissao ?? "—");
         const payment = String(row.tipo_pagamento_label ?? row.forma_pagamento ?? "");
         const countText = row.cobertos ? `${String(row.cobertos)} cobertos` : "pendente";
         return (
-          <article className="grid gap-2 rounded-lg border border-slate-200 bg-white p-2.5 shadow-sm transition hover:border-teal-300 hover:bg-slate-50 lg:grid-cols-[minmax(0,1fr)_96px_82px]" key={String(row.id ?? index)}>
+          <article className="grid gap-1.5 rounded-md border border-slate-200 bg-white p-1.5 shadow-sm transition hover:border-teal-300 hover:bg-slate-50 lg:grid-cols-[minmax(0,1fr)_82px_48px]" key={String(row.id ?? index)}>
             <div className="min-w-0">
-              <span className="mb-1 inline-flex rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-black uppercase tracking-wide text-amber-800">{countText}</span>
-              <h3 className="line-clamp-2 text-[11px] font-black leading-4 text-slate-800" title={history}>{date} · {history}</h3>
-              <p className="mt-0.5 text-[10px] font-semibold text-slate-500">
+              <div className="mb-0.5 flex items-center gap-1">
+                <span className="shrink-0 rounded bg-amber-50 px-1 py-0.5 text-[9px] font-black uppercase tracking-wide text-amber-800">{countText}</span>
+                <span className="shrink-0 font-mono text-[10px] font-bold text-slate-500">{date}</span>
+              </div>
+              <h3 className="line-clamp-2 text-[11px] font-black leading-[14px] text-slate-800" title={history}>{history}</h3>
+              <p className="mt-0.5 truncate text-[10px] font-semibold text-slate-500" title={`${String(row.tipo_componente ?? row.tipo_lancamento_label ?? "Principal")}${showNotePayment && payment && payment !== "—" ? ` · Pagamento: ${payment}` : ""}`}>
                 Tipo: {String(row.tipo_componente ?? row.tipo_lancamento_label ?? "Principal")}
                 {showNotePayment && payment && payment !== "—" ? ` · Pagamento: ${payment}` : ""}
               </p>
             </div>
-            <div className="flex items-center justify-between gap-2 rounded-md border border-slate-100 bg-slate-50 px-2 py-1 lg:block">
-              <span className="text-[10px] font-black uppercase tracking-wide text-slate-400">Valor</span>
-              <strong className="block text-[11px] text-slate-900 lg:mt-0.5">{String(row.valor ?? "—")}</strong>
+            <div className="flex items-center justify-between gap-2 rounded-md border border-slate-100 bg-slate-50 px-1.5 py-1 lg:block">
+              <span className="text-[9px] font-black uppercase tracking-wide text-slate-400">Valor</span>
+              <strong className="block whitespace-nowrap text-[11px] text-slate-900 lg:mt-0.5">{formatCurrency(row.valor)}</strong>
             </div>
-            <div className="flex items-center justify-end gap-1.5">
-              {Boolean(row.arquivo_id) && <button type="button" onClick={() => onView({ arquivoId: String(row.arquivo_id), pagina: Number(row.pagina || 1), titulo: "Documento" })} title="Visualizar documento" aria-label="Visualizar documento" className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-slate-200 text-slate-700 hover:bg-slate-50"><Eye size={13} /></button>}
-              <button type="button" onClick={() => onSelect(raw)} className="inline-flex h-7 items-center justify-center gap-1 rounded-md bg-slate-900 px-2 text-[11px] font-bold text-white hover:bg-slate-800">
+            <div className="flex flex-col items-stretch justify-center gap-1">
+              {Boolean(row.arquivo_id) && <button type="button" onClick={() => onView({ arquivoId: String(row.arquivo_id), pagina: Number(row.pagina || 1), titulo: "Documento" })} title="Visualizar documento" aria-label="Visualizar documento" className="inline-flex h-6 w-full items-center justify-center rounded-md border border-slate-200 text-slate-700 hover:bg-slate-50"><Eye size={13} /></button>}
+              <button type="button" onClick={() => onSelect(raw)} title="Criar regra" aria-label="Criar regra" className="inline-flex h-6 w-full items-center justify-center rounded-md bg-slate-900 text-white hover:bg-slate-800">
                 <WandSparkles size={13} />
-                Criar
               </button>
             </div>
           </article>
         );
       })}
+      </div>
+      <div className="flex items-center justify-between rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-bold text-slate-600">
+        <span>{safePage * pageSize + 1}-{Math.min((safePage + 1) * pageSize, rows.length)} de {rows.length}</span>
+        <div className="flex items-center gap-1">
+          <button type="button" disabled={safePage === 0} onClick={() => setPage((current) => Math.max(current - 1, 0))} className="rounded border border-slate-200 px-2 py-0.5 disabled:cursor-not-allowed disabled:opacity-40">Anterior</button>
+          <span className="rounded bg-slate-100 px-2 py-0.5">{safePage + 1}/{totalPages}</span>
+          <button type="button" disabled={safePage >= totalPages - 1} onClick={() => setPage((current) => Math.min(current + 1, totalPages - 1))} className="rounded border border-slate-200 px-2 py-0.5 disabled:cursor-not-allowed disabled:opacity-40">Próxima</button>
+        </div>
+      </div>
     </div>
   );
 }

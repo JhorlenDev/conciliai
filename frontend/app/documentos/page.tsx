@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { ChangeEvent, useEffect, useState } from "react";
 import { FileText, Trash2, Upload, Users } from "lucide-react";
+import { ActionIconButton } from "../components/action-icon-button";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 type Document = {
@@ -109,23 +110,19 @@ export default function DocumentosPage() {
           <ul className="divide-y">
             {documents.map((document) => (
               <li
-                className="flex items-center gap-3 px-5 py-3"
+                className="ui-list-row px-5 py-3"
                 key={document.id}
               >
-                <div>
-                  <strong className="block text-sm">{document.nome}</strong>
-                  <span className="text-xs text-slate-500">
+                <div className="ui-list-main">
+                  <strong className="ui-truncate block text-sm" title={document.nome}>{document.nome}</strong>
+                  <span className="ui-truncate block text-xs text-slate-500">
                     {label(document.tipo)} ·{" "}
                     {document.extensao.replace(".", "").toUpperCase()}
                   </span>
                 </div>
-                <button
-                  onClick={() => remove(document.id)}
-                  className="ml-auto rounded p-1 text-red-600 hover:bg-red-50"
-                  aria-label={`Excluir ${document.nome}`}
-                >
-                  <Trash2 size={16} />
-                </button>
+                <span className="ui-actions w-8">
+                  <ActionIconButton icon={Trash2} label={`Excluir ${document.nome}`} tone="danger" onClick={() => remove(document.id)} />
+                </span>
               </li>
             ))}
             {!documents.length && (

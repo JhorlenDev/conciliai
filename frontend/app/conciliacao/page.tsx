@@ -4089,43 +4089,18 @@ function ConciliacaoFlow({
               <ul className="mt-4 divide-y rounded-md border text-sm">
                 {review.arquivos.map((file) => (
                   <li
-                    className="flex items-center justify-between gap-3 px-3 py-2"
+                    className="ui-list-row px-3 py-2"
                     key={file.id}
                   >
-                    <span className="min-w-0 truncate">{file.nome}</span>
-                    <span className="ml-auto shrink-0 text-slate-500">
+                    <span className="ui-list-main ui-truncate" title={file.nome}>{file.nome}</span>
+                    <span className="shrink-0 text-slate-500">
                       {documentTypeLabel(file.tipo, bank)} · {file.status}
                     </span>
-                    <button
-                      onClick={() =>
-                        setViewer({
-                          arquivoId: file.id,
-                          pagina: 1,
-                          titulo: documentTypeLabel(file.tipo, bank),
-                        })
-                      }
-                      title="Visualizar arquivo"
-                      aria-label={`Visualizar ${file.nome}`}
-                      className="shrink-0 rounded p-1 text-slate-700 hover:bg-slate-100"
-                    >
-                      <Eye size={15} />
-                    </button>
-                    <button
-                      onClick={() => reprocessDocument(file.id)}
-                      title="Reprocessar arquivo"
-                      aria-label={`Reprocessar ${file.nome}`}
-                      className="shrink-0 rounded p-1 text-teal-700 hover:bg-teal-50"
-                    >
-                      <RefreshCw size={15} />
-                    </button>
-                    <button
-                      onClick={() => deleteDocument(file.id)}
-                      title="Excluir arquivo"
-                      aria-label={`Excluir ${file.nome}`}
-                      className="shrink-0 rounded p-1 text-red-600 hover:bg-red-50"
-                    >
-                      <Trash2 size={15} />
-                    </button>
+                    <span className="ui-actions w-24">
+                      <button onClick={() => setViewer({ arquivoId: file.id, pagina: 1, titulo: documentTypeLabel(file.tipo, bank) })} title="Visualizar arquivo" aria-label={`Visualizar ${file.nome}`} className="rounded p-1 text-slate-700 hover:bg-slate-100"><Eye size={15} /></button>
+                      <button onClick={() => reprocessDocument(file.id)} title="Reprocessar arquivo" aria-label={`Reprocessar ${file.nome}`} className="rounded p-1 text-teal-700 hover:bg-teal-50"><RefreshCw size={15} /></button>
+                      <button onClick={() => deleteDocument(file.id)} title="Excluir arquivo" aria-label={`Excluir ${file.nome}`} className="rounded p-1 text-red-600 hover:bg-red-50"><Trash2 size={15} /></button>
+                    </span>
                   </li>
                 ))}
               </ul>
@@ -4236,39 +4211,14 @@ function ConciliacaoFlow({
               {machineFiles.length > 0 && (
                 <ul className="divide-y rounded-md border text-sm">
                   {machineFiles.map((file) => (
-                    <li className="flex items-center justify-between gap-3 px-3 py-2" key={file.id}>
-                      <span className="min-w-0 truncate">{file.nome}</span>
-                      <span className="ml-auto shrink-0 text-slate-500">{documentTypeLabel(file.tipo, bank)} · {file.status}</span>
-                      <button
-                        onClick={() =>
-                          setViewer({
-                            arquivoId: file.id,
-                            pagina: 1,
-                            titulo: documentTypeLabel(file.tipo, bank),
-                          })
-                        }
-                        title="Visualizar arquivo"
-                        aria-label={`Visualizar ${file.nome}`}
-                        className="shrink-0 rounded p-1 text-slate-700 hover:bg-slate-100"
-                      >
-                        <Eye size={15} />
-                      </button>
-                      <button
-                        onClick={() => reprocessDocument(file.id)}
-                        title="Reprocessar arquivo"
-                        aria-label={`Reprocessar ${file.nome}`}
-                        className="shrink-0 rounded p-1 text-teal-700 hover:bg-teal-50"
-                      >
-                        <RefreshCw size={15} />
-                      </button>
-                      <button
-                        onClick={() => deleteDocument(file.id)}
-                        title="Excluir arquivo"
-                        aria-label={`Excluir ${file.nome}`}
-                        className="shrink-0 rounded p-1 text-red-600 hover:bg-red-50"
-                      >
-                        <Trash2 size={15} />
-                      </button>
+                    <li className="ui-list-row px-3 py-2" key={file.id}>
+                      <span className="ui-list-main ui-truncate" title={file.nome}>{file.nome}</span>
+                      <span className="shrink-0 text-slate-500">{documentTypeLabel(file.tipo, bank)} · {file.status}</span>
+                      <span className="ui-actions w-24">
+                        <button onClick={() => setViewer({ arquivoId: file.id, pagina: 1, titulo: documentTypeLabel(file.tipo, bank) })} title="Visualizar arquivo" aria-label={`Visualizar ${file.nome}`} className="rounded p-1 text-slate-700 hover:bg-slate-100"><Eye size={15} /></button>
+                        <button onClick={() => reprocessDocument(file.id)} title="Reprocessar arquivo" aria-label={`Reprocessar ${file.nome}`} className="rounded p-1 text-teal-700 hover:bg-teal-50"><RefreshCw size={15} /></button>
+                        <button onClick={() => deleteDocument(file.id)} title="Excluir arquivo" aria-label={`Excluir ${file.nome}`} className="rounded p-1 text-red-600 hover:bg-red-50"><Trash2 size={15} /></button>
+                      </span>
                     </li>
                   ))}
                 </ul>
@@ -4397,39 +4347,14 @@ function ConciliacaoFlow({
               {loanFiles.length > 0 ? (
                 <ul className="divide-y rounded-md border text-sm">
                   {loanFiles.map((file) => (
-                    <li className="flex items-center justify-between gap-3 px-3 py-2" key={file.id}>
-                      <span className="min-w-0 truncate">{file.nome}</span>
-                      <span className="ml-auto shrink-0 text-slate-500">{documentTypeLabel(file.tipo, bank)} · {file.status}</span>
-                      <button
-                        onClick={() =>
-                          setViewer({
-                            arquivoId: file.id,
-                            pagina: 1,
-                            titulo: documentTypeLabel(file.tipo, bank),
-                          })
-                        }
-                        title="Visualizar arquivo"
-                        aria-label={`Visualizar ${file.nome}`}
-                        className="shrink-0 rounded p-1 text-slate-700 hover:bg-slate-100"
-                      >
-                        <Eye size={15} />
-                      </button>
-                      <button
-                        onClick={() => reprocessDocument(file.id)}
-                        title="Reprocessar arquivo"
-                        aria-label={`Reprocessar ${file.nome}`}
-                        className="shrink-0 rounded p-1 text-teal-700 hover:bg-teal-50"
-                      >
-                        <RefreshCw size={15} />
-                      </button>
-                      <button
-                        onClick={() => deleteDocument(file.id)}
-                        title="Excluir arquivo"
-                        aria-label={`Excluir ${file.nome}`}
-                        className="shrink-0 rounded p-1 text-red-600 hover:bg-red-50"
-                      >
-                        <Trash2 size={15} />
-                      </button>
+                    <li className="ui-list-row px-3 py-2" key={file.id}>
+                      <span className="ui-list-main ui-truncate" title={file.nome}>{file.nome}</span>
+                      <span className="shrink-0 text-slate-500">{documentTypeLabel(file.tipo, bank)} · {file.status}</span>
+                      <span className="ui-actions w-24">
+                        <button onClick={() => setViewer({ arquivoId: file.id, pagina: 1, titulo: documentTypeLabel(file.tipo, bank) })} title="Visualizar arquivo" aria-label={`Visualizar ${file.nome}`} className="rounded p-1 text-slate-700 hover:bg-slate-100"><Eye size={15} /></button>
+                        <button onClick={() => reprocessDocument(file.id)} title="Reprocessar arquivo" aria-label={`Reprocessar ${file.nome}`} className="rounded p-1 text-teal-700 hover:bg-teal-50"><RefreshCw size={15} /></button>
+                        <button onClick={() => deleteDocument(file.id)} title="Excluir arquivo" aria-label={`Excluir ${file.nome}`} className="rounded p-1 text-red-600 hover:bg-red-50"><Trash2 size={15} /></button>
+                      </span>
                     </li>
                   ))}
                 </ul>

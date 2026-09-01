@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { Building2, Pencil, Plus, Trash2, X } from "lucide-react";
+import { ActionIconButton } from "../components/action-icon-button";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 type Client = { id: string; nome: string; documento: string | null };
@@ -165,7 +166,7 @@ export default function ClientesPage() {
                     const isEditing = editing === client.id;
                     return (
                       <tr className="border-t" key={client.id}>
-                        <td className="px-5 py-3">
+                        <td className="max-w-[360px] px-5 py-3">
                           {isEditing ? (
                             <input
                               value={draft.nome}
@@ -178,10 +179,10 @@ export default function ClientesPage() {
                               className="w-full rounded border px-2 py-1"
                             />
                           ) : (
-                            client.nome
+                            <span className="ui-table-text block" title={client.nome}>{client.nome}</span>
                           )}
                         </td>
-                        <td className="px-5 py-3">
+                        <td className="max-w-[220px] px-5 py-3">
                           {isEditing ? (
                             <input
                               value={draft.documento}
@@ -195,10 +196,10 @@ export default function ClientesPage() {
                               placeholder="CPF/CNPJ"
                             />
                           ) : (
-                            client.documento || "—"
+                            <span className="ui-table-text block" title={client.documento || "—"}>{client.documento || "—"}</span>
                           )}
                         </td>
-                        <td className="whitespace-nowrap px-5 py-3">
+                        <td className="ui-action-cell px-5 py-3">
                           {isEditing ? (
                             <>
                               <button
@@ -207,38 +208,14 @@ export default function ClientesPage() {
                               >
                                 Salvar
                               </button>
-                              <button
-                                onClick={() => setEditing(null)}
-                                className="ml-1 rounded border p-1 text-slate-600"
-                                title="Cancelar"
-                              >
-                                <X size={15} />
-                              </button>
+                              <ActionIconButton icon={X} label="Cancelar" tone="muted" onClick={() => setEditing(null)} />
                             </>
                           ) : (
-                            <>
-                              <button
-                                onClick={() => beginEdit(client)}
-                                className="rounded border border-emerald-200 p-1 text-emerald-800"
-                                title="Editar cliente"
-                              >
-                                <Pencil size={15} />
-                              </button>
-                              <button
-                                onClick={() => openBankAccounts(client)}
-                                className="ml-1 rounded border border-sky-200 p-1 text-sky-800"
-                                title="Contas bancárias"
-                              >
-                                <Building2 size={15} />
-                              </button>
-                              <button
-                                onClick={() => removeClient(client)}
-                                className="ml-1 rounded border border-red-200 p-1 text-red-700"
-                                title="Excluir cliente"
-                              >
-                                <Trash2 size={15} />
-                              </button>
-                            </>
+                            <span className="ui-actions w-24">
+                              <ActionIconButton icon={Pencil} label="Editar cliente" tone="success" onClick={() => beginEdit(client)} />
+                              <ActionIconButton icon={Building2} label="Contas bancárias" tone="primary" onClick={() => openBankAccounts(client)} />
+                              <ActionIconButton icon={Trash2} label="Excluir cliente" tone="danger" onClick={() => removeClient(client)} />
+                            </span>
                           )}
                         </td>
                       </tr>
@@ -258,7 +235,7 @@ export default function ClientesPage() {
                 <div className="flex items-center gap-2"><Building2 size={18} /><h2 className="font-semibold">Contas bancárias</h2></div>
                 <p className="mt-1 text-xs text-emerald-100">{bankClient.nome}</p>
               </div>
-              <button onClick={() => setBankClient(null)} className="rounded p-1 hover:bg-emerald-700" title="Fechar"><X size={18} /></button>
+              <ActionIconButton icon={X} label="Fechar" className="text-white hover:bg-emerald-700" onClick={() => setBankClient(null)} />
             </header>
             <div className="space-y-5 p-5">
               <section className="rounded-lg border border-emerald-100 bg-emerald-50/50 p-4">
@@ -274,7 +251,7 @@ export default function ClientesPage() {
               </section>
               <section>
                 <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-semibold text-slate-800">Contas cadastradas</h3><span className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">{bankAccounts.length}</span></div>
-                {bankAccounts.length === 0 ? <p className="rounded-lg border border-dashed p-5 text-center text-sm text-slate-500">Nenhuma conta bancária cadastrada para este cliente.</p> : <div className="space-y-2">{bankAccounts.map((account) => <article className="flex flex-wrap items-center gap-3 rounded-lg border p-3" key={account.id}><div className="min-w-40 flex-1"><p className="font-semibold text-slate-800">{account.banco}</p><p className="text-xs text-slate-500">Titular: {account.titular}</p></div><p className="text-sm text-slate-700">Ag. {account.agencia || "—"} · Cc. {account.conta}</p><button onClick={() => editBankAccount(account)} className="rounded border border-emerald-200 p-1 text-emerald-800" title="Editar conta"><Pencil size={15} /></button><button onClick={() => removeBankAccount(account)} className="rounded border border-red-200 p-1 text-red-700" title="Excluir conta"><Trash2 size={15} /></button></article>)}</div>}
+                {bankAccounts.length === 0 ? <p className="rounded-lg border border-dashed p-5 text-center text-sm text-slate-500">Nenhuma conta bancária cadastrada para este cliente.</p> : <div className="space-y-2">{bankAccounts.map((account) => <article className="ui-list-row rounded-lg border p-3" key={account.id}><div className="ui-list-main"><p className="ui-truncate font-semibold text-slate-800" title={account.banco}>{account.banco}</p><p className="ui-truncate text-xs text-slate-500" title={`Titular: ${account.titular}`}>Titular: {account.titular}</p></div><p className="shrink-0 text-sm text-slate-700">Ag. {account.agencia || "—"} · Cc. {account.conta}</p><span className="ui-actions w-16"><ActionIconButton icon={Pencil} label="Editar conta" tone="success" onClick={() => editBankAccount(account)} /><ActionIconButton icon={Trash2} label="Excluir conta" tone="danger" onClick={() => removeBankAccount(account)} /></span></article>)}</div>}
               </section>
             </div>
           </section>

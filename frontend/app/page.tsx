@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { ArrowRight, Banknote, Building2, Clock3, FileSpreadsheet, FileText, ListFilter, Plus, ReceiptText, RefreshCw, Route, Trash2, Users, WalletCards, X } from "lucide-react";
+import { ArrowRight, Banknote, Building2, Clock3, FileSpreadsheet, FileText, ListFilter, Lock, Plus, ReceiptText, RefreshCw, Route, Trash2, Unlock, Users, WalletCards, X } from "lucide-react";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 type Client = { id: string; nome: string };
@@ -109,6 +109,7 @@ export default function EntryPage() {
     [processYearFilter, setProcessYearFilter] = useState(""),
     [processToDelete, setProcessToDelete] = useState<DeleteTarget | null>(null),
     [isDeleting, setIsDeleting] = useState(false),
+    [legacyUnlocked, setLegacyUnlocked] = useState(false),
     [now, setNow] = useState<Date | null>(null);
   async function load() {
     try {
@@ -273,23 +274,47 @@ export default function EntryPage() {
             <ArrowRight size={15} />
           </Link>
           {activeConciliator === "bancos" && (
-            <form onSubmit={create} className="mt-3 rounded-lg border border-emerald-100 bg-emerald-50 p-3">
-              <h3 className="flex items-center gap-2 text-sm font-bold text-emerald-950"><Plus size={15} />Criar pelo fluxo antigo</h3>
-              <p className="mt-1 text-xs text-emerald-800">Atalho clássico apenas para bancos.</p>
+            <form onSubmit={create} className={`mt-3 rounded-lg border p-3 transition ${legacyUnlocked ? "border-emerald-100 bg-emerald-50" : "border-slate-200 bg-slate-50"}`}>
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <h3 className={`flex items-center gap-2 text-sm font-bold ${legacyUnlocked ? "text-emerald-950" : "text-slate-700"}`}>
+                    {legacyUnlocked ? <Unlock size={15} /> : <Lock size={15} />}
+                    Criar pelo fluxo antigo
+                  </h3>
+                  <p className={`mt-1 text-xs ${legacyUnlocked ? "text-emerald-800" : "text-slate-500"}`}>{legacyUnlocked ? "Atalho clássico liberado apenas para bancos." : "Bloqueado para evitar criação fora do guiado."}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setLegacyUnlocked((value) => !value)}
+                  title={legacyUnlocked ? "Bloquear fluxo antigo" : "Desbloquear fluxo antigo"}
+                  aria-label={legacyUnlocked ? "Bloquear fluxo antigo" : "Desbloquear fluxo antigo"}
+                  className={`inline-flex h-8 w-8 items-center justify-center rounded-md border ${legacyUnlocked ? "border-emerald-200 bg-white text-emerald-800 hover:bg-emerald-100" : "border-slate-200 bg-white text-slate-500 hover:bg-slate-100"}`}
+                >
+                  {legacyUnlocked ? <Unlock size={15} /> : <Lock size={15} />}
+                </button>
+              </div>
               <label className="mt-3 block text-xs font-bold text-slate-700">
                 Cliente
-                <select required value={clientId} onChange={(event) => setClientId(event.target.value)} className="mt-1 w-full rounded border bg-white p-2 text-sm font-normal">
+                <select disabled={!legacyUnlocked} required value={clientId} onChange={(event) => setClientId(event.target.value)} className="mt-1 w-full rounded border bg-white p-2 text-sm font-normal disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400">
                   <option value="">Selecionar cliente</option>
                   {clients.map((client) => <option value={client.id} key={client.id}>{client.nome}</option>)}
                 </select>
               </label>
               <div className="mt-2 grid grid-cols-2 gap-2">
-                <label className="text-xs font-bold text-slate-700">Início<input required type="date" value={start} onChange={(event) => setStart(event.target.value)} className="mt-1 w-full rounded border bg-white p-2 text-sm font-normal" /></label>
-                <label className="text-xs font-bold text-slate-700">Fim<input required type="date" value={end} onChange={(event) => setEnd(event.target.value)} className="mt-1 w-full rounded border bg-white p-2 text-sm font-normal" /></label>
+                <label className="text-xs font-bold text-slate-700">Início<input disabled={!legacyUnlocked} required type="date" value={start} onChange={(event) => setStart(event.target.value)} className="mt-1 w-full rounded border bg-white p-2 text-sm font-normal disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400" /></label>
+                <label className="text-xs font-bold text-slate-700">Fim<input disabled={!legacyUnlocked} required type="date" value={end} onChange={(event) => setEnd(event.target.value)} className="mt-1 w-full rounded border bg-white p-2 text-sm font-normal disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400" /></label>
               </div>
-              <button className="mt-3 w-full rounded bg-emerald-800 px-3 py-2 text-sm font-semibold text-white">
-                Criar e continuar
-              </button>
+              {legacyUnlocked ? (
+                <button className="mt-3 flex w-full items-center justify-center gap-2 rounded bg-emerald-800 px-3 py-2 text-sm font-semibold text-white hover:bg-emerald-900">
+                  <Plus size={15} />
+                  Criar e continuar
+                </button>
+              ) : (
+                <button type="button" onClick={() => setLegacyUnlocked(true)} className="mt-3 flex w-full items-center justify-center gap-2 rounded border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-100">
+                  <Lock size={15} />
+                  Desbloquear fluxo antigo
+                </button>
+              )}
             </form>
           )}
           {message && <p className="mt-3 rounded bg-red-50 px-2 py-1.5 text-xs font-semibold text-red-700">{message}</p>}

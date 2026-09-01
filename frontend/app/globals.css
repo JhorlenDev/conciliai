@@ -6,6 +6,71 @@
 body { background: #f6f7f8; color: #17212b; }
 button, input, select { font: inherit; }
 
+.ui-list-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.ui-list-main {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.ui-truncate {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ui-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.25rem;
+  white-space: nowrap;
+}
+
+.ui-icon-button,
+.ui-actions > button,
+.ui-actions > a {
+  display: inline-flex;
+  width: 1.75rem;
+  height: 1.75rem;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.375rem;
+  border: 1px solid transparent;
+  line-height: 1;
+  margin-left: 0 !important;
+  padding: 0 !important;
+}
+
+.ui-icon-button svg,
+.ui-actions button svg,
+.ui-actions a svg {
+  width: 0.9375rem;
+  height: 0.9375rem;
+  stroke-width: 2.1;
+}
+
+.ui-table-text {
+  max-width: 28rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ui-action-cell {
+  width: 1%;
+  white-space: nowrap;
+}
+
 section.overflow-hidden.rounded-xl > div.overflow-x-auto {
   max-height: calc(100dvh - 360px);
   overflow: auto;
